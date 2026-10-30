@@ -3,12 +3,12 @@
 //! engine built over this crate can test against it too. Deterministic: a seed fixes everything.
 
 use tally_wire::batch::PublicInfoContent;
-use tally_wire::batch::format;
 use tally_wire::{
-    Batch, BatchContent, Clock, Identity, Location, Observation, PublicKey, ReceiverInfo,
-    ReceiverSite, ReceiverSiteContent, Region, WireError,
+    Batch, BatchContent, Clock, Identity, Location, PublicKey, ReceiverInfo, ReceiverSite,
+    ReceiverSiteContent, Region, WireError,
 };
 
+use crate::arrived::BatchId;
 use crate::clock::Timebase;
 use crate::geo::{self, C, Geodetic};
 use crate::linalg::{self, Vec3};
@@ -190,6 +190,9 @@ pub struct Scenario {
     pub centre: (f64, f64),
     /// How far from the centre aircraft and the extra receivers are placed, metres.
     pub spread_m: f64,
+    /// How far from the centre the extra receivers are placed instead, when set, metres: a few
+    /// receivers at the density of many, under the whole sky's aircraft.
+    pub receiver_spread_m: Option<f64>,
     /// Which receivers (by index) are GNSS-disciplined.
     pub gps: Vec<usize>,
     /// (receiver index, true time, step seconds).
@@ -197,7 +200,7 @@ pub struct Scenario {
     pub reception_probability: f64,
     /// Every free-running clock's rate error at the start, when set, instead of a random one
     /// (parts per million): every clock wrong the same way, so nothing but the sync ranges shows
-    /// the gauge's.
+    /// their common rate.
     pub rate_ppm: Option<f64>,
     /// Every free-running receiver's timing jitter, seconds, when set, instead of the mix (one
     /// standard deviation).
@@ -215,6 +218,14 @@ pub struct Scenario {
     /// stamping from a coarse clock, as real ones in OpenSky's data do at hundreds of
     /// microseconds).
     pub jitters: Vec<(usize, f64)>,
+    /// Whether an ADS-B aircraft also sends the extended squitters MLAT never uses, at DO-260B's
+    /// nominal rates (RTCA DO-260B §2.2.3.3): an airborne velocity (type code 19) twice a second,
+    /// a target state and status (29) every 1.25 s and an identification (4) every 5 s. So a
+    /// receiver hears the real mix, about 60% of it wanted (`tally_wire::modes::wanted`), as a
+    /// real receiver does (RFC-0181's box-01, about 600 receptions a second of which 60% wanted;
+    /// `arrived::Rates::MEASURED`), where the scenes MLAT is calibrated on send only what it uses.
+    /// Off, the scenario's draws are what they were without it.
+    pub unwanted: bool,
 }
 
 impl Scenario {
@@ -242,6 +253,7 @@ impl Scenario {
             receivers: RECEIVERS.len(),
             centre: CENTRE,
             spread_m: 150_000.0,
+            receiver_spread_m: None,
             gps: vec![2],
             jumps: Vec::new(),
             reception_probability: 0.85,
@@ -251,6 +263,7 @@ impl Scenario {
             named: true,
             offsets: Vec::new(),
             jitters: Vec::new(),
+            unwanted: false,
         }
     }
 }
@@ -296,12 +309,37 @@ impl Simulation {
         self.receivers.iter().find(|receiver| receiver.key == *key)
     }
 
-    /// What each receiver would publish (RFC-0171 §3.1): its signed description and site, then its
-    /// receptions in the order it heard them, one signed batch per wall clock second (each
-    /// reception's `wall_ms`), at most `MAX_BATCH` observations a batch. Counter epoch 1, as `run`
-    /// gives the receptions.
-    pub fn feeds(&self) -> Result<Vec<Feed>, WireError> {
+    /// Receiver `index`'s receptions in the order it heard them, cut into its batches: one per
+    /// wall clock (each reception's `wall_ms`), at most `MAX_BATCH` observations a batch. Batch
+    /// `n` of the list is the receiver's sequence `n` of boot `BOOT_ID`, in [`Simulation::feeds`]
+    /// and [`arrivals`] alike.
+    fn batches_of(&self, index: usize) -> Vec<Vec<&Reception>> {
         const MAX_BATCH: usize = 400;
+        let key = self.receivers[index].key;
+        let mut heard: Vec<(f64, &Reception)> = self
+            .receptions
+            .iter()
+            .zip(&self.sources)
+            .filter(|(reception, _)| reception.receiver == key)
+            .map(|(reception, source)| (self.transmissions[*source].time, reception))
+            .collect();
+        heard.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut by_wall: Vec<Vec<&Reception>> = Vec::new();
+        for (_, reception) in heard {
+            match by_wall.last_mut() {
+                Some(batch) if batch[0].wall_ms == reception.wall_ms && batch.len() < MAX_BATCH => {
+                    batch.push(reception);
+                }
+                _ => by_wall.push(vec![reception]),
+            }
+        }
+        by_wall
+    }
+
+    /// What each receiver would publish (RFC-0171 §3.1): its signed description and site, then its
+    /// receptions in the order it heard them, one signed batch per wall clock second
+    /// (`batches_of`). Counter epoch 1, as `run` gives the receptions.
+    pub fn feeds(&self) -> Result<Vec<Feed>, WireError> {
         let start_ms = self.scenario.midnight_unix_ms + (self.scenario.start_tod_s * 1000.0) as u64;
         let mut feeds = Vec::with_capacity(self.receivers.len());
         for (index, receiver) in self.receivers.iter().enumerate() {
@@ -316,39 +354,25 @@ impl Simulation {
                     relays: Vec::new(),
                 },
             )?;
-            let mut heard: Vec<(f64, &Reception)> = self
-                .receptions
-                .iter()
-                .zip(&self.sources)
-                .filter(|(reception, _)| reception.receiver == receiver.key)
-                .map(|(reception, source)| (self.transmissions[*source].time, reception))
-                .collect();
-            heard.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let mut by_wall: Vec<Vec<&Reception>> = Vec::new();
-            for (_, reception) in heard {
-                match by_wall.last_mut() {
-                    Some(batch)
-                        if batch[0].wall_ms == reception.wall_ms && batch.len() < MAX_BATCH =>
-                    {
-                        batch.push(reception);
-                    }
-                    _ => by_wall.push(vec![reception]),
-                }
-            }
             let mut batches = Vec::new();
             let mut previous = [0; 32];
-            for (sequence, chunk) in by_wall.iter().enumerate() {
-                let batch = Batch::sign(
+            let relay = anchoring_relay();
+            for (sequence, chunk) in self.batches_of(index).iter().enumerate() {
+                // Anchored as its relay stated its clock when it was signed (RFC-0171 §3.6).
+                let anchor = tally_wire::Anchor::sign(&relay, chunk[0].wall_ms);
+                let batch = Batch::sign_anchored(
                     &identity,
                     &BatchContent {
-                        boot_id: 1,
+                        boot_id: BOOT_ID,
                         sequence: sequence as u64,
                         counter_epoch: 1,
                         wall_ms: chunk[0].wall_ms,
                         dropped: 0,
                         previous,
-                        observations: chunk.iter().map(|r| r.observation.clone()).collect(),
+                        observations: chunk.iter().map(|r| r.observation(SIGNAL)).collect(),
                     },
+                    tally_wire::Codec::Plain,
+                    &[anchor],
                 )?;
                 previous = batch.hash();
                 batches.push(batch);
@@ -364,8 +388,137 @@ impl Simulation {
     }
 }
 
+/// The boot every simulated receiver's batches are of.
+pub const BOOT_ID: u64 = 1;
+
+/// The signal level every simulated reception is carried at.
+const SIGNAL: u8 = 128;
+
+/// One batch as it reaches a holder of raw: when, which batch, and its receptions in the order
+/// the receiver heard them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Arrival {
+    pub at_ms: u64,
+    pub batch: BatchId,
+    pub receptions: Vec<Reception>,
+}
+
+/// When feeders as they are seal and deliver (`arrivals`): each receiver seals a batch once a
+/// second at a phase of its own, and each batch takes its receiver's path delay and a jitter.
+struct Delivery {
+    rng: Rng,
+    /// Each receiver's path, milliseconds.
+    delays: Vec<u64>,
+}
+
+impl Delivery {
+    /// Draws every receiver's phase and path from `seed`, then moves every reception's wall clock
+    /// to the batch it now travels in: the receiver's first seal after it was heard.
+    fn new(simulation: &mut Simulation, seed: u64) -> Self {
+        let mut rng = Rng::new(seed);
+        let start_ms = simulation.scenario.start_ms();
+        let phases: Vec<u64> = (0..simulation.receivers.len())
+            .map(|_| (rng.uniform() * 1000.0) as u64)
+            .collect();
+        let delays: Vec<u64> = (0..simulation.receivers.len())
+            .map(|_| 40 + (rng.uniform() * 210.0) as u64)
+            .collect();
+        let index_of: std::collections::BTreeMap<PublicKey, usize> = simulation
+            .receivers
+            .iter()
+            .enumerate()
+            .map(|(index, receiver)| (receiver.key, index))
+            .collect();
+        let times: Vec<f64> = simulation
+            .sources
+            .iter()
+            .map(|source| simulation.transmissions[*source].time)
+            .collect();
+        for (reception, time) in simulation.receptions.iter_mut().zip(times) {
+            let Some(index) = index_of.get(&reception.receiver) else {
+                continue;
+            };
+            let heard_ms = (time.max(0.0) * 1000.0) as u64;
+            let phase = phases[*index];
+            let seconds = (heard_ms + 1000 - phase) / 1000;
+            reception.wall_ms = start_ms + seconds * 1000 + phase;
+        }
+        Self { rng, delays }
+    }
+
+    /// When a batch of receiver `index` sealed at `wall_ms` arrives.
+    fn arrives(&mut self, index: usize, wall_ms: u64) -> u64 {
+        let jitter = (self.rng.uniform() * 30.0) as u64;
+        wall_ms + self.delays[index] + jitter
+    }
+}
+
+/// Feeders as they are (tally-feed's `SEAL_EVERY`): each simulated receiver seals a batch once a
+/// second at a phase of its own (the simulator's own batches all seal on the whole second, which
+/// would make every reception of a transmission arrive together), and each batch reaches the
+/// holder after its receiver's path delay (40 to 250 ms) and a little jitter. The simulation's
+/// receptions are rewritten in place to the wall clocks of the batches they now travel in; the
+/// batches are the receivers' [`Simulation::feeds`] would sign of them, sorted by arrival.
+pub fn arrivals(simulation: &mut Simulation, seed: u64) -> Vec<Arrival> {
+    let mut delivery = Delivery::new(simulation, seed);
+    let mut out = Vec::new();
+    for index in 0..simulation.receivers.len() {
+        let receiver = simulation.receivers[index].key;
+        for (sequence, chunk) in simulation.batches_of(index).into_iter().enumerate() {
+            out.push(Arrival {
+                at_ms: delivery.arrives(index, chunk[0].wall_ms),
+                batch: BatchId {
+                    receiver,
+                    boot_id: BOOT_ID,
+                    sequence: sequence as u64,
+                },
+                receptions: chunk.into_iter().cloned().collect(),
+            });
+        }
+    }
+    out.sort_by_key(|arrival| arrival.at_ms);
+    out
+}
+
+/// As [`arrivals`], as the records the receivers sign, each with when it reaches the holder:
+/// every description and site at the start, then each batch when [`arrivals`] says, from the same
+/// phases and paths. For an engine fed records as a relay hands them on.
+pub fn arrived_records(
+    simulation: &mut Simulation,
+    seed: u64,
+) -> Result<Vec<(u64, tally_wire::Record)>, WireError> {
+    let mut delivery = Delivery::new(simulation, seed);
+    let start_ms = simulation.scenario.start_ms();
+    let feeds = simulation.feeds()?;
+    let mut out = Vec::new();
+    for (index, feed) in feeds.iter().enumerate() {
+        out.push((
+            start_ms,
+            tally_wire::Record::ReceiverInfo(feed.info.clone()),
+        ));
+        out.push((
+            start_ms,
+            tally_wire::Record::ReceiverSite(feed.site.clone()),
+        ));
+        for batch in &feed.batches {
+            let at = delivery.arrives(index, batch.content()?.wall_ms);
+            out.push((at, tally_wire::Record::Batch(batch.clone())));
+        }
+    }
+    out.sort_by_key(|(at, _)| *at);
+    Ok(out)
+}
+
+/// The relay a simulated receiver publishes to, as its batches' freshness anchors name it
+/// (RFC-0171 §3.6): each batch carries this relay's anchor of the second it was signed in. A relay
+/// a simulation feeds uses its batches only if it knows this key (its own, or one its operator
+/// accepted, `--accept-relay`), as it would the relay a real feeder holds a session with.
+pub fn anchoring_relay() -> Identity {
+    Identity::from_seed([0xa7; 32])
+}
+
 /// One simulated receiver's signed traffic.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Feed {
     pub identity: Identity,
     /// Its description as a new feeder signs it: format 2, its public cell and no site.
@@ -456,8 +609,8 @@ fn pressure_feet(aircraft: &SimAircraft, height: f64) -> i32 {
 }
 
 /// Where receiver `index` stands: one of `RECEIVERS`, or beyond them a point on a sunflower
-/// spiral out to `spread_m` around the centre (the golden angle apart, so no two coincide), 10 m
-/// up.
+/// spiral out to `receiver_spread_m` (else `spread_m`) around the centre (the golden angle apart,
+/// so no two coincide), 10 m up.
 fn site_of(scenario: &Scenario, index: usize) -> (f64, f64, f64) {
     let (lat0, lon0) = scenario.centre;
     let named = if scenario.named { RECEIVERS.len() } else { 0 };
@@ -467,7 +620,8 @@ fn site_of(scenario: &Scenario, index: usize) -> (f64, f64, f64) {
     let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
     let k = (index - named) as f64;
     let total = scenario.receivers.saturating_sub(named).max(1) as f64;
-    let radius = scenario.spread_m * ((k + 0.5) / total).sqrt().min(1.0);
+    let spread_m = scenario.receiver_spread_m.unwrap_or(scenario.spread_m);
+    let radius = spread_m * ((k + 0.5) / total).sqrt().min(1.0);
     let bearing = k * golden;
     (
         lat0 + radius * bearing.cos() / 111_132.0,
@@ -678,27 +832,19 @@ impl World {
         receiver: usize,
         range: f64,
         noise: f64,
-    ) -> Reception {
+    ) -> Option<Reception> {
         let receiver = &self.receivers[receiver];
         let arrival = transmission.time + range / C;
         let raw = receiver
             .truth
             .counter(arrival, self.scenario.start_tod_s, noise);
-        Reception {
+        Some(Reception {
             receiver: receiver.key,
             epoch: 1,
             wall_ms: self.scenario.wall_ms(arrival),
-            observation: Observation {
-                format: if transmission.data.len() == 14 {
-                    format::MODE_S_LONG
-                } else {
-                    format::MODE_S_SHORT
-                },
-                timestamp: raw,
-                signal: 128,
-                data: transmission.data.clone(),
-            },
-        }
+            timestamp: raw,
+            message: crate::obs::ModeS::new(&transmission.data)?,
+        })
     }
 
     /// Appends to `into` what the receivers `mine` (indices) hear of transmission `index`, each
@@ -887,7 +1033,8 @@ fn make(scenario: &Scenario) -> (World, Rng, Vec<SimAircraft>) {
     let mut transmissions = Vec::new();
     for plane in &aircraft {
         let mut schedule: Vec<(f64, u8)> = Vec::new();
-        // Kinds: 0 position, 1 operational status, 2 all-call squitter, 3 altitude reply.
+        // Kinds: 0 position, 1 operational status, 2 all-call squitter, 3 altitude reply, and,
+        // with `unwanted`, 4 velocity, 5 target state and status, 6 identification.
         let mut t = rng.range(0.0, 0.5);
         while t < scenario.duration_s {
             if plane.adsb {
@@ -907,6 +1054,15 @@ fn make(scenario: &Scenario) -> (World, Rng, Vec<SimAircraft>) {
             while t < scenario.duration_s {
                 schedule.push((t, 1));
                 t += rng.range(2.3, 2.7);
+            }
+        }
+        if plane.adsb && scenario.unwanted {
+            for (kind, low, high) in [(4, 0.4, 0.6), (5, 1.15, 1.35), (6, 4.8, 5.2)] {
+                let mut t = rng.range(0.0, high);
+                while t < scenario.duration_s {
+                    schedule.push((t, kind));
+                    t += rng.range(low, high);
+                }
             }
         }
         schedule.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -946,7 +1102,11 @@ fn make(scenario: &Scenario) -> (World, Rng, Vec<SimAircraft>) {
                     df17(plane.address, me)
                 }
                 2 => df11(plane.address),
-                _ => df4(plane.address, pressure_feet(plane, truth.height_m)),
+                3 => df4(plane.address, pressure_feet(plane, truth.height_m)),
+                // What MLAT never uses: the fields past the type code are not read here.
+                4 => df17(plane.address, [(19 << 3) | 1, 0, 0, 0, 0, 0, 0]),
+                5 => df17(plane.address, [(29 << 3) | 2, 0, 0, 0, 0, 0, 0]),
+                _ => df17(plane.address, [4 << 3, 0, 0, 0, 0, 0, 0]),
             };
             transmissions.push(TruthTransmission {
                 address: plane.address,
@@ -989,7 +1149,9 @@ fn run_with(
                 continue;
             }
             let noise = world.receivers[receiver].truth.jitter_s * rng.normal();
-            sink(world.reception(transmission, receiver, range, noise), index);
+            if let Some(reception) = world.reception(transmission, receiver, range, noise) {
+                sink(reception, index);
+            }
         }
     }
     let World {

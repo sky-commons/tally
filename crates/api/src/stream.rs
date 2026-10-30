@@ -2,7 +2,7 @@
 //! Each `aircraft` event's data is an `AircraftUpdate`: the first every aircraft in the box
 //! (`full`), each later one the aircraft that changed and the addresses that left, at most every
 //! `EVERY`; a comment when nothing has been sent for `Settings::stream_heartbeat`, so the edge keeps
-//! the stream open. The precise feed changes once a second, and each new second is sent whole.
+//! the stream open.
 //!
 //! readsb is read once per `READ_EVERY` for every open stream (`Live`): one task reads every
 //! aircraft readsb positions and publishes the decoded view on a watch channel each stream reads,
@@ -22,7 +22,7 @@ use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use tally_api_types::{Aircraft, AircraftUpdate, Feed};
+use tally_api_types::{Aircraft, AircraftUpdate};
 use tally_relay::hub::source_of;
 use tokio::sync::watch;
 
@@ -231,48 +231,34 @@ pub fn changes(
 struct Viewer {
     app: Arc<App>,
     area: Area,
-    feed: Feed,
-    /// readsb's views, for the live feed; `None` for the precise one, which reads no readsb.
-    views: Option<Views>,
+    /// readsb's views.
+    views: Views,
     /// What the client holds, by hex.
     sent: HashMap<String, Aircraft>,
-    /// The precise second the client holds.
-    second: Option<u64>,
     tick: tokio::time::Interval,
     _place: Place,
 }
 
 impl Viewer {
     /// The next update to send, waiting for one; `None` when the stream ends (readsb has not
-    /// answered for `STALE_AFTER`, or the precise feed is no longer available).
+    /// answered for `STALE_AFTER`).
     async fn next(&mut self) -> Option<AircraftUpdate> {
         loop {
             self.tick.tick().await;
-            match self.feed {
-                Feed::Live => {
-                    let view = self.views.as_ref()?.borrow().clone()?;
-                    if !view.fresh(Instant::now()) {
-                        return None;
-                    }
-                    let (now_ms, aircraft) = in_view(&self.app, &self.area, &view);
-                    let (aircraft, gone) = changes(&mut self.sent, aircraft);
-                    if !aircraft.is_empty() || !gone.is_empty() {
-                        return Some(update(now_ms, Feed::Live, false, aircraft, gone));
-                    }
-                }
-                Feed::Precise => {
-                    let (second, answer) = precise(&self.app, &self.area)?;
-                    if self.second != Some(second) {
-                        self.second = Some(second);
-                        return Some(answer);
-                    }
-                }
+            let view = self.views.borrow().clone()?;
+            if !view.fresh(Instant::now()) {
+                return None;
+            }
+            let (now_ms, aircraft) = in_view(&self.app, &self.area, &view);
+            let (aircraft, gone) = changes(&mut self.sent, aircraft);
+            if !aircraft.is_empty() || !gone.is_empty() {
+                return Some(update(now_ms, false, aircraft, gone));
             }
         }
     }
 }
 
-/// The live feed's aircraft in `area` from `view`: readsb's, then those only Tally MLAT places,
+/// The aircraft in `area` from `view`: readsb's, then those only Tally MLAT places,
 /// as `/v1/aircraft` answers them.
 fn in_view(app: &App, area: &Area, view: &View) -> (u64, Vec<Aircraft>) {
     let readsb = view
@@ -284,28 +270,9 @@ fn in_view(app: &App, area: &Area, view: &View) -> (u64, Vec<Aircraft>) {
     routes::live_answer(app, area, view.now_ms, readsb)
 }
 
-/// The precise feed's newest second in `area` as a full update, or `None` when unavailable.
-fn precise(app: &App, area: &Area) -> Option<(u64, AircraftUpdate)> {
-    let (second, served) =
-        app.mlat
-            .precise_in_area(area, routes::wall_ms(), app.settings.mlat.max_age)?;
-    let answer = routes::precise_answer(&served, second.saturating_mul(1_000), routes::wall_ms());
-    Some((
-        second,
-        update(
-            answer.now_ms,
-            Feed::Precise,
-            true,
-            answer.aircraft,
-            Vec::new(),
-        ),
-    ))
-}
-
 /// An update sent now.
 pub fn update(
     now_ms: u64,
-    feed: Feed,
     full: bool,
     aircraft: Vec<Aircraft>,
     gone: Vec<String>,
@@ -313,7 +280,6 @@ pub fn update(
     AircraftUpdate {
         now_ms,
         sent_at_ms: routes::wall_ms(),
-        feed,
         full,
         aircraft,
         gone,
@@ -326,8 +292,7 @@ fn event(update: &AircraftUpdate) -> Result<Event, axum::Error> {
 }
 
 /// `GET /v1/aircraft/stream`: the viewport checked as `/v1/aircraft` checks it, a place among the
-/// client's streams, and the first, full, update (readsb answering, or a precise second held)
-/// before the stream's `200`, so a client that cannot be served is told why in its status.
+/// client's streams, and the first, full, update (readsb answering) before the stream's `200`, so a client that cannot be served is told why in its status.
 pub async fn open(
     State(app): State<Arc<App>>,
     Extension(Client {
@@ -335,7 +300,7 @@ pub async fn open(
     }): Extension<Client>,
     viewport: Result<Query<Viewport>, QueryRejection>,
 ) -> Response {
-    let (area, feed) = match routes::viewport(viewport) {
+    let area = match routes::viewport(viewport) {
         Ok(asked) => asked,
         Err(why) => return routes::refuse(StatusCode::BAD_REQUEST, &why),
     };
@@ -349,12 +314,27 @@ pub async fn open(
             .insert(header::RETRY_AFTER, HeaderValue::from(HEARTBEAT.as_secs()));
         return response;
     };
+    let mut views = Live::subscribe(&app);
+    let view = match tokio::time::timeout(
+        FIRST_READ,
+        views.wait_for(|view| view.as_ref().is_some_and(|view| view.fresh(Instant::now()))),
+    )
+    .await
+    {
+        Ok(Ok(view)) => view.clone(),
+        _ => None,
+    };
+    let Some(view) = view else {
+        return routes::refuse(StatusCode::BAD_GATEWAY, "readsb did not answer");
+    };
+    let (now_ms, aircraft) = in_view(&app, &area, &view);
     let mut viewer = Viewer {
         area,
-        feed,
-        views: None,
-        sent: HashMap::new(),
-        second: None,
+        views,
+        sent: aircraft
+            .iter()
+            .map(|one| (one.hex.clone(), one.clone()))
+            .collect(),
         tick: tokio::time::interval_at(tokio::time::Instant::now() + EVERY, EVERY),
         _place: place,
         app: Arc::clone(&app),
@@ -362,40 +342,7 @@ pub async fn open(
     viewer
         .tick
         .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let first = match feed {
-        Feed::Live => {
-            let mut views = Live::subscribe(&app);
-            let view = match tokio::time::timeout(
-                FIRST_READ,
-                views.wait_for(|view| view.as_ref().is_some_and(|view| view.fresh(Instant::now()))),
-            )
-            .await
-            {
-                Ok(Ok(view)) => view.clone(),
-                _ => None,
-            };
-            let Some(view) = view else {
-                return routes::refuse(StatusCode::BAD_GATEWAY, "readsb did not answer");
-            };
-            viewer.views = Some(views);
-            let (now_ms, aircraft) = in_view(&app, &area, &view);
-            viewer.sent = aircraft
-                .iter()
-                .map(|one| (one.hex.clone(), one.clone()))
-                .collect();
-            update(now_ms, Feed::Live, true, aircraft, Vec::new())
-        }
-        Feed::Precise => {
-            let Some((second, first)) = precise(&app, &area) else {
-                return routes::refuse(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    routes::PRECISE_UNAVAILABLE,
-                );
-            };
-            viewer.second = Some(second);
-            first
-        }
-    };
+    let first = update(now_ms, true, aircraft, Vec::new());
     let events =
         futures_util::stream::unfold((Some(first), viewer), |(first, mut viewer)| async move {
             let update = match first {

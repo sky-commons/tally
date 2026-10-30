@@ -58,6 +58,29 @@ impl Matrix {
         Some(Cholesky { n, l })
     }
 
+    /// `self · inner · self` for a symmetric `self`: the covariance `inner` carried through the
+    /// linear map `self`, symmetric by construction.
+    pub fn sandwich(&self, inner: &Matrix) -> Matrix {
+        let n = self.n;
+        let mut half = vec![0.0; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                half[i * n + j] = (0..n)
+                    .map(|k| self.data[i * n + k] * inner.data[k * n + j])
+                    .sum();
+            }
+        }
+        let mut out = Matrix::zeros(n);
+        for i in 0..n {
+            for j in 0..=i {
+                let value: f64 = (0..n).map(|k| half[i * n + k] * self.data[k * n + j]).sum();
+                out.set(i, j, value);
+                out.set(j, i, value);
+            }
+        }
+        out
+    }
+
     /// `self · v`.
     pub fn mul_vec(&self, v: &[f64]) -> Vec<f64> {
         (0..self.n)
@@ -100,6 +123,28 @@ impl Cholesky {
         y
     }
 
+    /// `R` with `L R = Q`, `Q` (and `R`) row-major with `width` columns.
+    pub fn forward_rows(&self, q: &[f64], width: usize) -> Vec<f64> {
+        let n = self.n;
+        let mut r = q.to_vec();
+        for i in 0..n {
+            for k in 0..i {
+                let factor = self.l[i * n + k];
+                if factor == 0.0 {
+                    continue;
+                }
+                for j in 0..width {
+                    r[i * width + j] -= factor * r[k * width + j];
+                }
+            }
+            let root = self.l[i * n + i];
+            for value in &mut r[i * width..(i + 1) * width] {
+                *value /= root;
+            }
+        }
+        r
+    }
+
     /// `x` with `Lᵀ x = y`.
     pub fn backward(&self, y: &[f64]) -> Vec<f64> {
         let n = self.n;
@@ -112,6 +157,49 @@ impl Cholesky {
             x[i] = value / self.l[i * n + i];
         }
         x
+    }
+
+    /// `L⁻¹`, lower triangular, row by row.
+    fn lower_inverse(&self) -> Vec<f64> {
+        let n = self.n;
+        let mut inv = vec![0.0; n * n];
+        for i in 0..n {
+            let root = self.l[i * n + i];
+            inv[i * n + i] = 1.0 / root;
+            for j in 0..i {
+                let mut value = 0.0;
+                for k in j..i {
+                    value -= self.l[i * n + k] * inv[k * n + j];
+                }
+                inv[i * n + j] = value / root;
+            }
+        }
+        inv
+    }
+
+    /// `A⁻¹`'s diagonal, as [`Cholesky::inverse_triangular`] makes it (the same sums in the same
+    /// order) without the rest: half its work, for a caller that reads only the variances.
+    pub fn inverse_diagonal(&self) -> Vec<f64> {
+        let n = self.n;
+        let inv = self.lower_inverse();
+        (0..n)
+            .map(|i| (i..n).map(|k| inv[k * n + i] * inv[k * n + i]).sum())
+            .collect()
+    }
+
+    /// `A⁻¹` as `L⁻ᵀ L⁻¹`: a third of [`Cholesky::inverse`]'s work, symmetric by construction.
+    pub fn inverse_triangular(&self) -> Matrix {
+        let n = self.n;
+        let inv = self.lower_inverse();
+        let mut out = Matrix::zeros(n);
+        for i in 0..n {
+            for j in 0..=i {
+                let value: f64 = (i..n).map(|k| inv[k * n + i] * inv[k * n + j]).sum();
+                out.set(i, j, value);
+                out.set(j, i, value);
+            }
+        }
+        out
     }
 
     /// `A⁻¹`, column by column.
@@ -177,15 +265,22 @@ mod tests {
         for (got, want) in back.iter().zip([1.0, 2.0, 3.0]) {
             assert!((got - want).abs() < 1e-9);
         }
-        let inverse = factor.inverse();
-        for row in 0..3 {
-            for column in 0..3 {
-                let mut value = 0.0;
-                for k in 0..3 {
-                    value += a.get(row, k) * inverse.get(k, column);
+        let diagonal = factor.inverse_diagonal();
+        let triangular = factor.inverse_triangular();
+        for (at, value) in diagonal.iter().enumerate() {
+            assert_eq!(value.to_bits(), triangular.get(at, at).to_bits());
+        }
+        for inverse in [factor.inverse(), triangular] {
+            for row in 0..3 {
+                for column in 0..3 {
+                    let mut value = 0.0;
+                    for k in 0..3 {
+                        value += a.get(row, k) * inverse.get(k, column);
+                    }
+                    let want = if row == column { 1.0 } else { 0.0 };
+                    assert!((value - want).abs() < 1e-9);
+                    assert_eq!(inverse.get(row, column), inverse.get(column, row));
                 }
-                let want = if row == column { 1.0 } else { 0.0 };
-                assert!((value - want).abs() < 1e-9);
             }
         }
         Ok(())

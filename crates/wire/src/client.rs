@@ -12,7 +12,7 @@
 //! | ------------------------------------------- | ----------------------------------------- | ------------------------------ |
 //! | `ReceiverSite`, `ReceiverInfo` format 1     | the exact site                            | `ReceiverInfo` format 2        |
 //! | `Batch`, `RelayBatch`, `RegionalBatch`      | counters: reverse MLAT, clock-line ranging | `ClientRegionalBatch`          |
-//! | `Positions` / `Provisional` formats 3, 4    | (receiver, epoch, counter) per reception  | formats 5, 6 (tags)            |
+//! | `Positions` format 7                        | (receiver, epoch, counter) per reception  | format 8 (tags)                |
 //! | `ClockModel`, `ClockModelPart`              | scope sites, `site_mm`, offsets           | `ClientClockModel`             |
 //! | `FaultProof` of raw records, or of models   | carries the records above                 | `FaultProof` of tagged records |
 //! | `EvidenceBundle` holding a format 1 info    | carries the site                          | a bundle by reference, or of format 2 infos |
@@ -29,7 +29,7 @@ use crate::directory::ProviderOffer;
 use crate::fault_proof::FaultProof;
 use crate::positions::Positions;
 use crate::probe::EchoReply;
-use crate::products::{ClientRegionalBatch, WorldPositions, WorldPrecise};
+use crate::products::{ClientRegionalBatch, WorldPositions};
 use crate::record::{Reason, Record, RelayAddress};
 
 /// A format 2 `ReceiverInfo`: a description that carries no site.
@@ -50,7 +50,7 @@ impl PublicReceiverInfo {
     }
 }
 
-/// A tagged `Positions` record (formats 5 and 6): no receiver, no counter.
+/// A tagged `Positions` record (format 8): no receiver, no counter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaggedPositions(Positions);
 
@@ -116,6 +116,7 @@ pub enum ClientRecord {
         version: u16,
     },
     Heartbeat,
+    TimedHeartbeat(crate::record::HeartbeatTimes),
     Redirect {
         retry_after_secs: u32,
         hints: Vec<RelayAddress>,
@@ -125,6 +126,8 @@ pub enum ClientRecord {
         bytes_per_sec: u32,
         burst: u32,
         wanted_per_sec: Option<u32>,
+        clock_ms: Option<u64>,
+        error_ms: Option<u64>,
     },
     Goodbye {
         reason: Reason,
@@ -132,18 +135,19 @@ pub enum ClientRecord {
     },
     ReceiverInfo(PublicReceiverInfo),
     Positions(TaggedPositions),
-    Provisional(TaggedPositions),
     ClockModel(ClientClockModel),
     FaultProof(ClientFaultProof),
     RegionalBatch(ClientRegionalBatch),
     WorldPositions(WorldPositions),
-    WorldPrecise(WorldPrecise),
     EchoReply(EchoReply),
     DeliveryAnswer(DeliveryAnswer),
     ProviderOffer(ProviderOffer),
     FirehoseCredential(FirehoseCredential),
     EvidenceBundle(ClientEvidence),
     FeederFigures(crate::figures::FeederFigures),
+    /// A relay's freshness anchor, to its feeder (RFC-0171 §3.6): what the feeder puts in each
+    /// batch it signs.
+    Anchor(crate::anchor::Anchor),
 }
 
 impl TryFrom<Record> for ClientRecord {
@@ -154,6 +158,7 @@ impl TryFrom<Record> for ClientRecord {
         Ok(match record {
             Record::Welcome { version } => Self::Welcome { version },
             Record::Heartbeat => Self::Heartbeat,
+            Record::TimedHeartbeat(times) => Self::TimedHeartbeat(times),
             Record::Redirect {
                 retry_after_secs,
                 hints,
@@ -166,10 +171,14 @@ impl TryFrom<Record> for ClientRecord {
                 bytes_per_sec,
                 burst,
                 wanted_per_sec,
+                clock_ms,
+                error_ms,
             } => Self::RateLimit {
                 bytes_per_sec,
                 burst,
                 wanted_per_sec,
+                clock_ms,
+                error_ms,
             },
             Record::Goodbye {
                 reason,
@@ -184,9 +193,6 @@ impl TryFrom<Record> for ClientRecord {
             Record::Positions(positions) => TaggedPositions::new(positions)
                 .map(Self::Positions)
                 .map_err(Record::Positions)?,
-            Record::Provisional(positions) => TaggedPositions::new(positions)
-                .map(Self::Provisional)
-                .map_err(Record::Provisional)?,
             Record::FaultProof(proof) => ClientFaultProof::new(proof)
                 .map(Self::FaultProof)
                 .map_err(Record::FaultProof)?,
@@ -197,11 +203,11 @@ impl TryFrom<Record> for ClientRecord {
             Record::ClientRegionalBatch(batch) => Self::RegionalBatch(batch),
             Record::FeederFigures(figures) => Self::FeederFigures(figures),
             Record::WorldPositions(world) => Self::WorldPositions(world),
-            Record::WorldPrecise(world) => Self::WorldPrecise(world),
             Record::EchoReply(reply) => Self::EchoReply(reply),
             Record::DeliveryAnswer(answer) => Self::DeliveryAnswer(answer),
             Record::ProviderOffer(offer) => Self::ProviderOffer(offer),
             Record::FirehoseCredential(credential) => Self::FirehoseCredential(credential),
+            Record::Anchor(anchor) => Self::Anchor(anchor),
             // Relay-only, or never sent to a client at all. Listed, not a wildcard, so a new
             // record kind is a compile error here until someone decides which it is.
             other @ (Record::Hello { .. }
@@ -232,6 +238,7 @@ impl From<ClientRecord> for Record {
         match record {
             ClientRecord::Welcome { version } => Self::Welcome { version },
             ClientRecord::Heartbeat => Self::Heartbeat,
+            ClientRecord::TimedHeartbeat(times) => Self::TimedHeartbeat(times),
             ClientRecord::Redirect {
                 retry_after_secs,
                 hints,
@@ -244,10 +251,14 @@ impl From<ClientRecord> for Record {
                 bytes_per_sec,
                 burst,
                 wanted_per_sec,
+                clock_ms,
+                error_ms,
             } => Self::RateLimit {
                 bytes_per_sec,
                 burst,
                 wanted_per_sec,
+                clock_ms,
+                error_ms,
             },
             ClientRecord::Goodbye {
                 reason,
@@ -258,18 +269,17 @@ impl From<ClientRecord> for Record {
             },
             ClientRecord::ReceiverInfo(info) => Self::ReceiverInfo(info.0),
             ClientRecord::Positions(positions) => Self::Positions(positions.0),
-            ClientRecord::Provisional(positions) => Self::Provisional(positions.0),
             ClientRecord::ClockModel(model) => Self::ClientClockModel(model),
             ClientRecord::FaultProof(proof) => Self::FaultProof(proof.0),
             ClientRecord::RegionalBatch(batch) => Self::ClientRegionalBatch(batch),
             ClientRecord::FeederFigures(figures) => Self::FeederFigures(figures),
             ClientRecord::WorldPositions(world) => Self::WorldPositions(world),
-            ClientRecord::WorldPrecise(world) => Self::WorldPrecise(world),
             ClientRecord::EchoReply(reply) => Self::EchoReply(reply),
             ClientRecord::DeliveryAnswer(answer) => Self::DeliveryAnswer(answer),
             ClientRecord::ProviderOffer(offer) => Self::ProviderOffer(offer),
             ClientRecord::FirehoseCredential(credential) => Self::FirehoseCredential(credential),
             ClientRecord::EvidenceBundle(bundle) => Self::EvidenceBundle(bundle.0),
+            ClientRecord::Anchor(anchor) => Self::Anchor(anchor),
         }
     }
 }
@@ -281,12 +291,10 @@ impl ClientRecord {
         Some(match self {
             Self::ReceiverInfo(info) => (KIND_RECEIVER_INFO, info.0.as_bytes()),
             Self::Positions(positions) => (KIND_POSITIONS, positions.0.as_bytes()),
-            Self::Provisional(positions) => (KIND_PROVISIONAL, positions.0.as_bytes()),
             Self::ClockModel(model) => (KIND_CLIENT_CLOCK_MODEL, model.as_bytes()),
             Self::FaultProof(proof) => (KIND_FAULT_PROOF, proof.0.as_bytes()),
             Self::RegionalBatch(batch) => (KIND_CLIENT_REGIONAL_BATCH, batch.as_bytes()),
             Self::WorldPositions(world) => (KIND_WORLD_POSITIONS, world.as_bytes()),
-            Self::WorldPrecise(world) => (KIND_WORLD_PRECISE, world.as_bytes()),
             Self::EchoReply(reply) => (KIND_ECHO_REPLY, reply.as_bytes()),
             Self::DeliveryAnswer(answer) => (KIND_DELIVERY_ANSWER, answer.as_bytes()),
             Self::ProviderOffer(offer) => (KIND_PROVIDER_OFFER, offer.as_bytes()),
@@ -297,10 +305,12 @@ impl ClientRecord {
             Self::FeederFigures(figures) => (KIND_FEEDER_FIGURES, figures.as_bytes()),
             Self::Welcome { .. }
             | Self::Heartbeat
+            | Self::TimedHeartbeat(_)
             | Self::Redirect { .. }
             | Self::RelayList(_)
             | Self::RateLimit { .. }
-            | Self::Goodbye { .. } => return None,
+            | Self::Goodbye { .. }
+            | Self::Anchor(_) => return None,
         })
     }
 
@@ -321,6 +331,39 @@ impl ClientRecord {
         }
     }
 
+    /// What it allocates of its own beside its place, as `Record::allocated` says of a record: a
+    /// signed record its bytes' capacity, any other its lists' and strings'.
+    pub fn allocated(&self) -> usize {
+        use crate::footprint::vec;
+        match self {
+            Self::Welcome { .. }
+            | Self::Heartbeat
+            | Self::TimedHeartbeat(_)
+            | Self::RateLimit { .. }
+            | Self::Goodbye { .. }
+            | Self::Anchor(_) => 0,
+            Self::Redirect { hints, .. } | Self::RelayList(hints) => {
+                vec::<RelayAddress>(hints.capacity())
+                    + hints
+                        .iter()
+                        .map(|hint| hint.address.capacity())
+                        .sum::<usize>()
+            }
+            Self::ReceiverInfo(info) => info.0.allocated(),
+            Self::Positions(positions) => positions.0.allocated(),
+            Self::ClockModel(model) => model.allocated(),
+            Self::FaultProof(proof) => proof.0.allocated(),
+            Self::RegionalBatch(batch) => batch.allocated(),
+            Self::WorldPositions(world) => world.allocated(),
+            Self::EchoReply(reply) => reply.allocated(),
+            Self::DeliveryAnswer(answer) => answer.allocated(),
+            Self::ProviderOffer(offer) => offer.allocated(),
+            Self::FirehoseCredential(credential) => credential.allocated(),
+            Self::EvidenceBundle(bundle) => bundle.0.allocated(),
+            Self::FeederFigures(figures) => figures.allocated(),
+        }
+    }
+
     /// The bytes `encode` writes, as `Record::encoded_len` measures a record.
     pub fn encoded_len(&self) -> usize {
         match self.signed() {
@@ -337,10 +380,11 @@ impl ClientRecord {
         }
     }
 
-    /// Decodes one record from the front of `bytes` as a client reads it: as `Record::decode`, and
-    /// a relay-only record is an error (a relay that sends one to a client broke version 3).
-    pub fn decode(bytes: &[u8]) -> Result<(Option<Self>, usize), WireError> {
-        let (record, used) = Record::decode(bytes)?;
+    /// Decodes one record from the front of `bytes` as a client on a session that negotiated
+    /// `version` reads it: as `Record::decode`, and a relay-only record is an error (a relay that
+    /// sends one to a client broke version 3).
+    pub fn decode(bytes: &[u8], version: u16) -> Result<(Option<Self>, usize), WireError> {
+        let (record, used) = Record::decode(bytes, version)?;
         match record {
             None => Ok((None, used)),
             Some(record) => {
@@ -360,6 +404,7 @@ impl ClientRecord {
 mod tests {
     use super::*;
     use crate::key::Identity;
+    use crate::record::MAX_VERSION;
 
     #[test]
     fn nothing_site_bearing_converts_and_everything_client_safe_round_trips()
@@ -376,7 +421,7 @@ mod tests {
             let Ok(client) = ClientRecord::try_from(record.clone()) else {
                 let mut bytes = Vec::new();
                 record.encode(&mut bytes)?;
-                assert!(ClientRecord::decode(&bytes).is_err());
+                assert!(ClientRecord::decode(&bytes, MAX_VERSION).is_err());
                 continue;
             };
             let (mut ours, mut theirs) = (Vec::new(), Vec::new());
@@ -386,7 +431,7 @@ mod tests {
             assert_eq!(client.encoded_len(), ours.len());
             assert_eq!(client.kind(), record.kind());
             assert_eq!(
-                ClientRecord::decode(&ours)?,
+                ClientRecord::decode(&ours, MAX_VERSION)?,
                 (Some(client.clone()), ours.len())
             );
             assert_eq!(Record::from(client), *record);
@@ -396,15 +441,15 @@ mod tests {
 
     #[test]
     fn raw_counters_and_full_models_never_convert() -> Result<(), WireError> {
-        use crate::positions::tests::{solution, solutions};
+        use crate::positions::tests::{fix_at, fixes_of};
         let engine = Identity::generate()?;
-        let raw = Positions::sign_solutions(
+        let raw = Positions::sign_fix(
             &engine,
-            &solutions(0, vec![solution([1; 32], &[1, 2, 3], 10)?]),
+            &fixes_of(0, vec![fix_at([1; 32], &[1, 2, 3], &[1, 2, 3], 10)?]),
         )?;
-        let other = Positions::sign_solutions(
+        let other = Positions::sign_fix(
             &engine,
-            &solutions(1, vec![solution([1; 32], &[1, 2, 3], 9_000)?]),
+            &fixes_of(1, vec![fix_at([1; 32], &[1, 2, 3], &[1, 2, 3], 9_000)?]),
         )?;
         let model = crate::ClockModel::sign(
             &engine,
@@ -444,8 +489,12 @@ mod tests {
                 "{relay_only:?}"
             );
         }
-        // Control converts.
+        // Control converts, a relay's anchor to its feeder among it.
         for control in [
+            Record::Anchor(crate::anchor::Anchor::sign(
+                &Identity::from_seed([5; 32]),
+                1_800_000_000_000,
+            )),
             Record::Heartbeat,
             Record::Welcome { version: 3 },
             Record::Goodbye {
@@ -461,7 +510,7 @@ mod tests {
             let mut bytes = Vec::new();
             client.encode(&mut bytes)?;
             assert_eq!(client.encoded_len(), bytes.len());
-            assert_eq!(Record::decode(&bytes)?.0, Some(control));
+            assert_eq!(Record::decode(&bytes, MAX_VERSION)?.0, Some(control));
         }
         Ok(())
     }

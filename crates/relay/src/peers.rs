@@ -36,13 +36,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tally_wire::{Identity, PublicKey, Record, RelayAddress, Role, Streams};
+use tally_wire::{NoiseKey, PublicKey, Record, RelayAddress, Role, Streams};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::budget::{Charge, Gauge, Store};
 use crate::hub::Hub;
 use crate::selection::RawSource;
+use crate::sharing::{MonoDeadline, Now};
 
 /// How long a member link may go unused before it is closed.
 pub const IDLE_MS: u64 = 5 * 60 * 1000;
@@ -54,7 +55,7 @@ const WAITING_PER_LINK: usize = 1_024;
 /// the relay plans is planned for its link (`budget::Plan::member_links`), so one slow member holds
 /// no more than this. A link gets one send a network tick (`network::TICK`, 100 ms), a stripe
 /// slice of a kilobyte or so each: some 256 of them, 25 s of sends, far past the point
-/// (`sharing::Deadlines::repair_after_ms`) where the member asks again for what it lacks, so a link
+/// (`sharing::Deadlines::repair_after`) where the member asks again for what it lacks, so a link
 /// this far behind holds nothing its member still waits for. (At 1 MiB, a relay taking a base
 /// cell planned 2 GiB for its 2,048 member links alone.) Twice a repair page, which is one send
 /// down this link (`sharing::member::REPAIR_PAGE_BYTES`), so a page always fits.
@@ -77,13 +78,17 @@ pub struct Written {
 }
 
 impl Queued {
-    /// What `records` cost while they wait: each one's encoded bytes and its slot, and the send's.
+    /// What a send of `records` allocates while it waits, as it is made ([`queued`], its lists
+    /// exactly as long): the send itself in its link's queue, each record's slot and its store
+    /// charge's, and what each record allocates of its own (`Record::allocated`). Before, each was
+    /// charged its encoded bytes and an assumed slot, which the lists' spare capacity passed.
     pub fn bytes(records: &[Record]) -> usize {
-        records
-            .iter()
-            .fold(std::mem::size_of::<Self>(), |sum, record| {
-                sum.saturating_add(record.encoded_len() + std::mem::size_of::<Record>())
-            })
+        records.iter().fold(
+            std::mem::size_of::<Self>()
+                + crate::footprint::vec::<Record>(records.len())
+                + crate::footprint::vec::<Charge>(records.len()),
+            |sum, record| sum.saturating_add(record.allocated()),
+        )
     }
 
     /// The records, and the charge to drop once they are written.
@@ -109,11 +114,14 @@ fn queued(
     member: &PublicKey,
     sends: Vec<crate::sharing::Addressed>,
 ) -> Option<Queued> {
-    let (records, store): (Vec<Record>, Vec<Charge>) = sends
+    let (mut records, mut store): (Vec<Record>, Vec<Charge>) = sends
         .into_iter()
         .filter(|sent| sent.to == *member)
         .map(|sent| (sent.record, sent.charge))
         .unzip();
+    // Exactly as long, so what they allocate is what `Queued::bytes` says.
+    records.shrink_to_fit();
+    store.shrink_to_fit();
     let bytes = Queued::bytes(&records);
     let link = waiting.try_charge(bytes)?;
     let all = links.try_charge(bytes)?;
@@ -130,7 +138,8 @@ fn queued(
 struct Held {
     sender: mpsc::Sender<Queued>,
     task: JoinHandle<()>,
-    used_ms: u64,
+    /// Closed once this passes unused (`IDLE_MS` after its last send, by `M`).
+    idle_at: MonoDeadline,
     /// The link's share of the store (`WAITING_PER_LINK_BYTES`): what its waiting sends hold.
     waiting: Arc<Gauge>,
 }
@@ -145,6 +154,8 @@ impl Drop for Held {
 pub struct Peers {
     members: Mutex<HashMap<PublicKey, Held>>,
     raw: Mutex<HashMap<(PublicKey, Vec<u64>), Held>>,
+    /// The members routed around as full, each wait on `M` (`Now::mono_ms`): how long a member is
+    /// routed around is a duration on this relay, never moved by a step of its judging clock.
     full: Mutex<HashMap<PublicKey, Wait>>,
     /// Sends dropped whole for room, since start.
     refused: AtomicU64,
@@ -164,33 +175,36 @@ impl Peers {
     /// routed around, and not dialled, for that long, or for twice the wait it was last given if
     /// it refuses again within that wait of its end (at most `FULL_WAIT_MAX_MS`), so a full member
     /// is tried less and less often and never in a loop.
-    pub fn refused_full(&self, key: PublicKey, asked: Duration, now_ms: u64) {
+    pub fn refused_full(&self, key: PublicKey, asked: Duration, now: impl Into<Now>) {
+        let now = now.into();
         let Ok(mut full) = self.full.lock() else {
             return;
         };
         let last = full.get(&key).copied();
-        full.insert(key, Wait::after(last, asked, now_ms));
+        full.insert(key, Wait::after(last, asked, now));
     }
 
     /// The members full now: routed around until their wait ends. A member's record is forgotten
     /// once a wait as long again has passed with no refusal, so its next one starts afresh.
-    pub fn full(&self, now_ms: u64) -> BTreeSet<PublicKey> {
+    pub fn full(&self, now: impl Into<Now>) -> BTreeSet<PublicKey> {
+        let now = now.into();
         let Ok(mut full) = self.full.lock() else {
             return BTreeSet::new();
         };
-        full.retain(|_, held| held.remembered(now_ms));
+        full.retain(|_, held| held.remembered(now));
         full.iter()
-            .filter(|(_, held)| held.holds(now_ms))
+            .filter(|(_, held)| held.holds(now))
             .map(|(key, _)| *key)
             .collect()
     }
 
-    /// How long `key` is routed around from `now_ms`, if it is full.
-    pub fn full_for(&self, key: &PublicKey, now_ms: u64) -> Option<Duration> {
+    /// How long `key` is routed around from `now`, if it is full.
+    pub fn full_for(&self, key: &PublicKey, now: impl Into<Now>) -> Option<Duration> {
+        let now = now.into();
         let full = self.full.lock().ok()?;
         let held = full.get(key)?;
-        held.holds(now_ms)
-            .then(|| Duration::from_millis(held.until_ms - now_ms))
+        held.holds(now)
+            .then(|| Duration::from_millis(held.until.left_ms(now)))
     }
 
     /// Sends what sharing addressed the member `relay.key` (`sends`, each charged to its store) to
@@ -201,12 +215,13 @@ impl Peers {
     pub fn send(
         &self,
         hub: &Arc<Hub>,
-        identity: &Identity,
+        identity: &NoiseKey,
         relay: RelayAddress,
         sends: Vec<crate::sharing::Addressed>,
-        now_ms: u64,
+        now: impl Into<Now>,
     ) {
-        if self.full_for(&relay.key, now_ms).is_some() {
+        let now = now.into();
+        if self.full_for(&relay.key, now).is_some() {
             return;
         }
         let Ok(mut members) = self.members.lock() else {
@@ -232,11 +247,11 @@ impl Peers {
             Held {
                 sender,
                 task,
-                used_ms: now_ms,
+                idle_at: now.after(IDLE_MS),
                 waiting: Gauge::new(Store::Batches, WAITING_PER_LINK_BYTES),
             }
         });
-        held.used_ms = now_ms;
+        held.idle_at = now.after(IDLE_MS);
         let links = hub.budget().member_links();
         let sent = queued((&held.waiting, &links), &key, sends)
             .is_some_and(|queued| held.sender.try_send(queued).is_ok());
@@ -249,10 +264,11 @@ impl Peers {
     pub fn keep_raw(
         &self,
         hub: &Arc<Hub>,
-        identity: &Identity,
+        identity: &NoiseKey,
         sources: Vec<RawSource>,
-        now_ms: u64,
+        now: impl Into<Now>,
     ) {
+        let now = now.into();
         let Ok(mut raw) = self.raw.lock() else {
             return;
         };
@@ -270,13 +286,14 @@ impl Peers {
         raw.retain(|key, held| wanted.contains_key(key) && !held.task.is_finished());
         for (key, source) in wanted {
             // A source that said it is full is not dialled until its wait has passed.
-            if raw.contains_key(&key) || self.full_for(&key.0, now_ms).is_some() {
+            if raw.contains_key(&key) || self.full_for(&key.0, now).is_some() {
                 continue;
             }
             // The sender is held and never sent on: the link lives while it does.
             let (sender, outgoing) = mpsc::channel(1);
+            // The band's raw, and its areas' models, which the engine's fixes may cite.
             let subscribe = Record::Subscribe {
-                streams: Streams::RAW,
+                streams: Streams::RAW.with(Streams::CLOCK_MODELS),
                 regions: source.regions.clone(),
             };
             let task = tokio::spawn(crate::link::member(
@@ -292,7 +309,8 @@ impl Peers {
                 Held {
                     sender,
                     task,
-                    used_ms: now_ms,
+                    // Kept while `selection` names it, never closed idle.
+                    idle_at: MonoDeadline::NEVER,
                     // Never sent on: nothing waits.
                     waiting: Gauge::new(Store::Batches, 0),
                 },
@@ -300,12 +318,11 @@ impl Peers {
         }
     }
 
-    /// Closes member links idle past `IDLE_MS`.
-    pub fn expire(&self, now_ms: u64) {
+    /// Closes member links idle past `IDLE_MS`, by `M`.
+    pub fn expire(&self, now: impl Into<Now>) {
+        let now = now.into();
         if let Ok(mut members) = self.members.lock() {
-            members.retain(|_, held| {
-                now_ms.saturating_sub(held.used_ms) <= IDLE_MS && !held.task.is_finished()
-            });
+            members.retain(|_, held| !held.idle_at.passed(now) && !held.task.is_finished());
         }
     }
 
@@ -320,7 +337,39 @@ impl Peers {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
+    use tally_wire::Identity;
+
+    /// RFC-0171 §3.6: a full member is routed around for its wait by the relay's monotonic
+    /// clock. A step of the judging clock a minute back neither stretches the wait nor, a minute
+    /// forward, ends it early. Before, the wait was kept on the judging clock and moved with it.
+    #[test]
+    fn a_full_members_wait_is_kept_by_the_monotonic_clock() -> Result<(), String> {
+        use crate::sharing::Now;
+        let peers = Peers::new();
+        let key = Identity::generate()
+            .map_err(|error| error.to_string())?
+            .public();
+        let t0 = 1_000_000_000;
+        let at = |mono_ms: u64, judge_step_ms: i64| {
+            Now::from(crate::ingest::Stamp::recorded(
+                mono_ms,
+                0,
+                mono_ms.saturating_add_signed(judge_step_ms),
+                mono_ms,
+                true,
+            ))
+        };
+        peers.refused_full(key, Duration::from_secs(60), at(t0, 0));
+        assert!(peers.full(at(t0 + 1_000, 120_000)).contains(&key));
+        assert_eq!(
+            peers.full_for(&key, at(t0 + 1_000, 120_000)),
+            Some(Duration::from_secs(59))
+        );
+        assert!(!peers.full(at(t0 + 60_000, -60_000)).contains(&key));
+        Ok(())
+    }
 
     /// A member that says it is full is routed around for the wait it asked, then tried again;
     /// turned away again within that wait of its end, the wait doubles, up to the most; and a
@@ -371,8 +420,16 @@ mod tests {
         Ok(())
     }
 
-    /// What sharing addressed `member`, `count` heartbeats each charged to `store` as its outbox
-    /// charges a send: its encoded bytes.
+    /// A record that allocates bytes of its own, as a send's do.
+    fn sent(member: PublicKey) -> Record {
+        Record::RelayList(vec![tally_wire::RelayAddress {
+            key: member,
+            address: "relay.example:4100".to_owned(),
+        }])
+    }
+
+    /// What sharing addressed `member`, `count` records each charged to `store` as its outbox
+    /// charges a send: what the record allocates (`Record::allocated`).
     fn addressed(
         store: &Arc<Gauge>,
         member: PublicKey,
@@ -380,14 +437,47 @@ mod tests {
     ) -> Vec<crate::sharing::Addressed> {
         (0..count)
             .filter_map(|_| {
-                let charge = store.try_charge(Record::Heartbeat.encoded_len())?;
+                let record = sent(member);
+                let charge = store.try_charge(record.allocated())?;
                 Some(crate::sharing::Addressed {
                     to: member,
-                    record: Record::Heartbeat,
+                    record,
                     charge,
+                    unaddressed_until: None,
                 })
             })
             .collect()
+    }
+
+    /// A send waiting for its link is charged what it allocates: its lists of records and of
+    /// their charges, read from an allocator counting this thread's bytes, beside the send's own
+    /// place and what each record allocates. Before, the charges' list was charged nothing.
+    #[test]
+    fn a_send_waiting_for_its_link_is_charged_what_it_allocates() -> Result<(), String> {
+        use tally_counting::Counting;
+        let member = Identity::generate()
+            .map_err(|error| error.to_string())?
+            .public();
+        let store = Gauge::unlimited(Store::Batches);
+        let (waiting, links) = (
+            Gauge::unlimited(Store::Batches),
+            Gauge::unlimited(Store::Batches),
+        );
+        for count in [1, 3, 17] {
+            let sends = addressed(&store, member, count);
+            let given = crate::footprint::vec::<crate::sharing::Addressed>(sends.capacity());
+            let own: usize = sends.iter().map(|sent| sent.record.allocated()).sum();
+            let base = Counting::live();
+            let send = queued((&waiting, &links), &member, sends).ok_or("refused")?;
+            // What the send's lists allocate: what was made less the list of sends it was given.
+            let lists = Counting::since(base) + given as isize;
+            assert_eq!(
+                waiting.held() as isize,
+                std::mem::size_of::<Queued>() as isize + lists + own as isize
+            );
+            drop(send);
+        }
+        Ok(())
     }
 
     /// What sharing addressed a member keeps its store charge all the way into the
@@ -403,8 +493,9 @@ mod tests {
         let waiting = Gauge::new(Store::Batches, WAITING_PER_LINK_BYTES);
         // The room every link's share comes from: a link past it is refused too.
         let links = Gauge::new(Store::Batches, 2 * WAITING_PER_LINK_BYTES);
-        let one = Record::Heartbeat.encoded_len();
-        let bytes = Queued::bytes(&[Record::Heartbeat, Record::Heartbeat]);
+        let one = sent(member).allocated();
+        assert!(one > 0);
+        let bytes = Queued::bytes(&[sent(member), sent(member)]);
         let Some(send) = queued((&waiting, &links), &member, addressed(&store, member, 2)) else {
             return Err("an empty share refused a send".into());
         };
@@ -414,7 +505,7 @@ mod tests {
         );
         // Handed to the link, which writes the records and only then drops the charges.
         let (records, written) = send.into_parts();
-        assert_eq!(records, vec![Record::Heartbeat; 2]);
+        assert_eq!(records, vec![sent(member); 2]);
         assert_eq!(store.held(), 2 * one, "released before it was written");
         drop(written);
         assert_eq!((store.held(), waiting.held(), links.held()), (0, 0, 0));
@@ -469,7 +560,7 @@ mod tests {
         .map_err(|error| error.to_string())?;
         let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY).taking(vec![area]));
         assert!(hub.budget().member_links().limit() >= WAITING_PER_LINK_BYTES);
-        let identity = Identity::generate().map_err(|error| error.to_string())?;
+        let identity = NoiseKey::of(Identity::generate().map_err(|error| error.to_string())?);
         let peers = Peers::new();
         let store = Gauge::new(Store::Batches, 64 << 20);
         // Nothing listens there: the link dials and waits, writing nothing.
@@ -480,17 +571,14 @@ mod tests {
             address: "127.0.0.1:9".to_owned(),
         };
         let per_send = 64;
-        let bytes = Queued::bytes(&vec![Record::Heartbeat; per_send]);
+        let bytes = Queued::bytes(&vec![sent(relay.key); per_send]);
         let sends = 2 * WAITING_PER_LINK_BYTES / bytes;
         for _ in 0..sends {
             let charged = addressed(&store, relay.key, per_send);
             peers.send(&hub, &identity, relay.clone(), charged, 0);
         }
         let kept = WAITING_PER_LINK_BYTES / bytes;
-        assert_eq!(
-            store.held(),
-            kept * per_send * Record::Heartbeat.encoded_len()
-        );
+        assert_eq!(store.held(), kept * per_send * sent(relay.key).allocated());
         assert_eq!(peers.refused(), (sends - kept) as u64);
         // Idle past `IDLE_MS`: closed, and what waited for it released.
         peers.expire(IDLE_MS + 1);
@@ -506,7 +594,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_raw_source_is_routed_around_for_its_wait() -> Result<(), String> {
         let hub = Arc::new(Hub::new(8, crate::sharing::Deadlines::RELAY));
-        let identity = Identity::generate().map_err(|error| error.to_string())?;
+        let identity = NoiseKey::of(Identity::generate().map_err(|error| error.to_string())?);
         let peers = Peers::new();
         let source = |key: PublicKey| RawSource {
             relay: RelayAddress {

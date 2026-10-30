@@ -20,8 +20,7 @@
 //!   the relay sends at most the bucket plus the cap times `t` ([`Cap::most_in`]).
 //! - **Strict priority classes** ([`Class`]), each record classified once, when its link gathers
 //!   it ([`Class::of`]), highest first: control, positions and clock models, raw to relay links
-//!   and engines, the rest of what relay links and engines are sent, provisional positions, and
-//!   plain subscribers. A data record waits for a grant from the bucket ([`Egress::grant`]); a
+//!   and engines, the rest of what relay links and engines are sent, and plain subscribers. A data record waits for a grant from the bucket ([`Egress::grant`]); a
 //!   class is granted nothing while a higher class waits, so lower classes get what higher ones
 //!   leave. Control is never queued: it is what a socket writes beyond its link's grants, and it
 //!   may draw the last [`Cap::reserve`] bytes of the bucket, which data never touches, so it always
@@ -219,17 +218,13 @@ pub enum Class {
     /// what keeps every session alive. Never queued; it draws the bucket's reserve.
     Control,
     /// Positions, clock models (and their parts) and fault proofs to a relay link or an engine:
-    /// what this relay's engines originate and the final positions and models it forwards.
+    /// what this relay's engines originate and the positions and models it forwards.
     Positions,
     /// Raw batches, with the receiver descriptions they travel with, to a relay link or an engine:
     /// the border raw MLAT needs.
     Raw,
     /// The rest of what a peer that forwards is sent: the deduplicated stream.
     Forwarded,
-    /// Provisional positions to a relay link (`Record::Provisional`): below the final positions
-    /// and the raw they are solved from, since a final one follows each, and above plain
-    /// subscribers.
-    Provisional,
     /// Everything a plain subscriber (or a beast-out client) is sent: it takes and forwards
     /// nothing. The only class shed heaviest first while anything waits in it.
     Taker,
@@ -237,12 +232,11 @@ pub enum Class {
 
 impl Class {
     /// Every class, highest first.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 5] = [
         Self::Control,
         Self::Positions,
         Self::Raw,
         Self::Forwarded,
-        Self::Provisional,
         Self::Taker,
     ];
 
@@ -265,25 +259,23 @@ impl Class {
     /// - To a peer that forwards (a relay or an engine), data by what MLAT needs first: positions,
     ///   clock models and fault proofs; then raw and the descriptions it travels with; then
     ///   everything else that is shared (the deduplicated stream, the directory's offers and
-    ///   evidence, a group's piece manifests and parity, the products); then provisional
-    ///   positions, which a final one follows.
+    ///   evidence, a group's piece manifests and parity, the products).
     /// - To any other peer, data is a taker's: it forwards nothing. Offers and evidence are
     ///   control to it, as the answer to what it asked (a feeder's query, a client's vouching).
     pub fn of_kind(record: u8, kind: Kind) -> Self {
+        use tally_wire::record::{
+            KIND_ANCHOR, KIND_CLIENT_CLOCK_MODEL, KIND_CLIENT_REGIONAL_BATCH, KIND_FEEDER_FIGURES,
+            KIND_RECEIVER_SITE,
+        };
         use tally_wire::record::{
             KIND_BATCH, KIND_BUNDLE_INDEX, KIND_CLOCK_MODEL, KIND_CLOCK_MODEL_PART,
             KIND_DELIVERY_ANSWER, KIND_DELIVERY_QUERY, KIND_ECHO, KIND_ECHO_REPLY,
             KIND_EVIDENCE_BUNDLE, KIND_FAULT_PROOF, KIND_FIREHOSE_CREDENTIAL, KIND_GOODBYE,
             KIND_HAVE_SUMMARY, KIND_HEARTBEAT, KIND_HELLO, KIND_MLAT_CUT, KIND_PARITY,
             KIND_PIECE_MANIFEST, KIND_POSITIONS, KIND_PROVIDER_OFFER, KIND_PROVIDER_QUERY,
-            KIND_PROVISIONAL, KIND_RATE_LIMIT, KIND_RECEIVER_INFO, KIND_REDIRECT,
-            KIND_REGIONAL_BATCH, KIND_RELAY_BATCH, KIND_RELAY_LIST, KIND_STRIPE_ASSIGNMENT,
-            KIND_STRIPE_RECEIPT, KIND_SUBSCRIBE, KIND_WELCOME, KIND_WORLD_POSITIONS,
-            KIND_WORLD_PRECISE,
-        };
-        use tally_wire::record::{
-            KIND_CLIENT_CLOCK_MODEL, KIND_CLIENT_REGIONAL_BATCH, KIND_FEEDER_FIGURES,
-            KIND_RECEIVER_SITE,
+            KIND_RATE_LIMIT, KIND_RECEIVER_INFO, KIND_REDIRECT, KIND_REGIONAL_BATCH,
+            KIND_RELAY_BATCH, KIND_RELAY_LIST, KIND_STRIPE_ASSIGNMENT, KIND_STRIPE_RECEIPT,
+            KIND_SUBSCRIBE, KIND_WELCOME, KIND_WORLD_POSITIONS,
         };
         let forwards = kind.forwards();
         match record {
@@ -304,6 +296,7 @@ impl Class {
             | KIND_HAVE_SUMMARY
             | KIND_STRIPE_RECEIPT
             | KIND_MLAT_CUT
+            | KIND_ANCHOR
             | KIND_FIREHOSE_CREDENTIAL => Self::Control,
             KIND_PROVIDER_OFFER | KIND_EVIDENCE_BUNDLE if !forwards => Self::Control,
             _ if !forwards => Self::Taker,
@@ -314,7 +307,6 @@ impl Class {
             | KIND_CLIENT_CLOCK_MODEL => Self::Positions,
             // A receiver's site travels with its description and raw, relay to relay only.
             KIND_BATCH | KIND_RECEIVER_INFO | KIND_RECEIVER_SITE => Self::Raw,
-            KIND_PROVISIONAL => Self::Provisional,
             KIND_RELAY_BATCH
             | KIND_PROVIDER_OFFER
             | KIND_EVIDENCE_BUNDLE
@@ -323,7 +315,6 @@ impl Class {
             | KIND_REGIONAL_BATCH
             | KIND_BUNDLE_INDEX
             | KIND_WORLD_POSITIONS
-            | KIND_WORLD_PRECISE
             | KIND_CLIENT_REGIONAL_BATCH
             | KIND_FEEDER_FIGURES => Self::Forwarded,
             // A kind this build does not know is never sent; were it, it would wait with the
@@ -1248,10 +1239,10 @@ mod tests {
     /// here fails.
     #[test]
     fn every_record_kind_has_its_priority_class() {
-        use Class::{Control as C, Forwarded as F, Positions as P, Provisional as V, Raw as R};
+        use Class::{Control as C, Forwarded as F, Positions as P, Raw as R};
         use tally_wire::record::KINDS;
         const T: Class = Class::Taker;
-        let table: [(u8, &str, Class, Class); 38] = [
+        let table: [(u8, &str, Class, Class); 37] = [
             (0x01, "Hello", C, C),
             (0x02, "Welcome", C, C),
             (0x03, "Batch", R, T),
@@ -1267,7 +1258,7 @@ mod tests {
             (0x0d, "ClockModel", P, T),
             (0x0e, "FaultProof", P, T),
             (0x0f, "ClockModelPart", P, T),
-            (0x10, "Provisional", V, T),
+            // 0x10, the provisional positions, is retired at wire version 4 (one MLAT fix).
             (0x11, "Echo", C, C),
             (0x12, "EchoReply", C, C),
             (0x15, "ProviderOffer", F, C),
@@ -1283,7 +1274,7 @@ mod tests {
             (0x1e, "RegionalBatch", F, T),
             (0x1f, "Parity", F, T),
             (0x20, "BundleIndex", F, T),
-            (0x21, "WorldPrecise", F, T),
+            // 0x21, the precise world product, is retired at wire version 4.
             (0x22, "DeliveryQuery", C, C),
             (0x23, "DeliveryAnswer", C, C),
             // A few bytes a relay sends the relays holding its areas, which apply it at a step.
@@ -1294,6 +1285,8 @@ mod tests {
             (0x27, "ClientRegionalBatch", F, T),
             // A relay's feeder figures (RFC-0174 §2.12), a product on client links.
             (0x28, "FeederFigures", F, T),
+            // A relay's freshness anchor to its feeders (RFC-0171 §3.6): as its clock, control.
+            (0x2a, "Anchor", C, C),
         ];
         let kinds: Vec<u8> = table.iter().map(|(kind, ..)| *kind).collect();
         assert_eq!(

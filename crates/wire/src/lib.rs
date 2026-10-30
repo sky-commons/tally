@@ -1,13 +1,24 @@
 //! The only code that speaks Tally's wire (RFC-0171 §3): the BEAST frames a receiver's decoder
 //! emits, the signed batches that carry them, the records that move between feeders, relays and
 //! subscribers, and the Noise transport every hop runs over. Every binary goes through this crate.
+// The crate that holds every key: no `unsafe` code outside the one read of the host's raw clock
+// (`kernel_clock`; the clock's bound, `clock_bound`, is read through ClockBound's own client).
+// Denied, not forbidden, since `kernel_clock` needs its allow, and a forbid refuses that too: the
+// build refuses `unsafe` in every other module, and that `kernel_clock` touches no key, so nothing
+// can forge what the types refuse (`key`'s seal), is review's to hold. A test's counting allocator
+// is the test-support crate's (`tally_counting`), never this one's.
+#![deny(unsafe_code)]
 
 pub mod acars;
+pub mod anchor;
 pub mod backoff;
 pub mod batch;
 pub mod beast;
+pub mod budget;
 pub mod client;
+pub mod clock_bound;
 pub mod clock_model;
+pub mod clocks;
 pub mod credit;
 pub mod cut;
 pub mod decoded;
@@ -15,6 +26,10 @@ pub mod delivery;
 pub mod directory;
 pub mod fault_proof;
 pub mod figures;
+pub mod footprint;
+/// The one module that calls libc, and so the one allowed `unsafe`: it reaches no key.
+#[allow(unsafe_code)]
+pub mod kernel_clock;
 pub mod key;
 pub mod modes;
 pub mod noise;
@@ -29,9 +44,10 @@ pub mod sharing;
 mod signed;
 pub mod site;
 
+pub use anchor::Anchor;
 pub use batch::{
-    Batch, BatchContent, BatchDraft, Clock, Codec, Description, Location, Observation,
-    PublicInfoContent, ReceiverInfo,
+    Batch, BatchContent, BatchDraft, Clock, Codec, Description, EncodedBatch, Inflated, Location,
+    Observation, PublicInfoContent, ReceiverInfo,
 };
 pub use beast::{Frame, FrameKind};
 /// The shared byte buffer batches are held in, so a crate reading them needs no dependency of its own.
@@ -56,28 +72,29 @@ pub use delivery::{
     TagKeys, TagKeysContent, delivery_tag,
 };
 pub use directory::{ProviderOffer, ProviderOfferContent, ProviderQuery};
-pub use fault_proof::{Fault, FaultProof, ModelFault, SolutionFault, Tolerance};
+pub use fault_proof::{Fault, FaultProof, FixFault, ModelFault, Tolerance};
 pub use figures::{
     FIGURES_BUCKET_MS, FIGURES_WINDOW_MS, FeederFigure, FeederFigures, FeederFiguresContent,
     MAX_FEEDER_FIGURES,
 };
-pub use key::{Identity, PublicKey};
+pub use key::{Handshakes, Identity, NoiseKey, PublicKey, Signer, Signing, Signs};
 pub use noise::{Accepted, Outgoing, Reader, Session, Writer};
 pub use observation_set::{
     Citations, ObservationIdentity, ObservationSet, Reception, Relation, TaggedSet,
 };
 pub use positions::{
-    AddressedCitation, EnuCovariance, Observed, Positions, Solution, SolutionsContent,
-    TaggedSolution, TaggedSolutionsContent, TransmitTime,
+    EnuCovariance, Fix, FixSets, FixesContent, MAX_FIX_MODELS, Members, Observed, Positions,
+    TaggedFix, TaggedFixesContent, TransmitTime,
 };
 pub use probe::{Echo, EchoReply, EchoReplyContent, Headroom};
 pub use products::{
     ClientObservation, ClientRegionalBatch, ClientRegionalBatchContent, RegionalBatch,
     RegionalBatchContent, RegionalDraft, WorldCandidate, WorldFix, WorldPositions,
-    WorldPositionsContent, WorldPrecise,
+    WorldPositionsContent,
 };
 pub use record::{
-    Reason, Record, RelayAddress, Role, SITES_VERSION, Streams, carries_sites, least_version,
+    FIXES_VERSION, HeartbeatTimes, Reason, Record, RelayAddress, Role, SITES_VERSION, Streams,
+    carries_sites, least_version,
 };
 pub use region::{Region, Regions};
 pub use sharing::{
@@ -90,7 +107,8 @@ pub use site::{
     SHARING_AREA_RESOLUTION, SiteId,
 };
 
-/// Everything that can go wrong on the wire. Any of these ends the connection.
+/// Everything that can go wrong on the wire. Any of these ends the connection, but
+/// [`WireError::Retired`], which fails one record alone.
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
     #[error("i/o: {0}")]
@@ -114,10 +132,22 @@ pub enum WireError {
     Oversize(usize),
     #[error("invalid {field}: {value}")]
     Invalid { field: &'static str, value: u64 },
+    /// A form wire version 4 retired ([`record::FIXES_VERSION`]: the provisional kind, the precise
+    /// world product, positions formats 1 to 6, a client clock model of window bins, a retired
+    /// stream as a record's one product), from a peer that negotiated a version below it, which
+    /// may still send it: the record is dropped and never forwarded, and it is no fault of the
+    /// sender's, so a reader counts it apart from a malformed record and reads on
+    /// (`noise::Message::next` skips it). From a peer of version 4 or later the same form is
+    /// [`WireError::Invalid`], a breach.
+    #[error("retired at wire version 4, from an older peer: {field}: {value}")]
+    Retired { field: &'static str, value: u64 },
     #[error("bad key: {0}")]
     Key(String),
     #[error("signature does not verify")]
     BadSignature,
     #[error("not a fault proof: {0}")]
     NotAFault(&'static str),
+    /// A record not signed because its signer's clock is not judging (`key::Signer::sign_with`).
+    #[error("not signed: the signer's clock is not synced")]
+    Unsynced,
 }

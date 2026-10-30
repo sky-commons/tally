@@ -18,7 +18,7 @@ use crate::fault_proof::FaultProof;
 use crate::key::{KEY_LEN, PublicKey};
 use crate::positions::Positions;
 use crate::probe::{Echo, EchoReply};
-use crate::products::{ClientRegionalBatch, RegionalBatch, WorldPositions, WorldPrecise};
+use crate::products::{ClientRegionalBatch, RegionalBatch, WorldPositions};
 use crate::region::Region;
 use crate::sharing::{
     BundleIndex, HaveSummary, ParityChunk, PieceManifest, StripeAssignment, StripeReceipt,
@@ -34,13 +34,14 @@ use crate::site::ReceiverSite;
 pub const MIN_VERSION: u16 = 2;
 /// Version 2 (RFC-0174 §2.2, §2.10): the network records (echo, delivery checks, the provider
 /// directory, sharing, credit, the products), compressed batches, the `Probe` role and 16-bit
-/// `Streams`. Version 3 ([`SITES_VERSION`]): receiver sites are relay-only.
-pub const MAX_VERSION: u16 = 3;
+/// `Streams`. Version 3 ([`SITES_VERSION`]): receiver sites are relay-only. Version 4
+/// ([`FIXES_VERSION`]): one MLAT fix class.
+pub const MAX_VERSION: u16 = 4;
 /// Version 3: "this peer keeps receiver sites off client links" (`crate::site`). A peer that
 /// negotiated it promises to send a site-bearing record ([`Record::carries_site`]: a
 /// `ReceiverSite`, a format 1 `ReceiverInfo`) only on a link [`carries_sites`] admits, and to send
 /// a client only what a [`crate::ClientRecord`] can hold. Its records: `ReceiverSite`, the format
-/// 2 `ReceiverInfo`, tagged `Positions` (formats 5 and 6), `ClientClockModel` and
+/// 2 `ReceiverInfo`, tagged `Positions` (formats 5 and 6, since retired for 8), `ClientClockModel` and
 /// `ClientRegionalBatch`. A feeder sends its `ReceiverSite` only to a relay that negotiated it,
 /// and a relay forwards a site-bearing record (an old feeder's format 1 description too, byte for
 /// byte) only to relay-role peers that negotiated it. It is also the least a relay-role peer may
@@ -48,6 +49,16 @@ pub const MAX_VERSION: u16 = 3;
 /// older version exists to carry anything.
 pub const SITES_VERSION: u16 = 3;
 const _: () = assert!(MAX_VERSION >= SITES_VERSION);
+/// Version 4: "MLAT in seconds" (RFC-0171 §3.8.1 as amended 2026-10-24). There is one kind of
+/// MLAT fix, positions formats 7 and 8 under the positions kind, so it retires the provisional
+/// kind ([`KIND_PROVISIONAL`]), the precise world product ([`KIND_WORLD_PRECISE`]), their stream
+/// bits ([`Streams::RETIRED`]), positions formats 1 to 6 (`Positions::is_retired`) and the client
+/// clock model's format 1, a window's bins. [`Record::decode`] reads each by the session's version:
+/// from a peer of this version or later it is a breach of the protocol (`WireError::Invalid`),
+/// and from one below it a form the reader drops and does not forward, no fault of the sender's
+/// (`WireError::Retired`), or, for a stream bit in a set, a bit ignored.
+pub const FIXES_VERSION: u16 = 4;
+const _: () = assert!(MAX_VERSION >= FIXES_VERSION && FIXES_VERSION > SITES_VERSION);
 
 /// The least version a session of `role` may agree (RFC-0171 §3.3): [`SITES_VERSION`] for a
 /// relay-role peer (a relay, a sharing member, an MLAT engine), which is sent sites; [`MIN_VERSION`]
@@ -87,6 +98,7 @@ pub const KIND_POSITIONS: u8 = 0x0c;
 pub const KIND_CLOCK_MODEL: u8 = 0x0d;
 pub const KIND_FAULT_PROOF: u8 = 0x0e;
 pub const KIND_CLOCK_MODEL_PART: u8 = 0x0f;
+/// Retired at [`FIXES_VERSION`]: provisional positions, a kind of their own. Never reused.
 pub const KIND_PROVISIONAL: u8 = 0x10;
 // RFC-0174 §2.10, version 2. Non-critical, as every new kind is unless ignoring it would be wrong.
 pub const KIND_ECHO: u8 = 0x11;
@@ -110,6 +122,7 @@ pub const KIND_WORLD_POSITIONS: u8 = 0x1d;
 pub const KIND_REGIONAL_BATCH: u8 = 0x1e;
 pub const KIND_PARITY: u8 = 0x1f;
 pub const KIND_BUNDLE_INDEX: u8 = 0x20;
+/// Retired at [`FIXES_VERSION`]: the precise world product. Never reused.
 pub const KIND_WORLD_PRECISE: u8 = 0x21;
 // RFC-0181 §7: the delivery check by tags made on arrival. Kinds of their own, not the retired
 // ones' bytes, so a build that predates them skips them as unknown (non-critical) rather than
@@ -127,13 +140,22 @@ pub const KIND_CLIENT_REGIONAL_BATCH: u8 = 0x27;
 // RFC-0174 §2.12 as amended 2026-10-19: a relay's signed figures of its receivers, for clients.
 // Non-critical: a build that predates it skips it.
 pub const KIND_FEEDER_FIGURES: u8 = 0x28;
+// RFC-0171 §3.6: a relay's signed freshness anchor, to its feeder sessions. Non-critical: a
+// feeder that predates it skips it. (0x29 was a retired kind of a draft never released.)
+pub const KIND_ANCHOR: u8 = 0x2a;
 
-/// Kinds this build knows were retired: read as `Record::Retired`, never written.
-pub const RETIRED_KINDS: [u8; 2] = [KIND_POSSESSION_QUERY, KIND_POSSESSION_ANSWER];
+/// Kinds this build knows were retired, never written and never reused: the possession check's,
+/// read as `Record::Retired`, and the ones [`FIXES_VERSION`] retired, read as it says.
+pub const RETIRED_KINDS: [u8; 4] = [
+    KIND_POSSESSION_QUERY,
+    KIND_POSSESSION_ANSWER,
+    KIND_PROVISIONAL,
+    KIND_WORLD_PRECISE,
+];
 
 /// Every kind this build reads and writes, in kind order: what a table over kinds is checked
 /// against, so a kind added here and nowhere else is a failing test.
-pub const KINDS: [u8; 38] = [
+pub const KINDS: [u8; 37] = [
     KIND_HELLO,
     KIND_WELCOME,
     KIND_BATCH,
@@ -149,7 +171,6 @@ pub const KINDS: [u8; 38] = [
     KIND_CLOCK_MODEL,
     KIND_FAULT_PROOF,
     KIND_CLOCK_MODEL_PART,
-    KIND_PROVISIONAL,
     KIND_ECHO,
     KIND_ECHO_REPLY,
     KIND_PROVIDER_OFFER,
@@ -164,7 +185,6 @@ pub const KINDS: [u8; 38] = [
     KIND_REGIONAL_BATCH,
     KIND_PARITY,
     KIND_BUNDLE_INDEX,
-    KIND_WORLD_PRECISE,
     KIND_DELIVERY_QUERY,
     KIND_DELIVERY_ANSWER,
     KIND_MLAT_CUT,
@@ -172,6 +192,7 @@ pub const KINDS: [u8; 38] = [
     KIND_CLIENT_CLOCK_MODEL,
     KIND_CLIENT_REGIONAL_BATCH,
     KIND_FEEDER_FIGURES,
+    KIND_ANCHOR,
 ];
 
 const HEADER_LEN: usize = 3;
@@ -221,15 +242,18 @@ impl Role {
     }
 
     /// Whether a session of this role may send `record` after its `Hello`. Only a `Probe` is held
-    /// to a list here (`Echo` and `DeliveryQuery`); what every other role may publish is the
-    /// responder's to decide, by the keys that signed it.
+    /// to a list here (`Echo`, `DeliveryQuery`, and a `TimedHeartbeat` asking the relay's clock);
+    /// what every other role may publish is the responder's to decide, by the keys that signed it.
     pub fn may_send(self, record: &Record) -> bool {
         match self {
             // A retired delivery query too: an old feeder's probe is answered with a refusal
             // (`Record::refusal`), not ended as a breach of the protocol.
             Self::Probe => matches!(
                 record,
-                Record::Echo(_) | Record::DeliveryQuery(_) | Record::Retired(KIND_POSSESSION_QUERY)
+                Record::Echo(_)
+                    | Record::DeliveryQuery(_)
+                    | Record::TimedHeartbeat(_)
+                    | Record::Retired(KIND_POSSESSION_QUERY)
             ),
             _ => true,
         }
@@ -257,22 +281,22 @@ impl Streams {
     /// engines adopting another's model as a prior. Its own bit, since most readers of positions
     /// never need them.
     pub const CLOCK_MODELS: Self = Self(8);
-    /// Provisional positions (RFC-0171 §3.8.1): solved a second or so after a transmission under
-    /// the latest model of its tile, carried forward, and superseded by the final positions that
-    /// follow. Opt-in, and its own bit: a reader of final positions is never sent them unasked.
-    pub const PROVISIONAL: Self = Self(16);
     /// The regional product (RFC-0174 §2.11): each area's deduplicated receptions as its origin
     /// relay signs them (`RegionalBatch`), by the subscription's regions.
     pub const REGIONAL: Self = Self(32);
     /// The world product (RFC-0174 §2.11): one fix per aircraft per second (`WorldPositions`).
     pub const WORLD: Self = Self(64);
-    /// The precise world product (RFC-0174 §2.11): one fix per aircraft per second from final MLAT
-    /// fixes, sealed once they can have come (`WorldPrecise`).
-    pub const WORLD_PRECISE: Self = Self(128);
     /// Relays' feeder figures (RFC-0174 §2.12): each area's receivers' figures as the relay
     /// that hosts or carries them signs them (`FeederFigures`), by the subscription's regions. Its
     /// own bit: raw is relay-only, so a client reads figures without asking for it.
     pub const FEEDER_FIGURES: Self = Self(256);
+    /// The bits [`FIXES_VERSION`] retired, reserved and never reused: 16, provisional positions,
+    /// and 128, the precise world product. Read from a session of that version or later they are
+    /// a breach; read from one below it they are ignored, cleared as they are read, and so is a
+    /// signed record's (its signer's version is not its reader's to know, and a relay forwards
+    /// another's signature it cannot answer for). A record that names one product and names a
+    /// retired one is the retired product's, dropped (`Streams::read_product`).
+    pub const RETIRED: Self = Self(16 | 128);
 
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -287,10 +311,45 @@ impl Streams {
         out.extend_from_slice(&self.0.to_be_bytes());
     }
 
+    /// A set of streams, as [`Streams::RETIRED`] says to read one.
     pub(crate) fn read(reader: &mut Body<'_>) -> Result<Self, WireError> {
-        reader.u16().map(Self)
+        let streams = reader.u16()?;
+        if streams & Self::RETIRED.0 == 0 {
+            return Ok(Self(streams));
+        }
+        if reader.refuses_retired() {
+            return Err(WireError::Invalid {
+                field: RETIRED_STREAM,
+                value: u64::from(streams),
+            });
+        }
+        Ok(Self(streams & !Self::RETIRED.0))
+    }
+
+    /// The one product a sharing record names: as [`Streams::read`], but a retired one read where
+    /// it is not a breach is the record's own retirement (`WireError::Retired`), since clearing it
+    /// would leave the record naming none.
+    pub(crate) fn read_product(reader: &mut Body<'_>) -> Result<Self, WireError> {
+        let product = reader.u16()?;
+        if product & Self::RETIRED.0 == 0 {
+            return Ok(Self(product));
+        }
+        let value = u64::from(product);
+        if reader.refuses_retired() {
+            return Err(WireError::Invalid {
+                field: RETIRED_STREAM,
+                value,
+            });
+        }
+        Err(WireError::Retired {
+            field: RETIRED_STREAM,
+            value,
+        })
     }
 }
+
+/// What a stream bit [`FIXES_VERSION`] retired is refused as.
+const RETIRED_STREAM: &str = "a stream retired at wire version 4";
 
 /// Why a relay closes a session. A feeder backs off by `retry_after_secs` whatever the reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -327,6 +386,13 @@ pub enum Reason {
     /// exempted such a parent from every shortfall. A reader that predates it reads `Other(8)`,
     /// which no reader takes as full.
     OverCeiling,
+    /// A feeder's batch was signed by a wall clock further ahead of the relay's than the relay
+    /// allows (`budget::F`), or by none it can read: every relay would judge
+    /// its batches outside its window of time (RFC-0171 §3.6). A batch only too old is dropped,
+    /// never refused. The feeder signs by the relay's stated clock from then on (`RateLimit`'s
+    /// `clock_ms`) and may come back at the wait given; one that predates the stated clock should
+    /// set its own (NTP). A reader that predates it reads `Other(9)`, which a feeder retries.
+    Clock,
     Other(u8),
 }
 
@@ -341,6 +407,7 @@ impl Reason {
             Self::FellBehind => 6,
             Self::Retired => 7,
             Self::OverCeiling => 8,
+            Self::Clock => 9,
             Self::Other(byte) => byte,
         }
     }
@@ -355,6 +422,7 @@ impl Reason {
             6 => Self::FellBehind,
             7 => Self::Retired,
             8 => Self::OverCeiling,
+            9 => Self::Clock,
             other => Self::Other(other),
         }
     }
@@ -383,6 +451,70 @@ impl RelayAddress {
     }
 }
 
+/// The timestamps a [`Record::TimedHeartbeat`] carries, Unix milliseconds by each side's clock:
+/// NTP's on-wire exchange (RFC 5905 §8). The asker sends `sent_ms` (its `T1`); the answer carries
+/// `T1` echoed and the time its sender took it (`T2`) as `echo`, its own send time (`T3`) as
+/// `sent_ms`, and its clock's error bound, and its reader notes when it took it (`T4`). Then the
+/// answerer's clock is `((T2 - T1) + (T3 - T4)) / 2` from the asker's, within half the round
+/// trip `(T4 - T1) - (T3 - T2)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeartbeatTimes {
+    /// The sender's clock as it wrote this.
+    pub sent_ms: u64,
+    /// An answer's echo: the asker's `sent_ms`, and the sender's clock when it took it.
+    pub echo: Option<(u64, u64)>,
+    /// The sender's stated error bound of its clock (as `Record::RateLimit`'s `error_ms`),
+    /// `u64::MAX` unsynced. Sent only with `echo`.
+    pub error_ms: Option<u64>,
+}
+
+impl HeartbeatTimes {
+    /// An asker's: its send time alone.
+    pub const fn asking(sent_ms: u64) -> Self {
+        Self {
+            sent_ms,
+            echo: None,
+            error_ms: None,
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+        out.extend_from_slice(&self.sent_ms.to_be_bytes());
+        match (self.echo, self.error_ms) {
+            (Some((asked, took)), error) => {
+                out.extend_from_slice(&asked.to_be_bytes());
+                out.extend_from_slice(&took.to_be_bytes());
+                if let Some(error) = error {
+                    out.extend_from_slice(&error.to_be_bytes());
+                }
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(WireError::Invalid {
+                field: "heartbeat error without its echo",
+                value: 0,
+            }),
+        }
+    }
+
+    fn read(reader: &mut Body<'_>) -> Result<Self, WireError> {
+        let sent_ms = reader.u64()?;
+        let echo = if reader.remaining() >= 16 {
+            Some((reader.u64()?, reader.u64()?))
+        } else {
+            None
+        };
+        let error_ms = (echo.is_some() && reader.remaining() >= 8)
+            .then(|| reader.u64())
+            .transpose()?;
+        Ok(Self {
+            sent_ms,
+            echo,
+            error_ms,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Record {
     /// The initiator's first record: the versions it speaks and what it is.
@@ -400,6 +532,12 @@ pub enum Record {
     /// A receiver's signed description of itself. Sent at start and whenever it changes.
     ReceiverInfo(ReceiverInfo),
     Heartbeat,
+    /// A heartbeat carrying the NTP timestamps (RFC 5905 §8) that let its reader measure the
+    /// sender's clock: kind 0x05 with a body, which a reader that predates it reads as a plain
+    /// [`Record::Heartbeat`] (its body ignored, §3.4). A feeder sends its own send time; a relay
+    /// answers with it echoed, when it took it, its own send time and its error bound, so the
+    /// feeder has the four timestamps of one exchange and the relay's word on its own clock.
+    TimedHeartbeat(HeartbeatTimes),
     /// "Leave me", from a relay. The relays named are hints; the feeder still chooses by its
     /// own rules, so a redirect can never steer a feeder somewhere it would not go.
     Redirect {
@@ -420,6 +558,22 @@ pub enum Record {
         /// (§3.4): `None` from a relay that states none, and a feeder that predates it reads the
         /// two fields before it and ignores it.
         wanted_per_sec: Option<u32>,
+        /// The relay's wall clock as it wrote this, Unix milliseconds: the clock it judges a
+        /// feeder's signed `wall_ms` by (`budget::Window::FEEDER`). Stated in the greeting, and
+        /// again whenever a feeder that signed in step with it drifts past half of `budget::F`. A
+        /// feeder signs its batches at the low end of what its configured relays' clocks select
+        /// (RFC 5905 §11.2.1, `tally_feed`'s `RelayClocks`), so no one relay off on its own moves
+        /// it; a relay it was not configured with only says, on its health, how far apart they
+        /// are. Appended after `wanted_per_sec`, and sent only with it: `None` from a relay that states none, and a feeder that predates it
+        /// reads the fields before it and ignores it.
+        clock_ms: Option<u64>,
+        /// How far the relay's clock may be from true time as it wrote this, in milliseconds
+        /// (`ε_r`, the bound the host's ClockBound publishes, `clock_bound`), `u64::MAX` while it
+        /// does not judge: what a feeder weighs this relay's clock by when it
+        /// selects (RFC 5905 §11.2.1). Appended after `clock_ms`, and sent only with it: `None`
+        /// from a relay that states none, which a feeder takes at the bound the protocol promises
+        /// (`budget::E`); a reader that predates it ignores it.
+        error_ms: Option<u64>,
     },
     /// The relay is closing the session.
     Goodbye {
@@ -437,18 +591,14 @@ pub enum Record {
     RelayBatch(Batch),
     /// Positions an MLAT engine solved and signed.
     Positions(Positions),
-    /// An MLAT engine's signed clock model manifest, which its format 3 positions cite by id.
+    /// An MLAT engine's signed clock model manifest, which its fixes cite by id.
     ClockModel(ClockModel),
     /// One part of a clock model too large for its manifest, checked against the manifest's
     /// hash of it.
     ClockModelPart(ClockModelPart),
-    /// Two signed solutions of the same inputs that disagree: anyone's, checked before it is
+    /// Two signed fixes of the same inputs that disagree: anyone's, checked before it is
     /// forwarded.
     FaultProof(FaultProof),
-    /// Provisional positions an MLAT engine solved and signed: a `Positions` of a provisional
-    /// format (`Positions::is_provisional`), under a kind of its own so a relay routes it by kind
-    /// alone and a reader that does not know it skips it. Each kind refuses the other's formats.
-    Provisional(Positions),
     /// A round-trip probe (RFC-0174 §2.2).
     Echo(Echo),
     /// A relay's signed answer to an `Echo`, with its headroom.
@@ -458,8 +608,9 @@ pub enum Record {
     DeliveryQuery(DeliveryQuery),
     /// A member's signed answer: the tag it made per batch, or that it does not take the area.
     DeliveryAnswer(DeliveryAnswer),
-    /// A record of a kind this build knows was retired (`RETIRED_KINDS`): nothing of its body is
-    /// read, it is never written, and a responder answers it with `refusal`.
+    /// A record of the possession check's retired kinds (`KIND_POSSESSION_QUERY`,
+    /// `KIND_POSSESSION_ANSWER`): nothing of its body is read, it is never written, and a responder
+    /// answers it with `refusal`.
     Retired(u8),
     /// A relay's signed offer of a cell (RFC-0174 §2.6).
     ProviderOffer(ProviderOffer),
@@ -485,8 +636,6 @@ pub enum Record {
     Parity(ParityChunk),
     /// A bundler's signed index of one second of a parent cell (RFC-0174 §2.6).
     BundleIndex(BundleIndex),
-    /// One second of the precise world product (RFC-0174 §2.11).
-    WorldPrecise(WorldPrecise),
     /// A relay's signed overload cut of its MLAT seats (RFC-0181 §10).
     MlatCut(MlatCut),
     /// A receiver's signed exact site: relay-only (`crate::site`).
@@ -496,6 +645,9 @@ pub enum Record {
     /// An area's deduplicated receptions as a client receives them: no counter.
     ClientRegionalBatch(ClientRegionalBatch),
     FeederFigures(crate::figures::FeederFigures),
+    /// A relay's signed freshness anchor (RFC-0171 §3.6, [`crate::anchor`]), to a feeder session:
+    /// what the feeder's next batches carry.
+    Anchor(crate::anchor::Anchor),
 }
 
 impl Record {
@@ -525,7 +677,7 @@ impl Record {
             Self::Welcome { .. } => KIND_WELCOME,
             Self::Batch(_) => KIND_BATCH,
             Self::ReceiverInfo(_) => KIND_RECEIVER_INFO,
-            Self::Heartbeat => KIND_HEARTBEAT,
+            Self::Heartbeat | Self::TimedHeartbeat(_) => KIND_HEARTBEAT,
             Self::Redirect { .. } => KIND_REDIRECT,
             Self::RelayList(_) => KIND_RELAY_LIST,
             Self::RateLimit { .. } => KIND_RATE_LIMIT,
@@ -536,7 +688,6 @@ impl Record {
             Self::ClockModel(_) => KIND_CLOCK_MODEL,
             Self::ClockModelPart(_) => KIND_CLOCK_MODEL_PART,
             Self::FaultProof(_) => KIND_FAULT_PROOF,
-            Self::Provisional(_) => KIND_PROVISIONAL,
             Self::Echo(_) => KIND_ECHO,
             Self::EchoReply(_) => KIND_ECHO_REPLY,
             Self::DeliveryQuery(_) => KIND_DELIVERY_QUERY,
@@ -553,12 +704,12 @@ impl Record {
             Self::RegionalBatch(_) => KIND_REGIONAL_BATCH,
             Self::Parity(_) => KIND_PARITY,
             Self::BundleIndex(_) => KIND_BUNDLE_INDEX,
-            Self::WorldPrecise(_) => KIND_WORLD_PRECISE,
             Self::MlatCut(_) => KIND_MLAT_CUT,
             Self::ReceiverSite(_) => KIND_RECEIVER_SITE,
             Self::ClientClockModel(_) => KIND_CLIENT_CLOCK_MODEL,
             Self::ClientRegionalBatch(_) => KIND_CLIENT_REGIONAL_BATCH,
             Self::FeederFigures(_) => KIND_FEEDER_FIGURES,
+            Self::Anchor(_) => KIND_ANCHOR,
             Self::Retired(kind) => *kind,
         }
     }
@@ -577,6 +728,64 @@ impl Record {
         }
     }
 
+    /// What it allocates of its own beside its place, as a queue or a store holding it is charged
+    /// for it (`footprint`): each signed record its bytes' capacity, a batch its shared bytes
+    /// unless they carry their own charge ([`Batch::allocated`]), and any other its lists' and
+    /// strings' capacities. Never its encoded length, which a record's allocations may pass.
+    pub fn allocated(&self) -> usize {
+        use crate::footprint::vec;
+        match self {
+            Self::Hello { .. }
+            | Self::Welcome { .. }
+            | Self::Heartbeat
+            | Self::TimedHeartbeat(_)
+            | Self::RateLimit { .. }
+            | Self::Goodbye { .. }
+            | Self::Echo(_)
+            | Self::Retired(_)
+            | Self::ProviderQuery(_)
+            | Self::StripeAssignment(_)
+            | Self::Anchor(_) => 0,
+            Self::Batch(batch) | Self::RelayBatch(batch) => batch.allocated(),
+            Self::ReceiverInfo(info) => info.allocated(),
+            Self::Redirect { hints, .. } | Self::RelayList(hints) => {
+                vec::<RelayAddress>(hints.capacity())
+                    + hints
+                        .iter()
+                        .map(|hint| hint.address.capacity())
+                        .sum::<usize>()
+            }
+            Self::Subscribe { regions, .. } => vec::<Region>(regions.capacity()),
+            Self::Positions(positions) => positions.allocated(),
+            Self::ClockModel(model) => model.allocated(),
+            Self::ClockModelPart(part) => part.allocated(),
+            Self::FaultProof(proof) => proof.allocated(),
+            Self::EchoReply(signed) => signed.allocated(),
+            Self::DeliveryQuery(query) => {
+                vec::<crate::delivery::SequenceRange>(query.ranges.capacity())
+                    + query.keys.as_ref().map_or(0, |keys| keys.allocated())
+            }
+            Self::DeliveryAnswer(signed) => signed.allocated(),
+            Self::ProviderOffer(signed) => signed.allocated(),
+            Self::PieceManifest(signed) => signed.allocated(),
+            Self::HaveSummary(have) => vec::<u8>(have.seconds.capacity()),
+            Self::StripeReceipt(signed) => signed.allocated(),
+            Self::FirehoseCredential(signed) => signed.allocated(),
+            Self::EvidenceBundle(signed) => signed.allocated(),
+            Self::WorldPositions(signed) => signed.allocated(),
+            Self::RegionalBatch(signed) => signed.allocated(),
+            Self::Parity(chunk) => {
+                vec::<u32>(chunk.lens.capacity()) + vec::<u8>(chunk.bytes.capacity())
+            }
+            Self::BundleIndex(signed) => signed.allocated(),
+            Self::MlatCut(signed) => signed.allocated(),
+            Self::ReceiverSite(signed) => signed.allocated(),
+            Self::ClientClockModel(signed) => signed.allocated(),
+            Self::ClientRegionalBatch(signed) => signed.allocated(),
+            Self::FeederFigures(signed) => signed.allocated(),
+        }
+    }
+
     /// The bytes `encode` writes for this record, header included: a signed record's own bytes
     /// are read, never copied; any other is encoded to be measured (each a few bytes, or a
     /// parity chunk's). The one measure of a record's size, for what it costs a queue or a store.
@@ -584,7 +793,7 @@ impl Record {
         let signed = match self {
             Self::Batch(batch) | Self::RelayBatch(batch) => batch.as_bytes().len(),
             Self::ReceiverInfo(info) => info.as_bytes().len(),
-            Self::Positions(positions) | Self::Provisional(positions) => positions.as_bytes().len(),
+            Self::Positions(positions) => positions.as_bytes().len(),
             Self::ClockModel(model) => model.as_bytes().len(),
             Self::ClockModelPart(part) => part.as_bytes().len(),
             Self::FaultProof(proof) => proof.as_bytes().len(),
@@ -598,7 +807,6 @@ impl Record {
             Self::WorldPositions(signed) => signed.as_bytes().len(),
             Self::RegionalBatch(signed) => signed.as_bytes().len(),
             Self::BundleIndex(signed) => signed.as_bytes().len(),
-            Self::WorldPrecise(signed) => signed.as_bytes().len(),
             Self::MlatCut(signed) => signed.as_bytes().len(),
             Self::ReceiverSite(signed) => signed.as_bytes().len(),
             Self::ClientClockModel(signed) => signed.as_bytes().len(),
@@ -635,6 +843,7 @@ impl Record {
             Self::Batch(batch) => out.extend_from_slice(batch.as_bytes()),
             Self::ReceiverInfo(info) => out.extend_from_slice(info.as_bytes()),
             Self::Heartbeat => {}
+            Self::TimedHeartbeat(times) => times.write(out)?,
             Self::Redirect {
                 retry_after_secs,
                 hints,
@@ -647,11 +856,36 @@ impl Record {
                 bytes_per_sec,
                 burst,
                 wanted_per_sec,
+                clock_ms,
+                error_ms,
             } => {
                 out.extend_from_slice(&bytes_per_sec.to_be_bytes());
                 out.extend_from_slice(&burst.to_be_bytes());
-                if let Some(wanted) = wanted_per_sec {
-                    out.extend_from_slice(&wanted.to_be_bytes());
+                if clock_ms.is_none() && error_ms.is_some() {
+                    // Appended after it: an error with no clock before it would be read as one.
+                    return Err(WireError::Invalid {
+                        field: "rate limit error without its clock",
+                        value: 0,
+                    });
+                }
+                match (wanted_per_sec, clock_ms) {
+                    (Some(wanted), clock) => {
+                        out.extend_from_slice(&wanted.to_be_bytes());
+                        if let Some(clock) = clock {
+                            out.extend_from_slice(&clock.to_be_bytes());
+                            if let Some(error) = error_ms {
+                                out.extend_from_slice(&error.to_be_bytes());
+                            }
+                        }
+                    }
+                    (None, None) => {}
+                    // Appended after it: a clock with no ceiling before it would be read as one.
+                    (None, Some(_)) => {
+                        return Err(WireError::Invalid {
+                            field: "rate limit clock without its wanted ceiling",
+                            value: 0,
+                        });
+                    }
                 }
             }
             Self::Goodbye {
@@ -671,9 +905,7 @@ impl Record {
                 }
             }
             Self::RelayBatch(batch) => out.extend_from_slice(batch.as_bytes()),
-            Self::Positions(positions) | Self::Provisional(positions) => {
-                out.extend_from_slice(positions.as_bytes())
-            }
+            Self::Positions(positions) => out.extend_from_slice(positions.as_bytes()),
             Self::ClockModel(model) => out.extend_from_slice(model.as_bytes()),
             Self::ClockModelPart(part) => out.extend_from_slice(part.as_bytes()),
             Self::FaultProof(proof) => out.extend_from_slice(proof.as_bytes()),
@@ -693,12 +925,12 @@ impl Record {
             Self::RegionalBatch(signed) => out.extend_from_slice(signed.as_bytes()),
             Self::Parity(chunk) => chunk.encode(out)?,
             Self::BundleIndex(signed) => out.extend_from_slice(signed.as_bytes()),
-            Self::WorldPrecise(signed) => out.extend_from_slice(signed.as_bytes()),
             Self::MlatCut(signed) => out.extend_from_slice(signed.as_bytes()),
             Self::ReceiverSite(signed) => out.extend_from_slice(signed.as_bytes()),
             Self::ClientClockModel(signed) => out.extend_from_slice(signed.as_bytes()),
             Self::ClientRegionalBatch(signed) => out.extend_from_slice(signed.as_bytes()),
             Self::FeederFigures(signed) => out.extend_from_slice(signed.as_bytes()),
+            Self::Anchor(anchor) => anchor.write(out),
             Self::Retired(kind) => {
                 out.truncate(start);
                 return Err(WireError::Invalid {
@@ -713,12 +945,17 @@ impl Record {
         Ok(())
     }
 
-    /// Decodes every record in one message's plaintext. Unknown non-critical kinds are skipped
-    /// and counted in the return value.
-    pub fn decode_message(mut bytes: &[u8], out: &mut Vec<Record>) -> Result<usize, WireError> {
+    /// Decodes every record in one message's plaintext, on a session that negotiated `version`
+    /// (as [`Record::decode`]). Unknown non-critical kinds are skipped and counted in the return
+    /// value.
+    pub fn decode_message(
+        mut bytes: &[u8],
+        version: u16,
+        out: &mut Vec<Record>,
+    ) -> Result<usize, WireError> {
         let mut skipped = 0;
         while !bytes.is_empty() {
-            let (record, used) = Self::decode(bytes)?;
+            let (record, used) = Self::decode(bytes, version)?;
             match record {
                 Some(record) => out.push(record),
                 None => skipped += 1,
@@ -728,10 +965,14 @@ impl Record {
         Ok(skipped)
     }
 
-    /// Decodes one record from the front of `bytes`: `None` for a kind this build does not know
-    /// and may skip.
-    pub fn decode(bytes: &[u8]) -> Result<(Option<Record>, usize), WireError> {
-        Self::decode_knowing(bytes, Self::knows)
+    /// Decodes one record from the front of `bytes`, read as a session that negotiated `version`
+    /// reads it: `None` for a kind this build does not know and may skip. What [`FIXES_VERSION`]
+    /// retired is read by `version` (its docs): a breach from a peer of it or later, and below it
+    /// `WireError::Retired`, which fails that record alone (a session's `Message` skips it and reads
+    /// on).
+    /// Bytes this build encoded itself, or holds without a session, are read at [`MAX_VERSION`].
+    pub fn decode(bytes: &[u8], version: u16) -> Result<(Option<Record>, usize), WireError> {
+        Self::decode_knowing(bytes, version, Self::knows)
     }
 
     /// Whether this build reads `kind`: every kind it writes (`KINDS`), and the ones it knows
@@ -745,6 +986,7 @@ impl Record {
     /// kinds (§3.4), skipped unless critical. `decode` is this with `Record::knows`.
     pub(crate) fn decode_knowing(
         bytes: &[u8],
+        version: u16,
         knows: impl Fn(u8) -> bool,
     ) -> Result<(Option<Record>, usize), WireError> {
         let header = take(bytes, 0, HEADER_LEN)?;
@@ -754,7 +996,7 @@ impl Record {
         if !knows(kind) {
             return Self::unknown(kind, length);
         }
-        let mut reader = Body::new(body);
+        let mut reader = Body::at(body, version);
         let record = match kind {
             KIND_HELLO => Self::Hello {
                 min_version: reader.u16()?,
@@ -766,7 +1008,8 @@ impl Record {
             },
             KIND_BATCH => Self::Batch(Batch::from_bytes(body.to_vec())?),
             KIND_RECEIVER_INFO => Self::ReceiverInfo(ReceiverInfo::from_bytes(body.to_vec())?),
-            KIND_HEARTBEAT => Self::Heartbeat,
+            KIND_HEARTBEAT if body.is_empty() => Self::Heartbeat,
+            KIND_HEARTBEAT => Self::TimedHeartbeat(HeartbeatTimes::read(&mut reader)?),
             KIND_REDIRECT => Self::Redirect {
                 retry_after_secs: reader.u32()?,
                 hints: decode_relays(&mut reader)?,
@@ -778,6 +1021,12 @@ impl Record {
                 // Appended: read when its bytes are there, as a relay that states it sends it.
                 wanted_per_sec: (reader.remaining() >= 4)
                     .then(|| reader.u32())
+                    .transpose()?,
+                clock_ms: (reader.remaining() >= 8)
+                    .then(|| reader.u64())
+                    .transpose()?,
+                error_ms: (reader.remaining() >= 8)
+                    .then(|| reader.u64())
                     .transpose()?,
             },
             KIND_GOODBYE => Self::Goodbye {
@@ -793,24 +1042,38 @@ impl Record {
                 Self::Subscribe { streams, regions }
             }
             KIND_RELAY_BATCH => Self::RelayBatch(Batch::from_bytes(body.to_vec())?),
-            KIND_POSITIONS => Self::Positions(positions_of(body, false)?),
-            KIND_PROVISIONAL => Self::Provisional(positions_of(body, true)?),
+            KIND_POSITIONS => Self::Positions(positions_of(body, version)?),
+            KIND_PROVISIONAL | KIND_WORLD_PRECISE => {
+                return retired(version, "a record kind retired at wire version 4", kind);
+            }
             KIND_CLOCK_MODEL => Self::ClockModel(ClockModel::from_bytes(body.to_vec())?),
             KIND_CLOCK_MODEL_PART => {
                 Self::ClockModelPart(ClockModelPart::from_bytes(body.to_vec())?)
             }
-            KIND_FAULT_PROOF => Self::FaultProof(FaultProof::from_bytes(body.to_vec())?),
-            KIND_ECHO => Self::Echo(Echo::from_body(body)?),
+            KIND_FAULT_PROOF => {
+                let proof = FaultProof::from_bytes(body.to_vec())?;
+                if let Some(format) = proof.retired_format() {
+                    return retired(
+                        version,
+                        "a fault proof of a retired positions format",
+                        format,
+                    );
+                }
+                Self::FaultProof(proof)
+            }
+            KIND_ECHO => Self::Echo(Echo::from_session(body, version)?),
             KIND_ECHO_REPLY => Self::EchoReply(EchoReply::from_bytes(body.to_vec())?),
-            KIND_DELIVERY_QUERY => Self::DeliveryQuery(DeliveryQuery::from_body(body)?),
+            KIND_DELIVERY_QUERY => Self::DeliveryQuery(DeliveryQuery::from_session(body, version)?),
             KIND_DELIVERY_ANSWER => {
                 Self::DeliveryAnswer(DeliveryAnswer::from_bytes(body.to_vec())?)
             }
             KIND_PROVIDER_OFFER => Self::ProviderOffer(ProviderOffer::from_bytes(body.to_vec())?),
-            KIND_PROVIDER_QUERY => Self::ProviderQuery(ProviderQuery::from_body(body)?),
-            KIND_STRIPE_ASSIGNMENT => Self::StripeAssignment(StripeAssignment::from_body(body)?),
+            KIND_PROVIDER_QUERY => Self::ProviderQuery(ProviderQuery::from_session(body, version)?),
+            KIND_STRIPE_ASSIGNMENT => {
+                Self::StripeAssignment(StripeAssignment::from_session(body, version)?)
+            }
             KIND_PIECE_MANIFEST => Self::PieceManifest(PieceManifest::from_bytes(body.to_vec())?),
-            KIND_HAVE_SUMMARY => Self::HaveSummary(HaveSummary::from_body(body)?),
+            KIND_HAVE_SUMMARY => Self::HaveSummary(HaveSummary::from_session(body, version)?),
             KIND_STRIPE_RECEIPT => Self::StripeReceipt(StripeReceipt::from_bytes(body.to_vec())?),
             KIND_FIREHOSE_CREDENTIAL => {
                 Self::FirehoseCredential(FirehoseCredential::from_bytes(body.to_vec())?)
@@ -822,13 +1085,20 @@ impl Record {
                 Self::WorldPositions(WorldPositions::from_bytes(body.to_vec())?)
             }
             KIND_REGIONAL_BATCH => Self::RegionalBatch(RegionalBatch::from_bytes(body.to_vec())?),
-            KIND_PARITY => Self::Parity(ParityChunk::from_body(body)?),
+            KIND_PARITY => Self::Parity(ParityChunk::from_session(body, version)?),
             KIND_BUNDLE_INDEX => Self::BundleIndex(BundleIndex::from_bytes(body.to_vec())?),
-            KIND_WORLD_PRECISE => Self::WorldPrecise(WorldPrecise::from_bytes(body.to_vec())?),
             KIND_MLAT_CUT => Self::MlatCut(MlatCut::from_bytes(body.to_vec())?),
             KIND_RECEIVER_SITE => Self::ReceiverSite(ReceiverSite::from_bytes(body.to_vec())?),
             KIND_CLIENT_CLOCK_MODEL => {
-                Self::ClientClockModel(ClientClockModel::from_bytes(body.to_vec())?)
+                let model = ClientClockModel::from_bytes(body.to_vec())?;
+                if model.format() < ClientClockModel::FORMAT {
+                    return retired(
+                        version,
+                        "a retired client clock model format",
+                        model.format(),
+                    );
+                }
+                Self::ClientClockModel(model)
             }
             KIND_CLIENT_REGIONAL_BATCH => {
                 Self::ClientRegionalBatch(ClientRegionalBatch::from_bytes(body.to_vec())?)
@@ -836,6 +1106,7 @@ impl Record {
             KIND_FEEDER_FIGURES => {
                 Self::FeederFigures(crate::figures::FeederFigures::from_bytes(body.to_vec())?)
             }
+            KIND_ANCHOR => Self::Anchor(crate::anchor::Anchor::from_body(body)?),
             KIND_POSSESSION_QUERY | KIND_POSSESSION_ANSWER => Self::Retired(kind),
             _ => return Self::unknown(kind, length),
         };
@@ -852,17 +1123,35 @@ impl Record {
     }
 }
 
-/// A `Positions` body under its kind: provisional formats under the provisional kind only, and
-/// every other format under the positions kind only.
-fn positions_of(body: &[u8], provisional: bool) -> Result<Positions, WireError> {
+/// A `Positions` body read on a session of `version`: any format but a retired one
+/// (`Positions::is_retired`), which is read as [`retired`] says.
+fn positions_of(body: &[u8], version: u16) -> Result<Positions, WireError> {
     let positions = Positions::from_bytes(body.to_vec())?;
-    if positions.is_provisional() != provisional {
-        return Err(WireError::Invalid {
-            field: "positions format for its kind",
-            value: u64::from(positions.format()),
-        });
+    if positions.is_retired() {
+        return retired(version, "a retired positions format", positions.format());
     }
     Ok(positions)
+}
+
+/// What a form [`FIXES_VERSION`] retired (`value` its kind or format byte) is read as on a session
+/// of `version`: a breach from a peer of that version or later, which promised never to send it
+/// (`WireError::Invalid`), and from one below it a form the reader drops and never forwards, no
+/// fault of the sender's (`WireError::Retired`).
+fn retired<T>(version: u16, field: &'static str, value: u8) -> Result<T, WireError> {
+    let value = u64::from(value);
+    if version >= FIXES_VERSION {
+        Err(WireError::Invalid { field, value })
+    } else {
+        Err(WireError::Retired { field, value })
+    }
+}
+
+/// The length of the record at the front of `bytes`, header included, when its header and body
+/// are there: how far a reader skips past a record that decoded to `WireError::Retired`.
+pub(crate) fn framed_len(bytes: &[u8]) -> Option<usize> {
+    let header = bytes.get(..HEADER_LEN)?;
+    let length = HEADER_LEN + usize::from(u16::from_be_bytes([header[1], header[2]]));
+    (bytes.len() >= length).then_some(length)
 }
 
 fn encode_relays(relays: &[RelayAddress], out: &mut Vec<u8>) -> Result<(), WireError> {
@@ -906,11 +1195,34 @@ fn take(bytes: &[u8], at: usize, len: usize) -> Result<&[u8], WireError> {
 pub(crate) struct Body<'a> {
     bytes: &'a [u8],
     at: usize,
+    /// The version of the session the body arrived on, `None` for one read without a session (a
+    /// signed record's content): what a form [`FIXES_VERSION`] retired is read by.
+    version: Option<u16>,
 }
 
 impl<'a> Body<'a> {
+    /// A body read without a session: a signed record's, read wherever it travelled.
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
+        Self {
+            bytes,
+            at: 0,
+            version: None,
+        }
+    }
+
+    /// A session's own body (an unsigned record's), on a session that negotiated `version`.
+    pub(crate) fn at(bytes: &'a [u8], version: u16) -> Self {
+        Self {
+            bytes,
+            at: 0,
+            version: Some(version),
+        }
+    }
+
+    /// Whether what [`FIXES_VERSION`] retired is a breach here: the body arrived on a session of
+    /// that version or later.
+    pub(crate) fn refuses_retired(&self) -> bool {
+        self.version.is_some_and(|version| version >= FIXES_VERSION)
     }
 
     /// How many bytes have been read.
@@ -1000,12 +1312,36 @@ pub(crate) mod tests {
                 bytes_per_sec: 64_000,
                 burst: 128_000,
                 wanted_per_sec: None,
+                clock_ms: None,
+                error_ms: None,
             },
             Record::RateLimit {
                 bytes_per_sec: 64_000,
                 burst: 128_000,
                 wanted_per_sec: Some(1_800),
+                clock_ms: None,
+                error_ms: None,
             },
+            Record::RateLimit {
+                bytes_per_sec: 64_000,
+                burst: 128_000,
+                wanted_per_sec: Some(1_800),
+                clock_ms: Some(1_791_244_800_000),
+                error_ms: None,
+            },
+            Record::RateLimit {
+                bytes_per_sec: 64_000,
+                burst: 128_000,
+                wanted_per_sec: Some(1_800),
+                clock_ms: Some(1_791_244_800_000),
+                error_ms: Some(12),
+            },
+            Record::TimedHeartbeat(HeartbeatTimes::asking(1_791_244_800_000)),
+            Record::TimedHeartbeat(HeartbeatTimes {
+                sent_ms: 1_791_244_800_010,
+                echo: Some((1_791_244_800_000, 1_791_244_800_004)),
+                error_ms: Some(u64::MAX),
+            }),
             Record::Goodbye {
                 reason: Reason::Full,
                 retry_after_secs: 600,
@@ -1066,15 +1402,15 @@ pub(crate) mod tests {
 
     #[test]
     fn the_mlat_records_round_trip_in_one_message() -> Result<(), WireError> {
-        use crate::positions::tests::{solution, solutions};
+        use crate::positions::tests::{fix_at, fixes_of};
         let engine = Identity::generate()?;
-        let first = Positions::sign_solutions(
+        let first = Positions::sign_fix(
             &engine,
-            &solutions(0, vec![solution([1; 32], &[1, 2, 3], 10)?]),
+            &fixes_of(0, vec![fix_at([1; 32], &[1, 2, 3], &[1, 2, 3], 10)?]),
         )?;
-        let second = Positions::sign_solutions(
+        let second = Positions::sign_fix(
             &engine,
-            &solutions(1, vec![solution([1; 32], &[1, 2, 3], 9_000)?]),
+            &fixes_of(1, vec![fix_at([1; 32], &[1, 2, 3], &[1, 2, 3], 9_000)?]),
         )?;
         let model = ClockModel::sign(
             &engine,
@@ -1100,7 +1436,7 @@ pub(crate) mod tests {
             record.encode(&mut message)?;
         }
         let mut back = Vec::new();
-        assert_eq!(Record::decode_message(&message, &mut back)?, 0);
+        assert_eq!(Record::decode_message(&message, MAX_VERSION, &mut back)?, 0);
         assert_eq!(back, records);
         Ok(())
     }
@@ -1236,14 +1572,6 @@ pub(crate) mod tests {
                     observations: Vec::new(),
                 },
             )?),
-            Record::WorldPrecise(WorldPrecise::sign(
-                &relay,
-                &crate::products::WorldPositionsContent {
-                    second: 1,
-                    part: 0,
-                    fixes: Vec::new(),
-                },
-            )?),
             Record::Parity(ParityChunk {
                 manifest: [1; 32],
                 cell,
@@ -1274,7 +1602,7 @@ pub(crate) mod tests {
             record.encode(&mut message)?;
         }
         let mut back = Vec::new();
-        assert_eq!(Record::decode_message(&message, &mut back)?, 0);
+        assert_eq!(Record::decode_message(&message, MAX_VERSION, &mut back)?, 0);
         assert_eq!(back, records);
         // Each kind is non-critical, so a reader that knows none of them skips it.
         let mut offset = 0;
@@ -1296,13 +1624,14 @@ pub(crate) mod tests {
             record.encode(&mut message)?;
         }
         let mut back = Vec::new();
-        assert_eq!(Record::decode_message(&message, &mut back)?, 0);
+        assert_eq!(Record::decode_message(&message, MAX_VERSION, &mut back)?, 0);
         assert_eq!(back, records);
         Ok(())
     }
 
     #[test]
-    fn a_probe_may_send_only_echoes_and_delivery_queries() -> Result<(), WireError> {
+    fn a_probe_may_send_only_echoes_timed_heartbeats_and_delivery_queries() -> Result<(), WireError>
+    {
         let relay = Identity::generate()?;
         let query = Record::DeliveryQuery(DeliveryQuery {
             nonce: [1; 32],
@@ -1313,7 +1642,12 @@ pub(crate) mod tests {
         });
         assert!(Role::Probe.may_send(&Record::Echo(Echo { nonce: 1 })));
         assert!(Role::Probe.may_send(&query));
+        // A probe asks a relay's clock with a timed heartbeat (RFC-0171 §3.6).
         for other in every_record()? {
+            if matches!(other, Record::TimedHeartbeat(_)) {
+                assert!(Role::Probe.may_send(&other));
+                continue;
+            }
             assert!(!Role::Probe.may_send(&other), "{other:?}");
             assert!(Role::Feeder.may_send(&other));
         }
@@ -1327,7 +1661,9 @@ pub(crate) mod tests {
     /// What a build before the tagged check does with one record: this build's decoder, knowing
     /// only that build's kinds.
     fn read_before_tags(record: &[u8]) -> Result<(Option<Record>, usize), WireError> {
-        Record::decode_knowing(record, |kind| KINDS_BEFORE_TAGS.contains(&kind))
+        Record::decode_knowing(record, MAX_VERSION, |kind| {
+            KINDS_BEFORE_TAGS.contains(&kind)
+        })
     }
 
     #[test]
@@ -1381,7 +1717,7 @@ pub(crate) mod tests {
             // Unknown to it, and not critical: skipped whole, never read as the possession check.
             assert_eq!(read_before_tags(&bytes)?, (None, bytes.len()), "{record:?}");
             assert!(!RETIRED_KINDS.contains(&bytes[0]));
-            assert_eq!(Record::decode(&bytes)?.0, Some(record));
+            assert_eq!(Record::decode(&bytes, MAX_VERSION)?.0, Some(record));
         }
         // What it knew, it still reads, and an unknown critical kind still ends it.
         let mut echo = Vec::new();
@@ -1416,7 +1752,7 @@ pub(crate) mod tests {
         message.extend_from_slice(&[KIND_POSSESSION_ANSWER, 0, 2, 0xff, 0xff]);
         Record::Heartbeat.encode(&mut message)?;
         let mut back = Vec::new();
-        assert_eq!(Record::decode_message(&message, &mut back)?, 0);
+        assert_eq!(Record::decode_message(&message, MAX_VERSION, &mut back)?, 0);
         assert_eq!(
             back,
             vec![
@@ -1443,7 +1779,7 @@ pub(crate) mod tests {
         let mut bytes = Vec::new();
         refusal.encode(&mut bytes)?;
         assert_eq!(bytes[3], 7);
-        assert_eq!(Record::decode(&bytes)?.0, Some(refusal));
+        assert_eq!(Record::decode(&bytes, MAX_VERSION)?.0, Some(refusal));
         // Nothing answers an old answer, nor any current record.
         assert_eq!(back[1].refusal(), None);
         assert!(!Role::Probe.may_send(&back[1]));
@@ -1504,11 +1840,11 @@ pub(crate) mod tests {
                 boot_id: 1,
                 sequence: 0,
                 issued_ms: 1,
-                spec_version: 6,
+                spec_version: 7,
                 model: [1; 32],
                 inputs: [2; 32],
-                window_first: 0,
-                window_last: 1,
+                edge_ms: 1_791_220_000_000,
+                span_ms: 20_000,
             },
         )?;
         let regional = ClientRegionalBatch::sign(
@@ -1546,19 +1882,173 @@ pub(crate) mod tests {
             assert_eq!(one[0] & CRITICAL, 0);
             // A version 2 build, which knows the kinds to the MLAT cut, skips every new kind and
             // reads a description of either format as a description.
-            let older = Record::decode_knowing(&one, |kind| kind <= KIND_MLAT_CUT)?;
+            let older = Record::decode_knowing(&one, MAX_VERSION, |kind| kind <= KIND_MLAT_CUT)?;
             match record {
                 Record::ReceiverInfo(_) => assert_eq!(older.0.as_ref(), Some(record)),
                 _ => assert_eq!(older, (None, one.len())),
             }
         }
         let mut back = Vec::new();
-        assert_eq!(Record::decode_message(&message, &mut back)?, 0);
+        assert_eq!(Record::decode_message(&message, MAX_VERSION, &mut back)?, 0);
         assert_eq!(back, records);
         let carrying: Vec<bool> = records.iter().map(Record::carries_site).collect();
         assert_eq!(carrying, vec![true, false, true, false, false]);
         for record in every_record()?.iter().chain(&network_records()?) {
             assert!(!record.carries_site(), "{record:?}");
+        }
+        Ok(())
+    }
+
+    /// One record of the forms wire version 4 retired, framed as an older peer would send it, with
+    /// the field it is refused by: each kind, each positions format, the client clock model's
+    /// format 1, and an unsigned sharing record naming a retired stream.
+    fn retired_forms() -> Result<Vec<(Vec<u8>, &'static str)>, WireError> {
+        let framed = |kind: u8, body: &[u8]| -> Result<Vec<u8>, WireError> {
+            let length = u16::try_from(body.len()).map_err(|_| WireError::Oversize(body.len()))?;
+            let mut out = vec![kind];
+            out.extend_from_slice(&length.to_be_bytes());
+            out.extend_from_slice(body);
+            Ok(out)
+        };
+        let engine = Identity::from_seed([7; 32]);
+        let mut forms = vec![
+            (
+                framed(KIND_PROVISIONAL, &[1, 2, 3])?,
+                "a record kind retired at wire version 4",
+            ),
+            (
+                framed(KIND_WORLD_PRECISE, &[])?,
+                "a record kind retired at wire version 4",
+            ),
+        ];
+        for format in 1..crate::positions::POSITIONS_FORMAT_FIX {
+            let mut bytes = vec![format];
+            bytes.extend_from_slice(engine.public().as_bytes());
+            bytes.extend_from_slice(&[0; 24]);
+            let old = Positions::signed(&engine, bytes);
+            forms.push((
+                framed(KIND_POSITIONS, old.as_bytes())?,
+                "a retired positions format",
+            ));
+        }
+        let model = crate::signed::Signed::sign(
+            ClientClockModel::DOMAIN,
+            1,
+            &engine,
+            &[0; 16],
+            ClientClockModel::MAX_LEN,
+        )?;
+        forms.push((
+            framed(KIND_CLIENT_CLOCK_MODEL, model.as_bytes())?,
+            "a retired client clock model format",
+        ));
+        for product in [16, 128] {
+            let mut chunk = Vec::new();
+            Record::Parity(ParityChunk {
+                manifest: [1; 32],
+                cell: crate::directory::tests::cell()?,
+                product: Streams::RAW,
+                second: 1,
+                lens: vec![1],
+                total: 1,
+                offset: 0,
+                bytes: vec![7],
+            })
+            .encode(&mut chunk)?;
+            // The product is the two bytes after the manifest and the cell.
+            let at = HEADER_LEN + 32 + 8;
+            chunk[at..at + 2].copy_from_slice(&u16::to_be_bytes(product));
+            forms.push((chunk, RETIRED_STREAM));
+        }
+        Ok(forms)
+    }
+
+    /// A version 3 peer's retired forms are dropped, no fault of its own (`WireError::Retired`);
+    /// from a version 4 peer, which promised never to send them, they are a breach.
+    #[test]
+    fn a_retired_form_is_dropped_from_a_version_3_peer_and_a_breach_from_a_version_4_one()
+    -> Result<(), WireError> {
+        for (bytes, field) in retired_forms()? {
+            for version in MIN_VERSION..FIXES_VERSION {
+                assert!(
+                    matches!(
+                        Record::decode(&bytes, version),
+                        Err(WireError::Retired { field: refused, .. }) if refused == field
+                    ),
+                    "{field} at {version}: {:?}",
+                    Record::decode(&bytes, version)
+                );
+            }
+            assert!(
+                matches!(
+                    Record::decode(&bytes, FIXES_VERSION),
+                    Err(WireError::Invalid { field: refused, .. }) if refused == field
+                ),
+                "{field}: {:?}",
+                Record::decode(&bytes, FIXES_VERSION)
+            );
+            assert_eq!(framed_len(&bytes), Some(bytes.len()));
+        }
+        // Every other record reads alike at every version.
+        let mut records = every_record()?;
+        records.extend(network_records()?);
+        records.extend(site_records()?);
+        for record in &records {
+            let mut bytes = Vec::new();
+            record.encode(&mut bytes)?;
+            for version in MIN_VERSION..=MAX_VERSION {
+                assert_eq!(
+                    Record::decode(&bytes, version)?,
+                    (Some(record.clone()), bytes.len()),
+                    "{record:?} at {version}"
+                );
+            }
+        }
+        // Retired for good: never encoded, and no longer a kind this build knows.
+        for kind in RETIRED_KINDS {
+            assert!(Record::Retired(kind).encode(&mut Vec::new()).is_err());
+            assert!(!KINDS.contains(&kind));
+        }
+        assert!(RETIRED_KINDS.contains(&KIND_PROVISIONAL));
+        assert!(RETIRED_KINDS.contains(&KIND_WORLD_PRECISE));
+        Ok(())
+    }
+
+    /// A subscription naming a retired stream: below version 4 the bit is ignored and the rest
+    /// read; at version 4 it is a breach.
+    #[test]
+    fn a_retired_stream_bit_is_ignored_below_version_4_and_refused_at_it() -> Result<(), WireError>
+    {
+        assert_eq!(Streams::RETIRED, Streams(16).with(Streams(128)));
+        for (named, read) in [
+            (Streams(16), Streams(0)),
+            (Streams(128), Streams(0)),
+            (Streams::POSITIONS.with(Streams(16)), Streams::POSITIONS),
+            (
+                Streams::RAW.with(Streams::WORLD).with(Streams(128)),
+                Streams::RAW.with(Streams::WORLD),
+            ),
+        ] {
+            let mut bytes = Vec::new();
+            Record::Subscribe {
+                streams: named,
+                regions: Vec::new(),
+            }
+            .encode(&mut bytes)?;
+            assert_eq!(
+                Record::decode(&bytes, FIXES_VERSION - 1)?.0,
+                Some(Record::Subscribe {
+                    streams: read,
+                    regions: Vec::new(),
+                })
+            );
+            assert!(matches!(
+                Record::decode(&bytes, FIXES_VERSION),
+                Err(WireError::Invalid {
+                    field: RETIRED_STREAM,
+                    ..
+                })
+            ));
         }
         Ok(())
     }
@@ -1579,7 +2069,7 @@ pub(crate) mod tests {
         let mut message = vec![0x7f, 0, 2, 9, 9];
         Record::Heartbeat.encode(&mut message)?;
         let mut back = Vec::new();
-        assert_eq!(Record::decode_message(&message, &mut back)?, 1);
+        assert_eq!(Record::decode_message(&message, MAX_VERSION, &mut back)?, 1);
         assert_eq!(back, vec![Record::Heartbeat]);
         Ok(())
     }
@@ -1587,7 +2077,7 @@ pub(crate) mod tests {
     #[test]
     fn an_unknown_critical_kind_ends_the_session() {
         assert!(matches!(
-            Record::decode_message(&[CRITICAL | 0x7f, 0, 0], &mut Vec::new()),
+            Record::decode_message(&[CRITICAL | 0x7f, 0, 0], MAX_VERSION, &mut Vec::new()),
             Err(WireError::UnknownCritical(_))
         ));
     }
@@ -1599,7 +2089,7 @@ pub(crate) mod tests {
         message[2] += 3;
         message.extend_from_slice(&[1, 2, 3]);
         let mut back = Vec::new();
-        Record::decode_message(&message, &mut back)?;
+        Record::decode_message(&message, MAX_VERSION, &mut back)?;
         assert_eq!(back, vec![Record::Welcome { version: 1 }]);
         Ok(())
     }
@@ -1615,11 +2105,15 @@ pub(crate) mod tests {
             bytes_per_sec: 64_000,
             burst: 128_000,
             wanted_per_sec: Some(1_800),
+            clock_ms: None,
+            error_ms: None,
         };
         let unstated = Record::RateLimit {
             bytes_per_sec: 64_000,
             burst: 128_000,
             wanted_per_sec: None,
+            clock_ms: None,
+            error_ms: None,
         };
         let (mut new, mut old) = (Vec::new(), Vec::new());
         stated.encode(&mut new)?;
@@ -1628,15 +2122,130 @@ pub(crate) mod tests {
         assert_eq!(new[3..old.len()], old[3..]);
         assert_eq!(new[old.len()..], 1_800u32.to_be_bytes());
         let mut back = Vec::new();
-        Record::decode_message(&new, &mut back)?;
-        Record::decode_message(&old, &mut back)?;
+        Record::decode_message(&new, MAX_VERSION, &mut back)?;
+        Record::decode_message(&old, MAX_VERSION, &mut back)?;
         assert_eq!(back, vec![stated.clone(), unstated]);
         // A later field after it is ignored in its turn.
         new[2] += 2;
         new.extend_from_slice(&[7, 7]);
         let mut later = Vec::new();
-        Record::decode_message(&new, &mut later)?;
+        Record::decode_message(&new, MAX_VERSION, &mut later)?;
         assert_eq!(later, vec![stated]);
+        Ok(())
+    }
+
+    /// A relay states its clock after the wanted ceiling (RFC-0171 §3.6): a feeder that predates
+    /// it reads the record as one stating the ceiling alone, byte for byte, and a clock is never
+    /// written without the ceiling it is appended after.
+    #[test]
+    fn a_rate_limits_clock_is_appended_after_its_wanted_ceiling() -> Result<(), WireError> {
+        let clocked = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: Some(1_800),
+            clock_ms: Some(1_791_244_800_123),
+            error_ms: None,
+        };
+        let unclocked = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: Some(1_800),
+            clock_ms: None,
+            error_ms: None,
+        };
+        let (mut new, mut old) = (Vec::new(), Vec::new());
+        clocked.encode(&mut new)?;
+        unclocked.encode(&mut old)?;
+        assert_eq!(new.len(), old.len() + 8);
+        assert_eq!(new[3..old.len()], old[3..]);
+        assert_eq!(new[old.len()..], 1_791_244_800_123u64.to_be_bytes());
+        let mut back = Vec::new();
+        Record::decode_message(&new, MAX_VERSION, &mut back)?;
+        assert_eq!(back, vec![clocked]);
+        let alone = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: None,
+            clock_ms: Some(1),
+            error_ms: None,
+        };
+        assert!(alone.encode(&mut Vec::new()).is_err());
+        Ok(())
+    }
+
+    /// A relay states its clock's error bound after its clock (RFC-0171 §3.6): a feeder that
+    /// predates it reads the record as one stating the clock alone, byte for byte, and an error
+    /// is never written without the clock it is appended after.
+    #[test]
+    fn a_rate_limits_error_is_appended_after_its_clock() -> Result<(), WireError> {
+        let bounded = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: Some(1_800),
+            clock_ms: Some(1_791_244_800_123),
+            error_ms: Some(40),
+        };
+        let unbounded = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: Some(1_800),
+            clock_ms: Some(1_791_244_800_123),
+            error_ms: None,
+        };
+        let (mut new, mut old) = (Vec::new(), Vec::new());
+        bounded.encode(&mut new)?;
+        unbounded.encode(&mut old)?;
+        assert_eq!(new.len(), old.len() + 8);
+        assert_eq!(new[3..old.len()], old[3..]);
+        assert_eq!(new[old.len()..], 40u64.to_be_bytes());
+        let mut back = Vec::new();
+        Record::decode_message(&new, MAX_VERSION, &mut back)?;
+        assert_eq!(back, vec![bounded]);
+        let alone = Record::RateLimit {
+            bytes_per_sec: 64_000,
+            burst: 128_000,
+            wanted_per_sec: Some(1_800),
+            clock_ms: None,
+            error_ms: Some(1),
+        };
+        assert!(alone.encode(&mut Vec::new()).is_err());
+        Ok(())
+    }
+
+    /// A timed heartbeat is a heartbeat with a body (RFC 5905 §8's timestamps): its kind is the
+    /// heartbeat's, so a reader that predates it, which reads a heartbeat's kind and ignores what
+    /// follows, reads a plain heartbeat; an empty body is still the plain one; an answer's error
+    /// is never written without its echo.
+    #[test]
+    fn a_timed_heartbeat_is_a_heartbeat_with_its_timestamps_appended() -> Result<(), WireError> {
+        let plain = {
+            let mut out = Vec::new();
+            Record::Heartbeat.encode(&mut out)?;
+            out
+        };
+        let answer = Record::TimedHeartbeat(HeartbeatTimes {
+            sent_ms: 30,
+            echo: Some((10, 20)),
+            error_ms: Some(7),
+        });
+        let mut timed = Vec::new();
+        answer.encode(&mut timed)?;
+        assert_eq!(timed[0], plain[0]);
+        assert_eq!(timed.len(), plain.len() + 32);
+        let mut back = Vec::new();
+        Record::decode_message(&timed, MAX_VERSION, &mut back)?;
+        Record::decode_message(&plain, MAX_VERSION, &mut back)?;
+        assert_eq!(back, vec![answer, Record::Heartbeat]);
+        // An asker's: its send time alone.
+        let mut asking = Vec::new();
+        Record::TimedHeartbeat(HeartbeatTimes::asking(5)).encode(&mut asking)?;
+        assert_eq!(asking.len(), plain.len() + 8);
+        let unechoed = Record::TimedHeartbeat(HeartbeatTimes {
+            sent_ms: 1,
+            echo: None,
+            error_ms: Some(1),
+        });
+        assert!(unechoed.encode(&mut Vec::new()).is_err());
         Ok(())
     }
 
@@ -1646,7 +2255,7 @@ pub(crate) mod tests {
         Record::hello(Role::Subscriber).encode(&mut message)?;
         message.pop();
         assert!(matches!(
-            Record::decode_message(&message, &mut Vec::new()),
+            Record::decode_message(&message, MAX_VERSION, &mut Vec::new()),
             Err(WireError::Truncated { .. })
         ));
         Ok(())

@@ -11,11 +11,8 @@ use crate::directory::Directory;
 use crate::hub::Item;
 use crate::selection::areas_solved_by;
 
-/// The products a parent bundle carries (RFC-0174 §2.5): raw, positions, provisional positions
-/// and clock models.
-const BUNDLED: Streams = Streams(
-    Streams::RAW.0 | Streams::POSITIONS.0 | Streams::PROVISIONAL.0 | Streams::CLOCK_MODELS.0,
-);
+/// The products a parent bundle carries (RFC-0174 §2.5): raw, positions and clock models.
+const BUNDLED: Streams = Streams(Streams::RAW.0 | Streams::POSITIONS.0 | Streams::CLOCK_MODELS.0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Subscription {
@@ -56,25 +53,21 @@ impl Subscription {
                 self.streams.contains(Streams::POSITIONS) && self.places(item.points.as_deref())
             }
             Record::FaultProof(_) => self.streams.contains(Streams::POSITIONS),
-            // Provisional positions go only to whoever asked for them: most readers of positions
-            // want only the final ones, and every provisional is followed by one.
-            Record::Provisional(_) => {
-                self.streams.contains(Streams::PROVISIONAL) && self.places(item.points.as_deref())
-            }
             // The regional product, by the area its origin signed it for (`Item::cell`).
             Record::RegionalBatch(_) => {
                 self.streams.contains(Streams::REGIONAL) && self.covers(item.cell)
             }
             // The world product is the world's.
             Record::WorldPositions(_) => self.streams.contains(Streams::WORLD),
-            Record::WorldPrecise(_) => self.streams.contains(Streams::WORLD_PRECISE),
             // A bundle's index, to whoever reads the parent cell it indexes (`Item::cell`), of
             // any product a bundle carries.
             Record::BundleIndex(_) => self.streams.0 & BUNDLED.0 != 0 && self.covers(item.cell),
-            // A clock model by where its tile is, so a reader of an area gets the models its
-            // positions cite; a part travels whole-world, as its manifest may need it anywhere.
+            // A clock model by its area, so a reader of an area and its band (an MLAT relay's raw
+            // link, `selection::RawSource`) gets the models of the areas its fixes cite; a part
+            // travels whole-world, as its manifest may need it anywhere.
             Record::ClockModel(_) => {
-                self.streams.contains(Streams::CLOCK_MODELS) && self.places(item.points.as_deref())
+                self.streams.contains(Streams::CLOCK_MODELS)
+                    && self.overlaps(item.points.as_deref())
             }
             Record::ClockModelPart(_) => self.streams.contains(Streams::CLOCK_MODELS),
             _ => false,
@@ -109,6 +102,22 @@ impl Subscription {
                     || points
                         .iter()
                         .any(|point| self.regions.iter().any(|region| region.contains(*point)))
+            }
+        }
+    }
+
+    /// Whether a record of the cells `cells` (a model's area) overlaps the subscription: a cell
+    /// in a region or a region in a cell. Unplaced (`None`), it is whole-world.
+    fn overlaps(&self, cells: Option<&[Region]>) -> bool {
+        match cells {
+            None => true,
+            Some(cells) => {
+                self.regions.is_empty()
+                    || cells.iter().any(|cell| {
+                        self.regions
+                            .iter()
+                            .any(|region| region.contains(*cell) || cell.contains(*region))
+                    })
             }
         }
     }
@@ -175,20 +184,16 @@ impl ClientSubscription {
                 streams.contains(Streams::POSITIONS) && self.holds(&item.place)
             }
             ClientRecord::FaultProof(_) => streams.contains(Streams::POSITIONS),
-            ClientRecord::Provisional(_) => {
-                streams.contains(Streams::PROVISIONAL) && self.holds(&item.place)
-            }
             // The regional product, counters stripped, by the area its origin signed it for.
             ClientRecord::RegionalBatch(_) => {
                 streams.contains(Streams::REGIONAL) && self.holds(&item.place)
             }
             ClientRecord::WorldPositions(_) => streams.contains(Streams::WORLD),
-            ClientRecord::WorldPrecise(_) => streams.contains(Streams::WORLD_PRECISE),
             // A relay's figures of an area's receivers, by that area.
             ClientRecord::FeederFigures(_) => {
                 streams.contains(Streams::FEEDER_FIGURES) && self.holds(&item.place)
             }
-            // A clock model without its offsets, by the area its full model's tile is in.
+            // A clock model without its offsets, by its area and the areas whose band holds it.
             ClientRecord::ClockModel(_) => {
                 streams.contains(Streams::CLOCK_MODELS) && self.holds(&item.place)
             }
@@ -210,6 +215,14 @@ impl ClientSubscription {
                     || regions
                         .iter()
                         .any(|region| region.contains(cell.0) || cell.0.contains(*region))
+            }
+            ClientPlace::Cells(cells) => {
+                regions.is_empty()
+                    || cells.iter().any(|cell| {
+                        regions
+                            .iter()
+                            .any(|region| region.contains(*cell) || cell.contains(*region))
+                    })
             }
             ClientPlace::Aircraft(points) => {
                 regions.is_empty()
@@ -241,7 +254,7 @@ impl Coarse {
 }
 
 /// Where a client may be routed a record, read from its client form alone (and, for a clock
-/// model, the area its full model's tile is in): never a receiver's site, never a tile centre.
+/// model, its full model's area and the areas whose band holds it): never a receiver's site.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientPlace {
     /// Of the whole world: every client that takes its stream, whatever its regions.
@@ -251,6 +264,9 @@ pub enum ClientPlace {
     Unplaced,
     /// In one cell no finer than a public cell: a receiver's public cell, an area.
     Cell(Coarse),
+    /// In any of these cells, each an area or coarser: a clock model's area and the areas whose
+    /// band holds it, the clients whose fixes may cite it.
+    Cells(Arc<[Region]>),
     /// The aircraft it places, by their finest cells: where aircraft are, not receivers.
     Aircraft(Arc<[Region]>),
 }
@@ -266,8 +282,9 @@ pub struct ClientItem {
 impl ClientItem {
     /// `record`'s client item. Its place is read from the record: a description's public cell, a
     /// regional product's or figures' area, the aircraft of positions (`aircraft`, the points the
-    /// hub placed them by), and, for a client clock model, the area its full model's tile is in
-    /// (`aircraft`'s first point, coarsened to its area here whatever it was).
+    /// hub placed them by), and, for a client clock model, its area and the areas whose band holds
+    /// it (`aircraft`, as `Network::client_model_places` placed it, each coarsened to its area
+    /// whatever it was, or to a public cell at finest).
     pub fn new(record: Arc<ClientRecord>, aircraft: Option<&Arc<[Region]>>) -> Self {
         let cell = |cell: Option<Region>| match cell {
             Some(cell) => ClientPlace::Cell(Coarse::of(cell)),
@@ -281,12 +298,19 @@ impl ClientItem {
             ClientRecord::FeederFigures(figures) => {
                 cell(figures.content().ok().and_then(|content| content.area))
             }
-            ClientRecord::ClockModel(_) => cell(
-                aircraft
-                    .and_then(|points| points.first())
-                    .and_then(|point| tally_wire::rendezvous::area_of_cell(*point)),
-            ),
-            ClientRecord::Positions(_) | ClientRecord::Provisional(_) => match aircraft {
+            ClientRecord::ClockModel(_) => match aircraft {
+                Some(places) if !places.is_empty() => ClientPlace::Cells(
+                    places
+                        .iter()
+                        .map(|place| {
+                            tally_wire::rendezvous::area_of_cell(*place)
+                                .unwrap_or_else(|| Coarse::of(*place).region())
+                        })
+                        .collect(),
+                ),
+                _ => ClientPlace::Unplaced,
+            },
+            ClientRecord::Positions(_) => match aircraft {
                 Some(points) => ClientPlace::Aircraft(Arc::clone(points)),
                 None => ClientPlace::World,
             },
@@ -301,7 +325,8 @@ impl ClientItem {
 }
 
 /// What an engine may take (RFC-0174 §2.3): an engine is another relay's MLAT taking an area's
-/// raw one hop, so it is granted raw and nothing else, and only of the regions it asked for that
+/// raw one hop, so it is granted raw and the clock models of the same regions (the neighbouring
+/// areas' models its fixes may cite) and nothing else, and only of the regions it asked for that
 /// lie inside the border band of the areas it is an MLAT relay for, by the ranking every relay
 /// computes alike from the offers it holds (`selection::areas_solved_by`). The whole world,
 /// another product, or a region outside the band is refused: an engine reads near home, never
@@ -314,12 +339,12 @@ pub fn engine_grant(
     directory: &Directory,
     engine: &PublicKey,
     asked: &Subscription,
-    now_ms: u64,
+    now: tally_wire::clocks::Judged,
 ) -> Subscription {
     if !asked.streams.contains(Streams::RAW) || asked.regions.is_empty() {
         return Subscription::nothing();
     }
-    let band = Band::of(&areas_solved_by(directory, engine, now_ms));
+    let band = Band::of(&areas_solved_by(directory, engine, now));
     let regions: Vec<Region> = asked
         .regions
         .iter()
@@ -329,8 +354,14 @@ pub fn engine_grant(
     if regions.is_empty() {
         return Subscription::nothing();
     }
+    // The models of the band's areas with their raw: the ones its fixes may cite beside its
+    // own areas' (`tally_mlat::area`), each by its area (`Subscription::wants`).
     Subscription {
-        streams: Streams::RAW,
+        streams: if asked.streams.contains(Streams::CLOCK_MODELS) {
+            Streams::RAW.with(Streams::CLOCK_MODELS)
+        } else {
+            Streams::RAW
+        },
         regions,
     }
 }
@@ -400,6 +431,7 @@ pub fn on_directory_link(record: &Record) -> bool {
             | Record::DeliveryAnswer(_)
             | Record::HaveSummary(_)
             | Record::Heartbeat
+            | Record::TimedHeartbeat(_)
             | Record::Goodbye { .. }
             | Record::Redirect { .. }
             | Record::RelayList(_)
@@ -408,12 +440,14 @@ pub fn on_directory_link(record: &Record) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use std::sync::Arc;
+    use tally_wire::clocks::recorded::judged;
 
     use tally_wire::rendezvous::AREA_RESOLUTION;
     use tally_wire::{
-        Identity, Location, Positions, ProviderOffer, ProviderOfferContent, Record, Region,
-        SolutionsContent, Streams,
+        FixesContent, Identity, Location, Positions, ProviderOffer, ProviderOfferContent, Record,
+        Region, Streams,
     };
 
     use super::{
@@ -547,8 +581,8 @@ mod tests {
             Identity::generate().map_err(text)?,
         );
         let directory = Directory::new();
-        directory.hold_verified(offer(&engine, atlanta, 8)?, Group::V4(1), NOW)?;
-        directory.hold_verified(offer(&other, sydney, 8)?, Group::V4(2), NOW)?;
+        directory.hold_verified(offer(&engine, atlanta, 8)?, Group::V4(1), judged(NOW))?;
+        directory.hold_verified(offer(&other, sydney, 8)?, Group::V4(2), judged(NOW))?;
         let band = tally_mlat::area::border_band(&tally_wire::Regions::new([atlanta]));
         let edge = *band.cells().last().ok_or("an empty band")?;
         let asked = Subscription {
@@ -556,7 +590,7 @@ mod tests {
             regions: vec![atlanta, edge, sydney],
         };
         assert_eq!(
-            engine_grant(&directory, &engine.public(), &asked, NOW),
+            engine_grant(&directory, &engine.public(), &asked, judged(NOW)),
             Subscription {
                 streams: Streams::RAW,
                 regions: vec![atlanta, edge],
@@ -569,7 +603,7 @@ mod tests {
             regions: Vec::new(),
         };
         assert_eq!(
-            engine_grant(&directory, &engine.public(), &world, NOW),
+            engine_grant(&directory, &engine.public(), &world, judged(NOW)),
             Subscription::nothing()
         );
         let positions = Subscription {
@@ -577,11 +611,11 @@ mod tests {
             regions: vec![atlanta],
         };
         assert_eq!(
-            engine_grant(&directory, &engine.public(), &positions, NOW),
+            engine_grant(&directory, &engine.public(), &positions, judged(NOW)),
             Subscription::nothing()
         );
         assert_eq!(
-            engine_grant(&directory, &other.public(), &asked, NOW),
+            engine_grant(&directory, &other.public(), &asked, judged(NOW)),
             Subscription {
                 streams: Streams::RAW,
                 regions: vec![sydney],
@@ -589,11 +623,11 @@ mod tests {
         );
         let stranger = Identity::generate().map_err(text)?;
         assert_eq!(
-            engine_grant(&directory, &stranger.public(), &asked, NOW),
+            engine_grant(&directory, &stranger.public(), &asked, judged(NOW)),
             Subscription::nothing()
         );
         assert_eq!(
-            engine_grant(&directory, &engine.public(), &asked, NOW + 600_001),
+            engine_grant(&directory, &engine.public(), &asked, judged(NOW + 600_001)),
             Subscription::nothing()
         );
         Ok(())
@@ -617,7 +651,7 @@ mod tests {
                 )?;
                 if !areas.contains(&area) {
                     areas.push(area);
-                    directory.hold_verified(offer(&engine, area, 8)?, Group::V4(1), NOW)?;
+                    directory.hold_verified(offer(&engine, area, 8)?, Group::V4(1), judged(NOW))?;
                 }
             }
         }
@@ -628,7 +662,7 @@ mod tests {
         );
         // The work is counted, not timed: the band lookups one band of the engine's areas takes.
         let before = tally_mlat::area::band_lookups_here();
-        let _ = Band::of(&areas_solved_by(&directory, &engine.public(), NOW));
+        let _ = Band::of(&areas_solved_by(&directory, &engine.public(), judged(NOW)));
         let one_band = tally_mlat::area::band_lookups_here() - before;
         assert!(one_band > 0);
         let chunks = band.cells().chunks(tally_wire::record::MAX_REGIONS).len() as u64;
@@ -639,7 +673,7 @@ mod tests {
                 regions: chunk.to_vec(),
             };
             assert_eq!(
-                engine_grant(&directory, &engine.public(), &asked, NOW),
+                engine_grant(&directory, &engine.public(), &asked, judged(NOW)),
                 asked
             );
         }
@@ -654,32 +688,33 @@ mod tests {
         Ok(())
     }
 
-    fn provisional() -> Result<Record, String> {
+    fn fix() -> Result<Record, String> {
         let engine = Identity::generate().map_err(|error| error.to_string())?;
-        Positions::sign_provisional(
+        Positions::sign_fix(
             &engine,
-            &SolutionsContent {
+            &FixesContent {
                 boot_id: 1,
                 sequence: 0,
                 issued_ms: 1,
-                spec_version: 3,
-                solutions: Vec::new(),
+                spec_version: 7,
+                fixes: Vec::new(),
             },
         )
-        .map(Record::Provisional)
+        .map(Record::Positions)
         .map_err(|error| error.to_string())
     }
 
+    /// There is one kind of MLAT fix (RFC-0171 §3.8.1 as amended 2026-10-24): its positions go to
+    /// every reader of positions, in the positions class to a relay link, and to nobody else.
     #[test]
-    fn provisional_positions_are_sent_only_when_asked_for_and_below_the_final_ones()
-    -> Result<(), String> {
+    fn fixes_are_sent_to_readers_of_positions_in_the_positions_class() -> Result<(), String> {
         let item = Item {
             source: 0,
-            record: Arc::new(provisional()?),
+            record: Arc::new(fix()?),
             cell: None,
             points: None,
             decoded: None,
-            stamp_ms: 0,
+            stamp: tally_wire::clocks::recorded::mono(0),
             client: None,
         };
         let asked = |streams: Streams| {
@@ -689,11 +724,11 @@ mod tests {
             }
             .wants(&item)
         };
-        assert!(!asked(Streams::POSITIONS.with(Streams::CLOCK_MODELS)));
-        assert!(asked(Streams::PROVISIONAL));
+        assert!(asked(Streams::POSITIONS));
+        assert!(!asked(Streams::RAW.with(Streams::CLOCK_MODELS)));
         assert!(!super::directory_wants(&item));
-        // To a relay link, the class held for them; to a plain subscriber, a taker's.
-        assert_eq!(Class::of(&item.record, Kind::Relay), Class::Provisional);
+        // To a relay link, the positions class; to a plain subscriber, a taker's.
+        assert_eq!(Class::of(&item.record, Kind::Relay), Class::Positions);
         assert_eq!(Class::of(&item.record, Kind::Taker), Class::Taker);
         Ok(())
     }

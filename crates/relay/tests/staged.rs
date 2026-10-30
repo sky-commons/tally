@@ -6,6 +6,7 @@
 //! each receiver's batches reach a subscriber in admitted order, described first; and what is let
 //! go is let go whole, counted. The hosted MLAT's are in `staged_mlat.rs`.
 
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,9 +24,56 @@ use tally_wire::{
 
 type Result<T = ()> = std::result::Result<T, String>;
 
-/// How long a test waits for the event it asserts before calling it a hang: a guard on a relay
-/// that never gets there, never a verdict on how fast the machine running the test is.
+/// The same key again, from its file form, for a test that hands a key over and still signs or
+/// dials as it: `Identity` is not `Clone`.
+fn twin(identity: &Identity) -> Result<Identity> {
+    Identity::from_base64(&identity.to_base64()).map_err(|error| error.to_string())
+}
+
+/// How long what a test waits on may stand still before the test calls it a hang: a guard on a
+/// relay that stopped moving, never a verdict on how fast the machine running the test is. A wait
+/// polls its condition and counts this from the last time it moved (`until`), so a relay that is
+/// slow on a loaded machine but moving is waited for, and Bazel's timeout for the target's size
+/// bounds the whole. Before, the whole wait was held to it from its start, and a run on a host at
+/// a load of 99 failed while the relay was still sealing.
 const HANG: Duration = Duration::from_secs(120);
+
+/// Polls `reached` until it is `target` or more, failing as a hang only once it has not moved for
+/// `HANG` (`what`: what stood still, and where it stood).
+fn until(target: u64, reached: impl Fn() -> u64, what: impl Fn(u64) -> String) -> Result {
+    let mut last = reached();
+    let mut moved = Instant::now();
+    while last < target {
+        std::thread::sleep(Duration::from_millis(5));
+        let now = reached();
+        if now > last {
+            (last, moved) = (now, Instant::now());
+        } else if moved.elapsed() > HANG {
+            return Err(what(now));
+        }
+    }
+    Ok(())
+}
+
+/// As [`until`], on the test's runtime.
+async fn until_async(
+    target: u64,
+    reached: impl Fn() -> u64,
+    what: impl Fn(u64) -> String,
+) -> Result {
+    let mut last = reached();
+    let mut moved = Instant::now();
+    while last < target {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let now = reached();
+        if now > last {
+            (last, moved) = (now, Instant::now());
+        } else if moved.elapsed() > HANG {
+            return Err(what(now));
+        }
+    }
+    Ok(())
+}
 
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -126,7 +174,7 @@ fn trace() -> Result<Trace> {
     let mut ingest_seq = 0;
     for second in 0..SECONDS {
         for (n, (identity, _, _)) in feeders.iter().enumerate() {
-            let batch = Batch::sign_with(
+            let batch = anchored_batch_with(
                 identity,
                 &BatchContent {
                     boot_id: 1,
@@ -140,10 +188,8 @@ fn trace() -> Result<Trace> {
                 tally_wire::Codec::Deflate,
             )
             .map_err(text)?;
-            let stamp = Stamp {
-                stamp_ms: BASE_MS + second * 1_000 + 10 * n as u64,
-                ingest_seq,
-            };
+            let at = BASE_MS + second * 1_000 + 10 * n as u64;
+            let stamp = Stamp::recorded(at, ingest_seq, at, at, true);
             ingest_seq += 1;
             batches.push((batch, stamp));
         }
@@ -152,7 +198,11 @@ fn trace() -> Result<Trace> {
         relay,
         feeders,
         batches,
-        end_ms: BASE_MS + (SECONDS + 7) * 1_000,
+        // Past the world's settle after the last second, on the epochs' grid, so every
+        // second of it is sealed.
+        end_ms: BASE_MS
+            + (SECONDS + 3) * 1_000
+            + tally_relay::products::WORLD_SETTLE_MS.div_ceil(1_000) * 1_000,
     })
 }
 
@@ -170,7 +220,7 @@ struct Made {
 fn stream_of(hub: &Hub) -> Result<(Vec<Observation>, u64)> {
     let products = &hub.network().products;
     let mut stream = Vec::new();
-    for record in products.tick(None) {
+    for record in products.tick() {
         if let Record::RelayBatch(batch) = record {
             batch.verify_as_relay().map_err(text)?;
             stream.extend(batch.content().map_err(text)?.observations);
@@ -179,11 +229,10 @@ fn stream_of(hub: &Hub) -> Result<(Vec<Observation>, u64)> {
     Ok((stream, products.report().stream_refused))
 }
 
-/// The relay's key, the trace's world switched on and its feeders described: as the trace's
-/// relay starts.
-fn start(hub: &Hub, trace: &Trace) {
-    hub.network().adopt_identity(trace.relay.clone());
-    hub.network().products.set_world(true);
+/// The relay's key and its feeders described: as the trace's relay starts (its world switched on
+/// where it is built, `Hub::gathering_world`).
+fn start(hub: &Hub, trace: &Trace) -> Result {
+    hub.network().adopt_identity(twin(&trace.relay)?);
     for (identity, info, location) in &trace.feeders {
         hub.publish_info(
             1,
@@ -194,6 +243,7 @@ fn start(hub: &Hub, trace: &Trace) {
             true,
         );
     }
+    Ok(())
 }
 
 /// A trace's batch, as a link hands it in: stamped `stamp`, or by the ingest clock when `None`.
@@ -204,6 +254,7 @@ fn inbound(hub: &Hub, batch: &Batch, stamp: Option<Stamp>) -> Inbound {
         origin: Origin::Elsewhere,
         verify: true,
         stamp,
+        arrived: None,
         in_flight: hub.in_flight_for(batch),
         refusal: None,
     }
@@ -213,22 +264,17 @@ fn inbound(hub: &Hub, batch: &Batch, stamp: Option<Stamp>) -> Inbound {
 fn made(hub: &Hub, end_ms: u64) -> Result<Made> {
     hub.advance(end_ms);
     let products = &hub.network().products;
-    let started = Instant::now();
-    while products.watermark_ms() < end_ms {
-        if started.elapsed() > HANG {
-            return Err(format!(
-                "the products reached {} of {end_ms}",
-                products.watermark_ms()
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    until(
+        end_ms,
+        || products.watermark_ms(),
+        |at| format!("the products stood at {at} of {end_ms}"),
+    )?;
     let mut made = Made {
         regional: Vec::new(),
         world: Vec::new(),
         stream: Vec::new(),
     };
-    for record in products.tick(None) {
+    for record in products.tick() {
         match record {
             Record::RegionalBatch(regional) => made.regional.push(regional.as_bytes().to_vec()),
             Record::WorldPositions(world) => made.world.push(world.as_bytes().to_vec()),
@@ -249,10 +295,13 @@ fn made(hub: &Hub, end_ms: u64) -> Result<Made> {
 fn run(trace: &Trace, threads: Threads, delay: impl Fn(usize) -> Duration) -> Result<Made> {
     let hub = Arc::new(
         Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY)
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
+            // The trace's world switched on, as `--world` does, its fixes' store planned.
+            .gathering_world(true)
             .product_boots(42)
             .staged(threads)?,
     );
-    start(&hub, trace);
+    start(&hub, trace)?;
     for (n, (batch, stamp)) in trace.batches.iter().enumerate() {
         std::thread::sleep(delay(n));
         hub.ingest(inbound(&hub, batch, Some(*stamp)));
@@ -275,10 +324,13 @@ fn run_clocked(trace: &Trace, threads: Threads, pause: Option<Pause>) -> Result<
             Arc::new(move || reading.load(Ordering::SeqCst)),
             tally_relay::sharing::Deadlines::RELAY,
         )
+        .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
+        // The trace's world switched on, as `--world` does, its fixes' store planned.
+        .gathering_world(true)
         .product_boots(42)
         .staged_pausing(threads, pause)?,
     );
-    start(&hub, trace);
+    start(&hub, trace)?;
     for (second, batches) in trace.batches.chunks(FEEDERS).enumerate() {
         clock.store(BASE_MS + second as u64 * 1_000 + 100, Ordering::SeqCst);
         for (batch, _) in batches {
@@ -380,13 +432,13 @@ fn stamped_by_the_ingest_clock_with_delays_inside_every_stage_the_bytes_are_the_
 #[test]
 fn copies_of_a_message_up_to_two_seconds_apart_are_kept_once() -> Result {
     let hub = Arc::new(
-        Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY).staged(
-            Threads {
+        Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY)
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
+            .staged(Threads {
                 ingest: 4,
                 message: 4,
                 seal: 4,
-            },
-        )?,
+            })?,
     );
     hub.network().adopt_identity(Identity::from_seed([59; 32]));
     let message = airborne(
@@ -400,7 +452,7 @@ fn copies_of_a_message_up_to_two_seconds_apart_are_kept_once() -> Result {
     // After the first copy: at once, 0.999 s, 2 s (each the same message), then 3.5 s (past it).
     for (n, after_ms) in [0u64, 999, 2_000, 3_500].into_iter().enumerate() {
         let receiver = Identity::from_seed([n as u8 + 60; 32]);
-        let batch = Batch::sign(
+        let batch = anchored_batch(
             &receiver,
             &BatchContent {
                 boot_id: 1,
@@ -418,22 +470,23 @@ fn copies_of_a_message_up_to_two_seconds_apart_are_kept_once() -> Result {
             },
         )
         .map_err(text)?;
-        let stamp = Stamp {
-            stamp_ms: BASE_MS + 400 + after_ms,
-            ingest_seq: n as u64,
-        };
+        let stamp = Stamp::recorded(
+            BASE_MS + 400 + after_ms,
+            n as u64,
+            BASE_MS + 400 + after_ms,
+            BASE_MS + 400 + after_ms,
+            true,
+        );
         hub.ingest(inbound(&hub, &batch, Some(stamp)));
     }
     let end_ms = BASE_MS + 10_000;
     hub.advance(end_ms);
     let products = &hub.network().products;
-    let started = Instant::now();
-    while products.watermark_ms() < end_ms {
-        if started.elapsed() > HANG {
-            return Err("the epochs never closed".to_owned());
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    until(
+        end_ms,
+        || products.watermark_ms(),
+        |at| format!("the epochs stood at {at} of {end_ms}"),
+    )?;
     let (stream, refused) = stream_of(&hub)?;
     assert_eq!(refused, 0);
     let kept: Vec<u64> = stream
@@ -522,13 +575,13 @@ async fn each_receivers_batches_reach_a_subscriber_in_order_described_first() ->
     // The ingest clock stopped: signing these batches takes real seconds in a debug build, and
     // a subscriber is let go two seconds of inbound behind, which is not what this reads.
     let hub = Arc::new(
-        Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY).staged(
-            Threads {
+        Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY)
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
+            .staged(Threads {
                 ingest: 8,
                 message: 2,
                 seal: 2,
-            },
-        )?,
+            })?,
     );
     let listener = hub.listen(
         999,
@@ -558,7 +611,7 @@ async fn each_receivers_batches_reach_a_subscriber_in_order_described_first() ->
                 .map_err(text)?;
                 hub.publish_info(1, info, receiver.public(), 1, None, true);
             }
-            let batch = Batch::sign(
+            let batch = anchored_batch(
                 receiver,
                 &BatchContent {
                     boot_id: 3,
@@ -578,6 +631,7 @@ async fn each_receivers_batches_reach_a_subscriber_in_order_described_first() ->
                 origin: Origin::Elsewhere,
                 verify: true,
                 stamp: None,
+                arrived: None,
                 in_flight,
                 refusal: None,
             });
@@ -585,17 +639,20 @@ async fn each_receivers_batches_reach_a_subscriber_in_order_described_first() ->
     }
     let mut items: Vec<Item> = Vec::new();
     let wanted = RECEIVERS * (BATCHES as usize + 1);
-    let deadline = Instant::now() + HANG;
+    // Each wait for more is bounded on its own: a subscriber that stopped hearing for `HANG` is a
+    // hang, one that hears slowly is waited for.
     while items.len() < wanted {
         let mut got = Vec::new();
         tokio::time::timeout(HANG, listener.recv_many(&mut got, 512))
             .await
-            .map_err(|_| "the subscriber stopped hearing".to_owned())?
+            .map_err(|_| {
+                format!(
+                    "the subscriber stopped hearing at {} of {wanted}",
+                    items.len()
+                )
+            })?
             .map_err(|fell| format!("{fell:?}"))?;
         items.extend(got.into_iter().map(tally_relay::fanout::Taken::into_item));
-        if Instant::now() > deadline {
-            return Err(format!("heard {} of {wanted}", items.len()));
-        }
     }
     let mut seen: HashMap<tally_wire::PublicKey, (bool, Option<u64>)> = HashMap::new();
     for item in &items {
@@ -637,6 +694,7 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
     // just, and the products, planned the same way, held all forty epochs.)
     let hub = Arc::new(
         Hub::clocked(8, Arc::new(|| 0), tally_relay::sharing::Deadlines::RELAY)
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
             // No area taken, so no member's share beside the feeder's: the stores hold exactly
             // what it is planned.
             .memory_for_feeders(1, false)
@@ -658,13 +716,13 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
     let receiver = Identity::from_seed([3; 32]);
     let seconds = 2 * hub.budget().gauge(Store::Products).limit() as u64 / 1_000;
     for second in 0..seconds {
-        let batch = Batch::sign(
+        let batch = anchored_batch(
             &receiver,
             &BatchContent {
                 boot_id: 4,
                 sequence: second,
                 counter_epoch: 0,
-                wall_ms: 0,
+                wall_ms: BASE_MS + second * 1_000,
                 dropped: 0,
                 previous: [0; 32],
                 observations: heard(second, 1),
@@ -677,24 +735,39 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
             batch,
             origin: Origin::Elsewhere,
             verify: true,
-            stamp: Some(Stamp {
-                stamp_ms: BASE_MS + second * 1_000,
-                ingest_seq: second,
-            }),
+            stamp: Some(Stamp::recorded(
+                BASE_MS + second * 1_000,
+                second,
+                BASE_MS + second * 1_000,
+                BASE_MS + second * 1_000,
+                true,
+            )),
+            arrived: None,
             in_flight,
             refusal: None,
         });
         hub.advance(BASE_MS + second * 1_000);
+        // Each second is taken before the next is stamped, as time passing would take it: fed
+        // faster than its threads read their ticks, one message thread would meet epochs more
+        // than `exchange::EPOCHS_OPEN` past another's and, after `exchange::WINDOW_WAIT_MS` of
+        // the host's time, let them go (`receptions_past_window`), so what was lost would be the
+        // host's load, not the products' budget.
+        let at = BASE_MS + second * 1_000;
+        until_async(
+            at,
+            || hub.network().products.watermark_ms(),
+            |stood| format!("the epochs stood at {stood} of {at}"),
+        )
+        .await?;
     }
     let end = BASE_MS + (seconds + 1) * 1_000;
     hub.advance(end);
-    let started = Instant::now();
-    while hub.network().products.watermark_ms() < end {
-        if started.elapsed() > HANG {
-            return Err("the epochs never closed".to_owned());
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    until_async(
+        end,
+        || hub.network().products.watermark_ms(),
+        |at| format!("the epochs stood at {at} of {end}"),
+    )
+    .await?;
     // The stalled subscriber was let go whole: told it fell behind, holding nothing.
     let mut got = Vec::new();
     assert!(matches!(
@@ -713,7 +786,31 @@ async fn a_subscriber_that_falls_behind_is_let_go_whole_and_the_stream_refused_w
         seconds as usize
     );
     assert_eq!(hub.network().products.report().stream_refused, refused);
-    // And nothing before the products: every batch was decoded and every epoch decided.
+    // And nothing before the products: every batch was decoded and every epoch decided, none let
+    // go past the message threads' window.
+    assert_eq!(hub.network().products.report().receptions_past_window, 0);
     assert_eq!(hub.memory_report().decoded_refused, 0);
     Ok(())
+}
+
+/// `content` signed by `identity` as a feeder of this build signs it (RFC-0171 §3.6): anchored by
+/// the relay its session is to as that relay's clock read its signed time, here the simulation's
+/// anchoring relay (`tally_mlat_solver::sim::anchoring_relay`), which every relay these tests
+/// start accepts.
+fn anchored_batch(
+    identity: &Identity,
+    content: &BatchContent,
+) -> std::result::Result<Batch, tally_wire::WireError> {
+    anchored_batch_with(identity, content, tally_wire::Codec::Plain)
+}
+
+/// As `anchored_batch`, its receptions written by `codec`.
+fn anchored_batch_with(
+    identity: &Identity,
+    content: &BatchContent,
+    codec: tally_wire::Codec,
+) -> std::result::Result<Batch, tally_wire::WireError> {
+    let anchor =
+        tally_wire::Anchor::sign(&tally_mlat_solver::sim::anchoring_relay(), content.wall_ms);
+    Batch::sign_anchored(identity, content, codec, &[anchor])
 }

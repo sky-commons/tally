@@ -32,30 +32,44 @@
 //! (the raw links), measured apart (2,000 feeders, two MLAT threads), and plans by those.
 //!
 //! Before, the hosted MLAT engine's threads were not planned (`--mlat-threads`, every core the
-//! relay saw by default): its window steps spread over every core beside the stages, at the
-//! stages' priority in its provisional steps, so on a relay hosting MLAT under load nothing kept a
-//! core for raw.
+//! relay saw by default): its steps spread over every core beside the stages, at the stages'
+//! priority, so on a relay hosting MLAT under load nothing kept a core for raw.
 
 use crate::budget::PLANNED_RECEPTIONS_PER_SEC;
 use crate::ingest::{INGEST_NANOS_PER_RECORD, MEMBER_RECORDS_PER_FEEDER, Threads};
 
 /// Receptions a second one ingest worker sustains, each batch verified, hashed, admitted,
-/// inflated, decoded and routed. Measured: 3.05 M receptions a second (5,040 batches) cost two
-/// workers 0.594 of a core together (195 ns a reception), 3.02 M (5,000 batches) cost four 0.636
-/// (211 ns), and 4.61 M (6,742 batches of 683 receptions) cost four 1.018 (221 ns, 151 us a batch).
-/// 221 ns is 4.5 M receptions a second, 7,500 planned batches.
-pub const INGEST_RECEPTIONS_PER_THREAD: usize = 4_500_000;
-/// The same where MLAT raw is held. Measured: 1.21 M receptions a second (2,000 batches) cost two
-/// workers 0.352 of a core (290 ns): 3.4 M receptions a second, 5,700 planned batches.
-pub const INGEST_RECEPTIONS_PER_THREAD_HOLDING_RAW: usize = 3_400_000;
+/// inflated, decoded, credited to its feeder's figures (each position's CPR decoded and its H3
+/// cell found, `figures::Figures::batch`) and routed. Measured (2026-10-27, `tally-load` `-c opt`,
+/// the relay on cores 0-15, its feeders sending the measured mix of `tally_load::traffic`, 60 s of
+/// each ingest worker's CPU time from `/proc/<pid>/task/*/stat` after a 60 s ramp and a 110 s
+/// warm-up, with `--no-mlat`): 1.23 M receptions a second (2,000 feeders) cost ten workers 0.589
+/// of a core together (480 ns a reception), and 2.97 M (5,000 feeders, a 120 s ramp) seven 1.414
+/// (476 ns): 2.0 M receptions a second, planned at 500 ns. A feeder's batch is inflated once, its
+/// wanted receptions and its decode read from the same bytes (`tally_wire::Inflated`). Before, 1.15 M (865 ns,
+/// 2026-10-26), when each feeder's figures found the CPR zone count of every position by `acos`
+/// and the H3 cell of every placing, its receiver's public cell's centre again for every batch,
+/// and every aircraft's last placing again for each feeder that heard it; and 4.5 M (221 ns) on
+/// 2026-10-09, over traffic of no position to credit, before the figures decoded positions at all.
+pub const INGEST_RECEPTIONS_PER_THREAD: usize = 2_000_000;
+/// The same where MLAT raw is held (each batch's wanted receptions into its raw shard's inbox
+/// besides, `mlat_host::MlatHost::offer_batch`). Measured the same way hosting MLAT: 1.22 M
+/// receptions a second (2,000 feeders, 457 seats) cost eight workers 0.839 to 0.862 of a core (687
+/// to 706 ns): at the dearer, 1.4 M receptions a second. Before, 0.9 M (1,105 ns, 2026-10-26), and
+/// 3.4 M (290 ns) on 2026-10-09 as the line above.
+pub const INGEST_RECEPTIONS_PER_THREAD_HOLDING_RAW: usize = 1_400_000;
 
-/// Receptions a second one message thread sustains, deduplicating its shards. Measured: 3.05 M
-/// receptions a second cost one thread 0.660 of a core (216 ns a reception), 3.02 M cost two
-/// threads 0.557 together and four 0.468, and 4.61 M cost four 0.620 (134 ns): a thread's shards
-/// fit its caches better the fewer they are, and the slice each batch sends each thread costs
-/// nothing measurable beside its receptions. Holding MLAT raw changes nothing here (1.21 M cost two
-/// threads 0.159, 131 ns). 216 ns is 4.6 M receptions a second, 7,600 planned batches.
-pub const MESSAGE_RECEPTIONS_PER_THREAD: usize = 4_600_000;
+/// Receptions a second one message thread sustains, deduplicating its shards: one table a
+/// thread, each reception probing the one place its fingerprint and what it was kept for hash to,
+/// prefetched ahead, and each epoch let go from the homes it listed (`exchange::Fingerprints`).
+/// Measured (2026-10-27, as the ingest workers above, `--no-mlat`): 1.18 M receptions a second
+/// (2,000 feeders) cost three threads 0.059 of a core together (50 ns a reception), and 2.91 M
+/// (5,000 feeders) three 0.140 (48 ns): at the dearer, 20 M receptions a second. Before, 10 M
+/// (98 ns) when each epoch listed its keys whole; 3.9 M (253 ns at 5,000 feeders) when each
+/// reception probed every epoch's table (`DEDUP_EPOCHS`) and walked its fingerprint's list of the
+/// areas it was kept for, and the more an epoch filled them the more of those probes missed the
+/// caches; and 4.6 M (216 ns) on 2026-10-09.
+pub const MESSAGE_RECEPTIONS_PER_THREAD: usize = 20_000_000;
 
 /// Receptions a second one sealer thread sustains, the sealer and its pool together (cutting,
 /// signing and deriving each epoch's records). Measured: 3.02 M to 3.05 M receptions a second
@@ -64,20 +78,28 @@ pub const MESSAGE_RECEPTIONS_PER_THREAD: usize = 4_600_000;
 /// 0.492 (107 ns). 178 ns is 5.6 M receptions a second, 9,300 planned batches. The part of it no
 /// helper takes (gathering each epoch from every message thread, numbering its records in cell
 /// order, applying them) was 0.144 to 0.164 of a core at 3.02 M and 0.144 at 4.61 M: it follows
-/// the epochs and the areas, not the receptions, so it bounds no feeder count.
-pub const SEAL_RECEPTIONS_PER_THREAD: usize = 5_600_000;
-/// The same where MLAT raw is held (its bins sealed too). Measured: 1.21 M receptions a second
-/// cost the sealer and one helper 0.370 of a core (305 ns): 3.2 M receptions a second.
-pub const SEAL_RECEPTIONS_PER_THREAD_HOLDING_RAW: usize = 3_200_000;
+/// the epochs and the areas, not the receptions, so it bounds no feeder count. Measured again over
+/// the measured mix (2026-10-27): 1.23 M receptions a second cost the sealer and two helpers
+/// 0.068 to 0.080 of a core (55 to 65 ns), 2.97 M 0.194 (65 ns): 15 M receptions a second. Before,
+/// 5.6 M (178 ns), measured on 2026-10-09 before the sealer's records were cut and signed in its
+/// pool.
+pub const SEAL_RECEPTIONS_PER_THREAD: usize = 15_000_000;
+/// The same where MLAT raw is held (its bins sealed too). Measured (2026-10-27, 457 seats): 1.22 M
+/// receptions a second cost the sealer and two helpers 0.076 of a core (62 ns), planned at the
+/// dearer figure without raw: 15 M receptions a second. Before, 3.2 M (305 ns, 2026-10-09).
+pub const SEAL_RECEPTIONS_PER_THREAD_HOLDING_RAW: usize = 15_000_000;
 
 /// Planned feeders one core of the async runtime carries: each one's Noise session and its
 /// batches' framing, the fan-out's writes to subscribers, the links and the stats. Measured: ten
 /// runtime workers took 0.404 to 0.412 of a core together at 5,000 feeders (82 us a feeder a
-/// second), and 0.516 at 6,742 (77 us): 12,100 feeders a core.
-pub const RUNTIME_FEEDERS_PER_CORE: usize = 12_000;
+/// second), and 0.516 at 6,742 (77 us): 12,100 feeders a core. Measured again over the measured mix
+/// (2026-10-27): sixteen workers took 0.119 to 0.128 of a core at 2,000 feeders (64 us) and 0.303
+/// at 5,000 (61 us): 15,600 feeders a core, planned at 15,000.
+pub const RUNTIME_FEEDERS_PER_CORE: usize = 15_000;
 /// The same where MLAT raw is held. Measured: 0.243 of a core at 2,000 feeders (121 us a feeder a
-/// second): 8,200 feeders a core.
-pub const RUNTIME_FEEDERS_PER_CORE_HOLDING_RAW: usize = 8_000;
+/// second), 8,200 feeders a core (2026-10-09); again (2026-10-27, 457 seats) 0.142 to 0.161 (81
+/// us): 12,400 a core, planned at 12,000.
+pub const RUNTIME_FEEDERS_PER_CORE_HOLDING_RAW: usize = 12_000;
 
 /// Nanoseconds of the async runtime one record answered there costs at most, whatever its size
 ///: the records no ingest worker takes (an echo's reply signed, a delivery query's
@@ -101,32 +123,87 @@ pub const RUNTIME_NANOS_PER_RECORD: usize = 60_000;
 /// two at 28% each, 41 ms.
 pub const BUSY_PERCENT: usize = 50;
 
-/// Nanoseconds of one core a second hosted MLAT's window steps cost a hosted feeder: the seals of
-/// its raw, each window step's fits and solutions (spread over the step's threads,
-/// `window::parallel`), and the engine's own thread that steps them. Measured (2026-10-09, the
-/// relay built `-c opt` with each MLAT thread adding its own run time (`/proc/thread-self/schedstat`)
-/// to its kind's count as it ended, on cores 0-9 of a 32-core host with the harness on 10-31, two
-/// areas, eight MLAT threads; a window step came about every 40 s, so each is taken whole, after
-/// the ramp): at 500 feeders a window step cost 10.0 and 11.0 cores-seconds (0.27 of a core), the
-/// seals 0.058 of a core and the engine's thread 0.008, 0.68 ms a feeder a second; at 2,000 a
-/// window step cost 39.4 cores-seconds every 41 s (0.96 of a core), the seals 0.21 and the engine's
-/// thread 0.085, 0.63 ms. 0.68 ms is planned as 0.70.
-pub const MLAT_WINDOW_NANOS_PER_FEEDER: usize = 700_000;
-/// The same of its provisional steps: weighing what each batch told its address shards and solving
-/// what is due, every second. Measured in the same runs, over each 10 s once the feeders were all
-/// up: 0.14 to 0.20 of a core at 500 feeders (0.41 ms a feeder a second at its most), and 0.72 to
-/// 0.80 at 2,000 (0.40 ms at its most). 0.41 ms.
-pub const MLAT_PROVISIONAL_NANOS_PER_FEEDER: usize = 410_000;
+// Hosted MLAT's cost a seat (RFC-0171 §3.8.1 as amended 2026-10-24; RFC-0181 §10, "MLAT in the
+// cores"), measured where the host pays it: `tally-load` (`-c opt`) against the world relay's plan
+// (`crates/relay/tests/world-relay.txt`: 16 cores, its memory, so 4 MLAT threads), the relay on
+// cores 0-15 of the 32-core build host and the harness on 16-31 (`--relay-cores 16`), 2,000
+// feeders sending the measured mix (`tally_load::traffic`, about 600 receptions a second a
+// receiver, 60% of them messages MLAT wants), 60 s measured after a 60 s ramp and a 110 s warm-up,
+// 2026-10-27, its seats at the 546 its plan printed: each thread's CPU time from
+// `/proc/<pid>/task/*/stat` (the step's own threads come and go, so theirs is the process's less
+// every named thread's), the steps' fit and solve times from `GET /mlat` (`steps_total`, read at
+// both ends of the window). Before (2026-10-27, 457 seats), 5.37 ms a seat: refits 1.72, solving
+// 1.02, the host 0.27, the rest 1.57, publishing 0.41; the refit since gathers its area's
+// receptions into compact items sorted once and reads its sync points through integer ranks and
+// one list of hearers, and the step's intake sorts light tuples and builds a reception only for
+// those it keeps (`tally_mlat_solver`). Before that (2026-10-26, 522 seats), 5.97 ms: refits
+// 1.87, solving 0.86, the host 0.32, the rest 1.89, publishing 0.64. A relay
+// alone verifies no neighbour's model, so that one part is the pairwise path sweep's
+// (`tally-mlat-solver`'s `pairwise_path_sweep`, world density, seed 9000). Every figure is
+// milliseconds of one core a seat-second. `//crates/load:plan_seats` runs the same load and holds
+// the seats it settles at within 15% of the seats the plan prints. Before, every part was the
+// sweep's alone (refits 0.872, verifying 0.387, solving 0.682: 1.94 ms a seat, filled to the whole
+// of MLAT's threads), which leaves out the host's own work around the solver and runs one thread
+// over an even scene: the plan printed 2,022 seats on the world relay, and its load settled at
+// about 500.
 
-/// The most of MLAT's share of the cores the plan fills with its measured cost. MLAT plans no
-/// headroom of its own, unlike a stage ([`BUSY_PERCENT`]): it runs below the stages' priority, so
-/// the half of the stages' share they leave idle on average is MLAT's too whenever they do not
-/// need it, and what it cannot do in time it sheds, counted (`mlat_host`, Behind), never pushing
-/// back on raw. Its window steps are bursty (a step every 40 s or so, each seconds of every thread
-/// it has), which a window step past the steps MLAT may be behind absorbs by shedding the empty
-/// steps queued behind it into the next (no window is lost); its provisional steps, every second,
-/// run above the window steps.
-pub const MLAT_BUSY_PERCENT: usize = 100;
+/// Nanoseconds of one core a second an area's refits cost for each of its receivers: the pair
+/// fits of its model every `tally_wire::budget::REFIT_EVERY_MS`, each pair sought from its knots in
+/// the area's previous model, over the trailing window, as the host runs them on MLAT's threads
+/// (the steps' `fit_ms`, 803 ms a second over 546 seats, 72.5 refits a second at 11.1 ms; the
+/// sweep's "sync" was 0.872, one thread over an even scene). Dearer than the sweep for its refits,
+/// not their cost: each area refit cost what the sweep's did (11.1 ms against 15.6), but the load's
+/// seats lie over more areas each, 0.133 refits a seat-second against the sweep's 0.056. A refit
+/// has no fixed part: over the world's areas its cost follows its points, about 640 ns a point and
+/// rising with them, the pair fits most of it (`pair_tests`, `a_refits_cost_follows_its_points`).
+pub const MLAT_REFIT_NANOS_PER_FEEDER: usize = 1_470_000;
+/// Nanoseconds of one core a second verifying the neighbouring areas' models costs a seat: each
+/// such model checked once over the raw the engine holds (`Engine::verify_model`, `mlat_host`),
+/// and only when a fix the engine publishes or judges cites it (`mlat_host`, unneeded): the
+/// sweep's "a holder of the window verifying each model", 0.602 ms a feeder-second, times the
+/// share of its band's models an area's relay's fixes cite, 2.693 of 4.185 ms (1,433 of 2,259
+/// models), so 0.387. The one part the load test cannot measure: a relay alone has no neighbour
+/// (`models_verified` 0 there).
+pub const MLAT_VERIFY_NANOS_PER_FEEDER: usize = 387_000;
+/// Nanoseconds of one core a second hosted MLAT's solving costs a seat: every due set its areas'
+/// relays take up grouped into its transmissions, and of them one an aircraft a slot of 0.7 s
+/// solved (`tally_mlat_solver::backoff`, mlat-server's `RESOLVE_BACKOFF`), and again as its set
+/// closes bigger, from at most `pair::HEARERS_MOST` (32) receivers, with its verification and
+/// signing (the steps' `solve_ms`, 548 ms a second over 546 seats; the sweep's "fixes" was 0.682).
+pub const MLAT_SOLVE_NANOS_PER_FEEDER: usize = 1_000_000;
+/// Nanoseconds of one core a second the host's own thread spends a seat: taking each step's due
+/// batches from the inboxes, admitting them into the pool in order once MLAT's threads have
+/// classified them (`mlat_host`, take), settling the pool's charge, applying the cuts and judging
+/// the step (the governor), and the serial parts of the step it starts: the `tally-mlat` thread,
+/// 0.153 of a core over 546 seats.
+pub const MLAT_HOST_NANOS_PER_FEEDER: usize = 280_000;
+/// Nanoseconds of one core a second MLAT's threads spend a seat beyond its refits and its solving:
+/// classifying its batches (hashing each message, finding its positions,
+/// `tally_mlat::engine::classify`), building and judging the due sets taken up (`fix::choose`),
+/// weighing them, building their records, letting go of what the step took, and the background
+/// work beside the steps (standing's checks, forgetting receivers): the step threads' CPU, 2.029
+/// of a core, less `fit_ms` and `solve_ms`, 0.678 over 546 seats.
+pub const MLAT_STEP_REST_NANOS_PER_FEEDER: usize = 1_240_000;
+/// Nanoseconds of one core a second publishing a seat's share of MLAT's output costs the relay's
+/// duties thread: each step's positions, tagged positions and the clock models they cite signed
+/// into the hub, forwarded and released (`Hub::publish_from`, `publish_positions`,
+/// `publish_clock_model`), and the consistency checks of what it published: the duties thread's
+/// CPU hosting MLAT, 0.259 of a core, less what it spends not hosting it at the same feeders
+/// (0.028, `--no-mlat`), 0.231 over 546 seats (0.335 over 522 before each positions record's keys
+/// were checked once for its five readers, `tally_wire::Positions::fixes`).
+pub const MLAT_PUBLISH_NANOS_PER_FEEDER: usize = 420_000;
+
+/// The most of MLAT's threads the plan fills with its measured cost: the governor's target
+/// (`mlat_host::STEP_TARGET_MS` of `STEP_BUDGET_MS`), where a cut aims a step, so seats planned at
+/// it run their steps where the governor holds them and are never cut for their cost alone
+/// (`mlat_host`, Overload), and a cut on one dear step is lifted back to within an eighth of it.
+/// Its work is even: one step a second, each a second's solves and half
+/// the areas' refits (`tally_mlat::area::refit_turn`), so no step carries every area's refit at
+/// once. Before, 100: the plan filled MLAT's threads whole, so its seats ran their steps past the
+/// target and the governor cut them on the first dear step to the target's worth, a quarter below
+/// the plan (662 planned, 522 settled, 2026-10-26).
+pub const MLAT_BUSY_PERCENT: usize =
+    (crate::mlat_host::STEP_TARGET_MS * 100 / crate::mlat_host::STEP_BUDGET_MS) as usize;
 
 /// A nanosecond of one core, a second.
 const NANOS: usize = 1_000_000_000;
@@ -359,15 +436,44 @@ pub fn threads_for(load: Load, holds_raw: bool, cores: Option<usize>) -> Threads
     }
 }
 
-/// Nanoseconds of one core a second hosted MLAT costs one seat (a planned feeder's worth): its
-/// window steps and its provisional steps, in a relay that hosts MLAT (`hosts_mlat`), and nothing
-/// in one that does not.
+/// Nanoseconds of one core a second hosted MLAT costs one seat (a planned feeder's worth): every
+/// cost the host pays for it, as the load test measured them (above): its share of its area's
+/// refits, of verifying its neighbours' models and its solving, the host thread's taking and
+/// judging, the rest of MLAT's threads' work around the solver, and publishing what it solved, in
+/// a relay that hosts MLAT (`hosts_mlat`), and nothing in one that does not: 5.37 ms (5.97 on
+/// 2026-10-26, before the profile's cuts of 2026-10-27). Before, the
+/// sweep's solver work alone, 1.94 ms (0.87 refitting, 0.39 verifying, 0.68 solving), which the
+/// load test showed a quarter of what a seat costs the host; and before that the tiles' joint
+/// fits at the steps' cap of refits and their solving, 43.5 ms planned.
 pub const fn mlat_per_feeder(hosts_mlat: bool) -> usize {
     if hosts_mlat {
-        MLAT_WINDOW_NANOS_PER_FEEDER + MLAT_PROVISIONAL_NANOS_PER_FEEDER
+        MLAT_REFIT_NANOS_PER_FEEDER
+            + MLAT_VERIFY_NANOS_PER_FEEDER
+            + MLAT_SOLVE_NANOS_PER_FEEDER
+            + MLAT_HOST_NANOS_PER_FEEDER
+            + MLAT_STEP_REST_NANOS_PER_FEEDER
+            + MLAT_PUBLISH_NANOS_PER_FEEDER
     } else {
         0
     }
+}
+
+/// The part of [`mlat_per_feeder`] a step of a relay alone runs (its refits, its solving, the
+/// host's taking and judging, the rest around the solver): not verifying neighbours' models, of
+/// which it has none, nor publishing, on the duties thread. What a load test of one relay holds
+/// its steps' time to, as a share of the target (`//crates/load:plan_seats`).
+pub const fn mlat_step_per_feeder() -> usize {
+    MLAT_REFIT_NANOS_PER_FEEDER
+        + MLAT_SOLVE_NANOS_PER_FEEDER
+        + MLAT_HOST_NANOS_PER_FEEDER
+        + MLAT_STEP_REST_NANOS_PER_FEEDER
+}
+
+/// Nanoseconds of one core a second the plan sets aside for one seat: its cost
+/// ([`mlat_per_feeder`]) at [`MLAT_BUSY_PERCENT`] of MLAT's threads, so the seats the cores carry
+/// run their steps at the governor's target.
+pub const fn mlat_planned_per_feeder(hosts_mlat: bool) -> usize {
+    (mlat_per_feeder(hosts_mlat) * 100).div_ceil(MLAT_BUSY_PERCENT)
 }
 
 /// Nanoseconds of one core a second the stages and the runtime spend on one planned feeder's
@@ -394,26 +500,24 @@ fn stages_planned(load: Load, holds_raw: bool) -> usize {
 }
 
 /// The same for hosted MLAT's steps over `load` (at [`MLAT_BUSY_PERCENT`]): none where it is not
-/// hosted. MLAT's work follows the seats and the members' raw.
+/// hosted. MLAT's work follows the seats, which hold the members' raw it takes part with too
+/// ([`planned_per_feeder`]).
 fn mlat_planned(load: Load, hosts_mlat: bool) -> usize {
     load.seats
-        .saturating_add(load.member_feeders)
-        .saturating_mul(mlat_per_feeder(hosts_mlat))
-        .saturating_mul(100)
-        .div_ceil(MLAT_BUSY_PERCENT)
+        .saturating_mul(mlat_planned_per_feeder(hosts_mlat))
 }
 
-/// Nanoseconds of one core a second the plan sets aside for one planned feeder's worth of the
-/// members' rate: the stages' share at [`BUSY_PERCENT`] and, hosting MLAT, its steps'.
+/// Nanoseconds of one core a second the plan sets aside for one planned feeder's worth of
+/// `source`'s rate: the stages' share at [`BUSY_PERCENT`]. Its MLAT is a seat's
+/// ([`mlat_per_feeder`]): the engine's seats are every receiver it holds, the members' border band
+/// as much as the feeders (`tally_mlat::engine::Capacity::receivers`), so a member's raw takes part
+/// only where it holds a seat, and is never planned a second time beside them. Before, each
+/// feeder's worth of the members' rate was planned a seat's MLAT ahead of every feeder as well,
+/// so a relay on one core with the members' rate it is packaged with carried no feeder at all.
 pub fn planned_per_feeder(source: Source, holds_raw: bool) -> usize {
-    let stages = spent_per_feeder(source, holds_raw)
+    spent_per_feeder(source, holds_raw)
         .saturating_mul(100)
-        .div_ceil(BUSY_PERCENT);
-    stages.saturating_add(
-        mlat_per_feeder(holds_raw)
-            .saturating_mul(100)
-            .div_ceil(MLAT_BUSY_PERCENT),
-    )
+        .div_ceil(BUSY_PERCENT)
 }
 
 /// Nanoseconds of one core a second the cores leave the feeders' connections and the MLAT seats:
@@ -457,7 +561,7 @@ pub fn stage_nanos(holds_raw: bool) -> usize {
 /// their receptions through the stages, at [`BUSY_PERCENT`]) beside `seats` MLAT seats.
 pub fn connections_carried(available: usize, holds_raw: bool, seats: usize) -> usize {
     available
-        .saturating_sub(seats.saturating_mul(mlat_per_feeder(holds_raw)))
+        .saturating_sub(seats.saturating_mul(mlat_planned_per_feeder(holds_raw)))
         .checked_div(connection_nanos(holds_raw).saturating_add(stage_nanos(holds_raw)))
         .unwrap_or(usize::MAX)
 }
@@ -466,7 +570,7 @@ pub fn connections_carried(available: usize, holds_raw: bool, seats: usize) -> u
 /// `connections` sessions and `seats` MLAT seats: the cores' bound on `R_max`.
 pub fn rate_carried(available: usize, holds_raw: bool, connections: usize, seats: usize) -> u64 {
     let left = available
-        .saturating_sub(seats.saturating_mul(mlat_per_feeder(holds_raw)))
+        .saturating_sub(seats.saturating_mul(mlat_planned_per_feeder(holds_raw)))
         .saturating_sub(connections.saturating_mul(connection_nanos(holds_raw)));
     (left as u128 * PLANNED_RECEPTIONS_PER_SEC as u128)
         .checked_div(stage_nanos(holds_raw) as u128)
@@ -482,7 +586,7 @@ pub fn seats_carried(available: usize, holds_raw: bool, connections: usize) -> u
             connections
                 .saturating_mul(connection_nanos(holds_raw).saturating_add(stage_nanos(holds_raw))),
         )
-        .checked_div(mlat_per_feeder(holds_raw))
+        .checked_div(mlat_planned_per_feeder(holds_raw))
         .unwrap_or(usize::MAX)
 }
 
@@ -508,14 +612,9 @@ pub const fn after_mlat_share(total: usize, holds_raw: bool) -> usize {
 /// known: none where it is not hosted; else the cores the stages' share leaves, rounded up, at
 /// least one, or where the cores are not known as many as its measured cost at
 /// [`MLAT_BUSY_PERCENT`] needs, at least one. MLAT is given all of what is left, not only its
-/// average, because its work is not even: a window step's comes at once every 40 s or so, and a
-/// provisional step carries exactly the models of the window steps `tally_mlat::engine::MODELS_RIPEN_MS`
-/// (15 s) before it, by their stamp, and is shed, counted (`provisional_models_late`), when one of
-/// them has not reported by its turn: the sooner a window step reports, the fewer provisional steps
-/// are shed. Measured (2026-10-09, 2,000 feeders on 10 cores): on the three threads its average
-/// cost needs, a window step took 19 and 24 s, past the ripening; on eight, about 10 s, within
-/// it. Its threads run below the stages' priority, so the cores they share with the stages cost
-/// the stages nothing.
+/// average: a step's refits and solves come together once a second, and a step that runs past
+/// its second is overload (`mlat_host`, Overload), which cuts seats. Its threads run below the
+/// stages' priority, so the cores they share with the stages cost the stages nothing.
 pub fn mlat_threads_for(load: Load, hosts_mlat: bool, cores: Option<usize>) -> usize {
     if !hosts_mlat {
         return 0;
@@ -568,15 +667,18 @@ mod tests {
                     seal: 1
                 }
             );
-            // 5,000 planned feeders, about 3 M receptions a second, which one message thread
-            // could not carry.
+            // 5,000 planned feeders, about 3 M receptions a second, which one ingest worker could
+            // not carry (one message thread and the sealer's one thread carry them: 98 and 65 ns
+            // a reception).
             let five = threads_for(load(planned(5_000)), holds_raw, Some(10));
             assert!(
-                five.message >= 2 && five.ingest >= 2 && five.seal >= 2,
+                five.message >= 1 && five.ingest >= 2 && five.seal >= 1,
                 "{five:?}"
             );
-            // Four times the rate, about four times the threads.
+            // 20,000, about 12 M, which neither one message thread nor one sealer could.
             let twenty = threads_for(load(planned(20_000)), holds_raw, None);
+            assert!(twenty.seal >= 2 && twenty.message >= 2, "{twenty:?}");
+            // Four times the rate, about four times the threads.
             assert!(
                 twenty.message >= 4 * five.message - 3,
                 "{twenty:?} {five:?}"
@@ -604,10 +706,11 @@ mod tests {
                 3
             );
         }
-        // Holding MLAT raw costs the sealer more, and the ingest workers' receptions more.
+        // Holding MLAT raw never costs the sealer less (measured no dearer since 2026-10-27), and
+        // costs the ingest workers' receptions more.
         assert!(
             threads_for(load(planned(20_000)), true, None).seal
-                > threads_for(load(planned(20_000)), false, None).seal
+                >= threads_for(load(planned(20_000)), false, None).seal
         );
         assert!(
             Work::Ingest.per_feeder(true, Source::Member)
@@ -648,7 +751,7 @@ mod tests {
                 // Connections carried at the mean with their seats fit the cores.
                 assert!(
                     connections * (connection_nanos(holds_raw) + stage_nanos(holds_raw))
-                        + seats * mlat_per_feeder(holds_raw)
+                        + seats * mlat_planned_per_feeder(holds_raw)
                         <= available,
                     "{cores} {holds_raw}"
                 );
@@ -656,7 +759,8 @@ mod tests {
                     // MLAT's share is kept for the seats, and connections went on beyond them.
                     assert!(seats > 0 && seats <= connections, "{cores} {seats}");
                     assert!(
-                        (seats + 1) * mlat_per_feeder(true) >= available / 100 * MLAT_SHARE_PERCENT
+                        (seats + 1) * mlat_planned_per_feeder(true)
+                            >= available / 100 * MLAT_SHARE_PERCENT
                             || seats == connections,
                         "{cores} {seats} {connections}"
                     );
@@ -806,7 +910,7 @@ mod tests {
         };
         assert_eq!(
             mlat_threads_for(load, true, None),
-            (10_000 * mlat_per_feeder(true)).div_ceil(NANOS)
+            (10_000 * mlat_planned_per_feeder(true)).div_ceil(NANOS)
         );
     }
 
@@ -838,5 +942,24 @@ mod tests {
             let without = connections_carried(available_nanos(4, holds_raw, 0, none), holds_raw, 0);
             assert!(with < without, "{holds_raw}");
         }
+    }
+
+    /// A seat costs every part the host pays for it, each as measured, and is planned at the
+    /// governor's target of MLAT's threads; nothing where MLAT is not hosted.
+    #[test]
+    fn a_seat_costs_its_share_of_its_areas_refits_and_its_solving() {
+        assert_eq!(mlat_per_feeder(false), 0);
+        assert_eq!(mlat_planned_per_feeder(false), 0);
+        assert_eq!(MLAT_BUSY_PERCENT, 75);
+        assert!(mlat_planned_per_feeder(true) * MLAT_BUSY_PERCENT >= mlat_per_feeder(true) * 100);
+        assert_eq!(
+            mlat_per_feeder(true),
+            MLAT_REFIT_NANOS_PER_FEEDER
+                + MLAT_VERIFY_NANOS_PER_FEEDER
+                + MLAT_SOLVE_NANOS_PER_FEEDER
+                + MLAT_HOST_NANOS_PER_FEEDER
+                + MLAT_STEP_REST_NANOS_PER_FEEDER
+                + MLAT_PUBLISH_NANOS_PER_FEEDER
+        );
     }
 }

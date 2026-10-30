@@ -3,6 +3,7 @@ exports_files(
     [
         "Cargo.lock",
         "Cargo.toml",
+        "clippy.toml",
     ],
     visibility = ["//:__subpackages__"],
 )

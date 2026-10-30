@@ -5,10 +5,14 @@
 //! index order, ahead of the manifest, and drops the rest. A part that arrives after its manifest
 //! is checked against the manifest's list, kept for a while for that, and forwarded once.
 //!
-//! Bounded both ways: parts held wait at most `HOLD`, and at most `HELD_BYTES` of them are held,
-//! the model least recently active (a part of it arriving) forgotten first, so a stranger's
-//! parts for manifests that never come forget each other oldest first; a manifest's list is kept
-//! for `HOLD`, at most `EXPECTED_HASHES` hashes over all of them, the oldest forgotten first.
+//! Bounded both ways, by one room (`budget::Plan::parts_room`: what the members' shared rate and
+//! the relay's own MLAT may bring while a part waits): parts held wait at most `HOLD`, and at most
+//! the room's bytes of them are held, each model's entry in its table with them, the model least
+//! recently active (a part of it arriving) forgotten first, so a stranger's parts for manifests
+//! that never come forget each other oldest first; a manifest's list is kept for `HOLD`, at most
+//! the room's bytes of lists, each with its entry (a manifest lists 32 bytes for each part, and
+//! came within the same rate), the oldest forgotten first. What the tables allocate at the room
+//! is charged whole (`budget::Store::Parts`, [`planned_bytes`]).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -21,19 +25,70 @@ use crate::bounded::Bounded;
 /// How long a part waits for its manifest, and a manifest's list waits for its late parts. An
 /// engine sends a model's parts and its manifest back to back, so anything this late is lost.
 pub const HOLD: Duration = Duration::from_secs(30);
-/// The most bytes of parts held waiting for their manifests: a few dense models in flight.
-pub const HELD_BYTES: usize = 64 * 1024 * 1024;
-/// The most part hashes kept from manifests already forwarded (32 bytes each, 32 MiB).
-pub const EXPECTED_HASHES: usize = 1_000_000;
-/// Models with parts held, and manifests whose lists are kept: a bound on the tables' keys
-/// beside their bytes.
-const MODELS_REMEMBERED: usize = 65_536;
+/// What one part holds while it waits, at most: its bytes at the most a part carries
+/// (`clock_model::PART_LEN` and its header), and its slot in its model's list, twice as the list
+/// grows beside the one it replaces.
+pub const ONE_PART_BYTES: usize =
+    tally_wire::clock_model::PART_LEN + 64 + 2 * std::mem::size_of::<(u64, ClockModelPart)>();
+/// What a model with parts held takes of the room beside its parts: its entry in the table of
+/// models (`Bounded::bytes_per_key`), so a flood of the smallest parts, each of a model of its
+/// own, fills the room with what the table holds for them and is held to it.
+const HELD_KEY_BYTES: usize = Bounded::<Hash, Held>::bytes_per_key();
+/// What a kept list takes of the room beside its hashes: its entry in the table of lists.
+const EXPECTED_KEY_BYTES: usize = Bounded::<Hash, Expected>::bytes_per_key();
+/// The least room: one model of one part, so a relay with no members and no MLAT still passes
+/// one on.
+pub const ONE_MODEL_BYTES: usize = HELD_KEY_BYTES + ONE_PART_BYTES;
+/// The fewest bytes a part takes held (its header, `clock_model`'s 35 bytes, and its slot).
+const PART_LEAST: usize = 35 + 2 * std::mem::size_of::<(u64, ClockModelPart)>();
+/// What a kept list takes for each hash: the hash and whether its part went out.
+const PER_HASH: usize = std::mem::size_of::<Hash>() + std::mem::size_of::<bool>();
+
+/// The most models a room of `room` bytes holds parts for: the room over what the smallest model
+/// takes of it (its entry and one part of the fewest bytes), one at least.
+const fn held_models(room: usize) -> usize {
+    let models = room / (HELD_KEY_BYTES + PART_LEAST);
+    if models == 0 { 1 } else { models }
+}
+
+/// The most lists a room of `room` bytes keeps: the room over what the smallest list takes of it
+/// (its entry and one hash), one at least.
+const fn expected_models(room: usize) -> usize {
+    let models = room / (EXPECTED_KEY_BYTES + PER_HASH);
+    if models == 0 { 1 } else { models }
+}
+
+/// What a kept list of `hashes` takes of the room: its entry, its hashes as allocated, and
+/// whether each went out.
+fn list_bytes(hashes: &[Hash], capacity: usize) -> usize {
+    EXPECTED_KEY_BYTES
+        + capacity * std::mem::size_of::<Hash>()
+        + hashes.len() * std::mem::size_of::<bool>()
+}
+
+/// What the tables allocate at most in a room of `room` bytes: each table of models at the most
+/// models the room holds (`Bounded::planned_bytes`, its pages kept once made), and beside it the
+/// room's bytes of parts, and of lists, each held to the room together with its models' entries.
+pub const fn planned_bytes(room: usize) -> usize {
+    Bounded::<Hash, Held>::planned_bytes(held_models(room))
+        + room
+        + Bounded::<Hash, Expected>::planned_bytes(expected_models(room))
+        + room
+}
 
 /// One model's parts waiting for its manifest, each with the connection it came from.
 struct Held {
     active: Instant,
     parts: Vec<(u64, ClockModelPart)>,
+    /// What it takes of the room: its entry and its parts, each one's bytes and its slot, twice
+    /// ([`part_bytes`]).
     bytes: usize,
+}
+
+/// What `part` holds while it waits, counted against the room: its bytes, and its slot in its
+/// model's list twice, as a list grows beside the one it replaces.
+fn part_bytes(part: &ClockModelPart) -> usize {
+    part.allocated() + 2 * std::mem::size_of::<(u64, ClockModelPart)>()
 }
 
 /// A forwarded manifest's list, and which of its parts have gone out.
@@ -41,6 +96,8 @@ struct Expected {
     at: Instant,
     hashes: Vec<Hash>,
     forwarded: Vec<bool>,
+    /// What it takes of the room ([`list_bytes`]).
+    bytes: usize,
 }
 
 pub struct Parts {
@@ -48,28 +105,40 @@ pub struct Parts {
     held_bytes: usize,
     max_bytes: usize,
     expected: Bounded<Hash, Expected>,
-    expected_hashes: usize,
-    max_hashes: usize,
+    expected_bytes: usize,
     hold: Duration,
 }
 
-impl Default for Parts {
-    fn default() -> Self {
-        Self::new(HELD_BYTES, EXPECTED_HASHES, HOLD)
-    }
-}
-
 impl Parts {
-    pub fn new(max_bytes: usize, max_hashes: usize, hold: Duration) -> Self {
+    /// Tables in a room of `room` bytes ([`planned_bytes`]).
+    pub fn sized(room: usize) -> Self {
+        Self::new(room, HOLD)
+    }
+
+    /// Tables in a room of `room` bytes, each waiting `hold` at most.
+    pub fn new(room: usize, hold: Duration) -> Self {
         Self {
-            held: Bounded::new(MODELS_REMEMBERED),
+            held: Bounded::new(held_models(room)),
             held_bytes: 0,
-            max_bytes,
-            expected: Bounded::new(MODELS_REMEMBERED),
-            expected_hashes: 0,
-            max_hashes,
+            max_bytes: room,
+            expected: Bounded::new(expected_models(room)),
+            expected_bytes: 0,
             hold,
         }
+    }
+
+    /// The tables in a room of `room` bytes from now, the least recently active forgotten past
+    /// it: what a budget resized tells them.
+    pub fn resize(&mut self, room: usize) {
+        self.max_bytes = room;
+        for (_, held) in self.held.set_capacity(held_models(room)) {
+            self.held_bytes -= held.bytes;
+        }
+        for (_, expected) in self.expected.set_capacity(expected_models(room)) {
+            self.expected_bytes -= expected.bytes;
+        }
+        while self.held_bytes > self.max_bytes && self.forget_held() {}
+        while self.expected_bytes > self.max_bytes && self.forget_expected() {}
     }
 
     /// Bytes of parts held now.
@@ -99,8 +168,11 @@ impl Parts {
             }
             return None;
         }
-        let size = part.as_bytes().len();
-        if size > self.max_bytes {
+        let size = part_bytes(&part);
+        let new_model = self.held.get(&id).is_none();
+        // A model's first part brings its entry too.
+        let cost = size + if new_model { HELD_KEY_BYTES } else { 0 };
+        if cost > self.max_bytes {
             return None;
         }
         match self.held.get_mut(&id) {
@@ -110,11 +182,11 @@ impl Parts {
                 }
                 held.active = now;
                 held.parts.push((source, part));
-                held.bytes += size;
+                held.bytes += cost;
                 self.held.touch(&id);
             }
             None => {
-                if self.held.len() >= MODELS_REMEMBERED {
+                if self.held.len() >= self.held.capacity() {
                     self.forget_held();
                 }
                 self.held.insert(
@@ -122,12 +194,12 @@ impl Parts {
                     Held {
                         active: now,
                         parts: vec![(source, part)],
-                        bytes: size,
+                        bytes: cost,
                     },
                 );
             }
         }
-        self.held_bytes += size;
+        self.held_bytes += cost;
         while self.held_bytes > self.max_bytes {
             if !self.forget_held() {
                 break;
@@ -158,27 +230,29 @@ impl Parts {
                 }
             }
         }
-        if !hashes.is_empty() && hashes.len() <= self.max_hashes {
+        let bytes = list_bytes(&hashes, hashes.capacity());
+        if !hashes.is_empty() && bytes <= self.max_bytes {
             let mut forwarded = vec![false; hashes.len()];
             for index in ready.keys() {
                 forwarded[*index] = true;
             }
-            if self.expected.len() >= MODELS_REMEMBERED {
+            if let Some(old) = self.expected.remove(&id) {
+                self.expected_bytes -= old.bytes;
+            }
+            if self.expected.len() >= self.expected.capacity() {
                 self.forget_expected();
             }
-            self.expected_hashes += hashes.len();
-            if let Some(old) = self.expected.remove(&id) {
-                self.expected_hashes -= old.hashes.len();
-            }
+            self.expected_bytes += bytes;
             self.expected.insert(
                 id,
                 Expected {
                     at: now,
                     hashes,
                     forwarded,
+                    bytes,
                 },
             );
-            while self.expected_hashes > self.max_hashes {
+            while self.expected_bytes > self.max_bytes {
                 if !self.forget_expected() {
                     break;
                 }
@@ -216,7 +290,7 @@ impl Parts {
     fn forget_expected(&mut self) -> bool {
         match self.expected.pop_first() {
             Some((_, expected)) => {
-                self.expected_hashes -= expected.hashes.len();
+                self.expected_bytes -= expected.bytes;
                 true
             }
             None => false,
@@ -245,7 +319,7 @@ mod tests {
     #[test]
     fn parts_wait_for_their_manifest_and_go_out_ahead_of_it_in_index_order() {
         let now = Instant::now();
-        let mut table = Parts::default();
+        let mut table = Parts::sized(1 << 20);
         let model = parts(1, 3, 100);
         // Reordered and repeated, from two connections.
         for (source, part) in [
@@ -270,7 +344,7 @@ mod tests {
     #[test]
     fn a_part_the_manifest_does_not_list_is_dropped_and_a_late_listed_one_goes_out_once() {
         let now = Instant::now();
-        let mut table = Parts::default();
+        let mut table = Parts::sized(1 << 20);
         let model = parts(1, 3, 100);
         let forged = ClockModelPart::new([1; 32], 1, b"not the part");
         table.part(1, model[0].clone(), now);
@@ -289,7 +363,10 @@ mod tests {
         assert!(table.part(1, orphan[0].clone(), now).is_none());
         assert!(table.held_bytes() > 0);
         table.part(1, parts(8, 1, 10)[0].clone(), now + HOLD);
-        assert_eq!(table.held_bytes(), parts(8, 1, 10)[0].as_bytes().len());
+        assert_eq!(
+            table.held_bytes(),
+            HELD_KEY_BYTES + part_bytes(&parts(8, 1, 10)[0])
+        );
         // And a manifest's list is given up too: a late part is then just held.
         assert!(table.part(1, model[2].clone(), now + HOLD).is_none());
     }
@@ -298,7 +375,7 @@ mod tests {
     fn held_parts_are_bounded_by_bytes_forgetting_the_model_least_recently_active() {
         let now = Instant::now();
         let budget = 10_000;
-        let mut table = Parts::new(budget, 100, HOLD);
+        let mut table = Parts::new(budget, HOLD);
         // A flood of parts for manifests that never come.
         for flood in 2..60u8 {
             table.part(2, parts(flood, 1, 1_000)[0].clone(), now);
@@ -316,11 +393,54 @@ mod tests {
                 .is_none()
         );
         assert!(table.held_bytes() <= budget);
-        // Lists from manifests are bounded by hashes.
-        let mut lists = Parts::new(budget, 100, HOLD);
+        // Lists from manifests are bounded by their bytes in the same room.
+        let mut lists = Parts::new(budget, HOLD);
         for id in 0..20u8 {
             lists.manifest([id; 32], vec![[id; 32]; 30], now);
-            assert!(lists.expected_hashes <= 100);
+            assert!(lists.expected_bytes <= budget);
         }
+        assert!(lists.expected.len() < 20);
+    }
+
+    /// The tables at a room, flooded by parts of many models that never get their manifest and by
+    /// manifests whose lists are kept, allocate no more than [`planned_bytes`] of the room plans,
+    /// and a smaller room forgets past it. Measured by the allocator, on this thread.
+    #[test]
+    fn the_tables_stay_within_their_plan_at_a_room() {
+        use tally_counting::Counting;
+        let now = Instant::now();
+        let room = 6 * ONE_MODEL_BYTES;
+        let floods: Vec<Vec<ClockModelPart>> = (0..120u8)
+            .map(|id| parts(id, 1 + u16::from(id % 5), 1 + usize::from(id) * 251))
+            .collect();
+        let lists: Vec<(Hash, Vec<Hash>)> = (0..200u8)
+            .map(|id| {
+                (
+                    [id; 32].map(|byte| byte ^ 0x5a),
+                    vec![[id; 32]; 1 + usize::from(id)],
+                )
+            })
+            .collect();
+        let base = Counting::peak_base();
+        let mut table = Parts::sized(room);
+        // Each taken as a copy, so what the tables keep is counted.
+        for (flood, (id, list)) in floods.iter().zip(&lists) {
+            for part in flood {
+                let _ = table.part(2, part.clone(), now);
+            }
+            let _ = table.manifest(*id, list.clone(), now);
+            assert!(table.held_bytes() <= room);
+        }
+        let peak = usize::try_from(Counting::peak_since(base)).unwrap_or(0);
+        assert!(
+            peak <= planned_bytes(room),
+            "{peak} at the peak, {} planned",
+            planned_bytes(room)
+        );
+        // And each table's figures are tight: the room's bytes of what it holds are most of it.
+        assert!(peak * 3 >= planned_bytes(room), "{peak}");
+        table.resize(ONE_MODEL_BYTES);
+        assert!(table.held_bytes() <= ONE_MODEL_BYTES);
+        assert!(table.expected_bytes <= ONE_MODEL_BYTES);
     }
 }

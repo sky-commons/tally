@@ -11,14 +11,17 @@
 //! store nothing, and a query about one is answered "I do not take this area".
 //!
 //! **What it costs.** One tag a feeder a second for the window: `TAG_WINDOW_MS` of 40-byte entries,
-//! about 12 KB a feeder ([`PER_FEEDER_BYTES`]), 240 MB at 20,000 feeders, where holding the
-//! batches themselves for the same window would be some 8 GB. Bounded per receiver by
-//! [`ENTRIES_PER_RECEIVER`] (twice a feeder's rate over the window), so one receiver, however
-//! fast it sends, fills only its own share, which is what each feeder's connection is planned at
-//! ([`PER_RECEIVER_BYTES`], its floor), and in all by the store's gauge (the budget's
-//! `Store::Delivery`, [`Delivery::charge_to`]), which every entry is charged to before it is held
-//! and released from as it is let go, and which is the store's only bound in all; past either a
-//! batch is refused whole (no tag, and never denied) and counted.
+//! with a quarter again of room for each stream's list to grow and the receiver's and its stream's
+//! slots in its shard's tables, about 17 kB a feeder ([`PER_FEEDER_BYTES`]), 343 MB at 20,000
+//! feeders, where holding the batches themselves for the same window would be some 8 GB. Bounded
+//! per receiver by [`ENTRIES_PER_RECEIVER`] (twice a feeder's rate over the window), so one
+//! receiver, however fast it sends, fills only its own share, which is what each feeder's
+//! connection is planned at ([`PER_RECEIVER_BYTES`], its floor), and in all by the store's gauge
+//! (the budget's `Store::Delivery`, [`Delivery::charge_to`]). Each shard is charged what it
+//! allocates, read from its lists' capacities and its tables' buckets (`footprint`): what a change
+//! may grow is charged before it grows, and the charge comes down as the lists and tables shrink.
+//! The gauge is the store's only bound in all; past either a batch is refused whole (no tag, and
+//! never denied) and counted.
 //!
 //! **"Not seen" is said only when it is known.** A batch is "not seen" when the relay has watched
 //! its receiver for that long and holds no entry for it: an entry is kept for every batch taken in,
@@ -65,33 +68,64 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tally_wire::delivery::{KEY_PERIOD_MS, TAG_WINDOW_MS};
 use tally_wire::{
-    Batch, DeliveryAnswer, DeliveryAnswerContent, DeliveryQuery, Identity, Possession, PublicKey,
-    Region, Tag, TagKey, TagKeysContent, delivery_tag,
+    Batch, DeliveryAnswer, DeliveryAnswerContent, DeliveryQuery, Possession, PublicKey, Region,
+    Tag, TagKey, TagKeysContent, delivery_tag,
 };
+use tally_wire::{Signing, Signs};
 
 use crate::budget::{Charge, Gauge, Store};
 use crate::directory::Group;
+use crate::footprint::{self, Table, Tree};
 use crate::selection::Selection;
 
 /// One entry a batch costs while it is held.
 pub const TAG_BYTES: usize = std::mem::size_of::<Tagged>();
-/// What one feeder costs the store: a batch a second (RFC-0181's feeder) for the window.
-pub const PER_FEEDER_BYTES: usize = TAG_BYTES * (TAG_WINDOW_MS / 1000) as usize;
 /// The most entries one receiver holds, over all its streams: twice a feeder's batch a second over
 /// the window, room for a burst. Past it that receiver's batch is refused whole and counted; no
 /// other receiver's is.
 pub const ENTRIES_PER_RECEIVER: usize = 2 * (TAG_WINDOW_MS / 1000) as usize;
-/// What one receiver can hold of the store whatever it sends: its entries to the cap
-/// ([`ENTRIES_PER_RECEIVER`]). What a feeder's connection reserves (its floor), so a feeder
-/// sending past a batch a second fills what was planned for it and no more. Before, a feeder was
-/// planned at a batch a second ([`PER_FEEDER_BYTES`]) and the cap was twice it.
-pub const PER_RECEIVER_BYTES: usize = TAG_BYTES * ENTRIES_PER_RECEIVER;
+/// What one receiver can hold of the store whatever it sends ([`receiver_bytes`] of its entries to
+/// the cap, [`ENTRIES_PER_RECEIVER`], over its boots remembered): what a feeder's connection
+/// reserves (its floor), so a feeder sending past a batch a second fills what was planned for it
+/// and no more.
+pub const PER_RECEIVER_BYTES: usize = receiver_bytes(ENTRIES_PER_RECEIVER, BOOTS_PER_RECEIVER);
+/// What one feeder at a batch a second (RFC-0181's feeder) under one boot holds: a window of
+/// entries ([`receiver_bytes`]).
+pub const PER_FEEDER_BYTES: usize = receiver_bytes((TAG_WINDOW_MS / 1000) as usize + 1, 1);
+/// What the store allocates whatever it holds, once a shard holds anything: the roots of each
+/// shard's orders ([`orders_bytes`]). Held before any feeder (`budget::Plan`).
+pub const FIXED_BYTES: usize =
+    SHARDS * 2 * Tree::<(u64, StreamKey), ()>::bytes_planned(0) + STRANGERS_BYTES;
+/// What the strangers' allowances allocate at most ([`Strangers`]): their map churned at its cap
+/// ([`STRANGER_GROUPS`], one forgotten for each new one) and their order of the same, charged
+/// whole when the store is (`Delivery::charge_to`), as a table held at its cap whatever the relay
+/// carries is. Before, they were charged to nothing.
+pub const STRANGERS_BYTES: usize =
+    footprint::table_churned::<Option<Group>, Allowance>(STRANGER_GROUPS)
+        + footprint::btree_planned::<(u64, Option<Group>), ()>(STRANGER_GROUPS);
+/// What a receiver holding `entries` over `streams` streams allocates at most, its share of its
+/// shard's tables included: the entries' lists, which hold at most a quarter again their entries
+/// and [`ENTRIES_LEAST`] more each (`grown`, `age`); its boots; its record's buckets and each
+/// stream's, a table being kept within four times what it holds (`Shard::settle`,
+/// `footprint::table_per_entry`); and each stream's place in the orders.
+pub const fn receiver_bytes(entries: usize, streams: usize) -> usize {
+    footprint::vec::<Tagged>(entries + entries / 4 + streams * ENTRIES_LEAST)
+        + footprint::vec::<u64>(BOOTS_PER_RECEIVER)
+        + footprint::table_per_entry::<PublicKey, Receiver>(TABLE_KEPT_WITHIN)
+        + streams
+            * (footprint::table_per_entry::<StreamKey, Stream>(TABLE_KEPT_WITHIN)
+                + Tree::<(u64, StreamKey), ()>::bytes_per_entry())
+}
+/// The fewest entries a stream's list grows by (`grown`).
+const ENTRIES_LEAST: usize = 4;
+/// A shard's tables are kept within this many times what they hold (`Shard::settle`).
+const TABLE_KEPT_WITHIN: usize = 4;
 /// The most streams (receiver and boot) whose horizon is remembered.
 pub const STREAMS_REMEMBERED: usize = 100_000;
 /// The most boots of one receiver whose streams are remembered: past it the receiver's stream held
 /// longest ago is forgotten, so one feeder churning boot ids forgets only its own streams, never
-/// another's (the hub's `BOOTS_PER_AUTHOR`, for the same reason).
-pub const BOOTS_PER_RECEIVER: usize = crate::hub::BOOTS_PER_AUTHOR;
+/// another's: the one it publishes under and the last few before it.
+pub const BOOTS_PER_RECEIVER: usize = 4;
 /// How long a silent stream's horizon is remembered: what "not seen" of an unknown stream means.
 pub const STREAM_MEMORY_MS: u64 = 60 * 60 * 1000;
 /// How recently a receiver must have fed the relay a batch for its grant to be taken: a feeder
@@ -166,6 +200,9 @@ struct Strangers {
     by_whole: BTreeSet<(u64, Option<Group>)>,
     /// What every stranger together may ask (`STRANGER_BURST`): spent after the group's own.
     relay: RelayWide,
+    /// [`STRANGERS_BYTES`], charged to the store (`Delivery::charge_to`); `None` while it could
+    /// not be, when no stranger is answered, as a store with no room refuses.
+    charge: Option<Charge>,
 }
 
 /// The relay-wide allowance of all strangers: a bucket of `STRANGER_BURST` earning one query each
@@ -214,10 +251,18 @@ impl RelayWide {
 }
 
 impl Strangers {
+    /// Allowances charged whole to `gauge` ([`STRANGERS_BYTES`]).
+    fn charged_to(gauge: &std::sync::Arc<Gauge>) -> Self {
+        Self {
+            charge: gauge.try_charge(STRANGERS_BYTES),
+            ..Self::default()
+        }
+    }
+
     /// Spends one query of `group`'s strangers and one of the relay-wide allowance at `now_ms`, if
     /// both have one left: a refusal by the relay-wide cap spends nothing of the group's.
     fn spend(&mut self, group: Option<Group>, now_ms: u64) -> bool {
-        if !self.relay.has_one(now_ms) {
+        if self.charge.is_none() || !self.relay.has_one(now_ms) {
             return false;
         }
         let spent = self.spend_in_group(group, now_ms);
@@ -264,14 +309,20 @@ struct Shard {
     /// The receivers watched: those of the relay's areas that fed it, while a stream of theirs is
     /// remembered.
     receivers: HashMap<PublicKey, Receiver>,
+    /// The buckets of `receivers`, so what its table allocates (`footprint::Table`).
+    receivers_table: Table,
     streams: HashMap<StreamKey, Stream>,
+    streams_table: Table,
     /// Streams holding entries, by their last arrival: the order entries age out in.
-    active: BTreeSet<(u64, StreamKey)>,
+    active: Tree<(u64, StreamKey), ()>,
     /// Streams holding none, by their last arrival: the order they are forgotten in.
-    idle: BTreeSet<(u64, StreamKey)>,
+    idle: Tree<(u64, StreamKey), ()>,
     entries: usize,
-    /// Its entries' bytes (`TAG_BYTES` each), charged to the store's gauge before an entry is
-    /// held and released as one is let go: `entries * TAG_BYTES`, always.
+    /// What the streams' entries and the receivers' boots allocate: their capacities, followed as
+    /// each changes.
+    lists: usize,
+    /// What the shard allocates ([`Shard::footprint`]), charged to the store's gauge before
+    /// anything grows and brought down to it after each change.
     held: Charge,
 }
 
@@ -279,12 +330,23 @@ impl Shard {
     fn new(gauge: &std::sync::Arc<Gauge>) -> Self {
         Self {
             receivers: HashMap::new(),
+            receivers_table: Table::default(),
             streams: HashMap::new(),
-            active: BTreeSet::new(),
-            idle: BTreeSet::new(),
+            streams_table: Table::default(),
+            active: Tree::new(),
+            idle: Tree::new(),
             entries: 0,
+            lists: 0,
             held: gauge.empty(),
         }
+    }
+
+    /// What it allocates now: its two tables, its orders and its lists.
+    fn footprint(&self) -> usize {
+        self.receivers_table.bytes::<PublicKey, Receiver>()
+            + self.streams_table.bytes::<StreamKey, Stream>()
+            + orders_bytes(self.streams.len())
+            + self.lists
     }
 }
 
@@ -296,7 +358,9 @@ struct Receiver {
     fed_ms: u64,
     /// Its boots whose streams are remembered, the boot held most recently last.
     boots: Vec<u64>,
-    /// Until then a boot of it the relay knows nothing of may be one it forgot early.
+    /// Until then a boot of it the relay knows nothing of may be one it forgot early, or one whose
+    /// batch it refused for want of room (`Shard::refuse`): nothing is said "not seen" of such a
+    /// boot, nor by a stream made for it before then (`Stream::sure_from_ms`).
     unsure_until_ms: u64,
     /// The keys its feeder gave this relay.
     keys: Option<Keys>,
@@ -371,6 +435,10 @@ impl Keys {
 struct Stream {
     /// Sequences below this may have been taken in and let go (or refused).
     horizon: u64,
+    /// Made while its receiver was unsure (`Receiver::unsure_until_ms`), it may be a boot the
+    /// relay forgot early or refused a batch of before it was made, whatever sequence it starts
+    /// at: "not seen" is said of it only from then.
+    sure_from_ms: u64,
     last_ms: u64,
     /// In sequence order, each kept `TAG_WINDOW_MS` (a batch is found by binary search). Batches
     /// arrive in sequence order but for the odd straggler, so the oldest are at the front.
@@ -400,12 +468,12 @@ impl Delivery {
             shards: (0..SHARDS)
                 .map(|_| Mutex::new(Shard::new(&gauge)))
                 .collect(),
+            strangers: Mutex::new(Strangers::charged_to(&gauge)),
             gauge: Mutex::new(gauge),
             placement: RandomState::new(),
             refused: AtomicU64::new(0),
             refused_keys: AtomicU64::new(0),
             unanswered: AtomicU64::new(0),
-            strangers: Mutex::default(),
         }
     }
 
@@ -418,6 +486,9 @@ impl Delivery {
     /// A receiver's batch the relay took in (new, verified), its receiver's signed location
     /// falling at `point`: held, as an entry for the window, only for a receiver of the relay's
     /// areas (`selection`), tagged under the key its feeder gave this relay if one is in force.
+    /// `now_ms` is `M` (`sharing::Now::mono_ms`): every time delivery keeps (a tag's age, a
+    /// stream's, a key's switch, an allowance) is a duration, so a step of the relay's judging
+    /// clock keeps nothing past its window.
     pub fn hold(&self, selection: &Selection, batch: &Batch, point: Option<Region>, now_ms: u64) {
         if !selection.takes_receiver(point) {
             return;
@@ -442,6 +513,11 @@ impl Delivery {
                 return;
             }
             *held = std::sync::Arc::clone(&gauge);
+        }
+        if let Ok(mut strangers) = self.strangers.lock() {
+            // Released from the old store first, so a store sized for it takes it.
+            strangers.charge = None;
+            strangers.charge = gauge.try_charge(STRANGERS_BYTES);
         }
         for shard in self.shards.iter() {
             if let Ok(mut shard) = shard.lock() {
@@ -472,11 +548,14 @@ impl Delivery {
     pub fn answer_at(
         &self,
         selection: &Selection,
-        identity: Option<&Identity>,
+        identity: Option<&Signing<'_>>,
         query: &DeliveryQuery,
         (point, prober, group): (Option<Region>, PublicKey, Option<Group>),
-        now_ms: u64,
+        now: impl Into<crate::sharing::Now>,
     ) -> Option<DeliveryAnswer> {
+        let now = now.into();
+        // Everything held is read by `M`; the answer is issued by `J`.
+        let now_ms = now.mono_ms();
         let identity = identity?;
         if !self.allowed(prober, group, now_ms) {
             self.unanswered.fetch_add(1, Ordering::Relaxed);
@@ -512,7 +591,7 @@ impl Delivery {
             nonce: query.nonce,
             receiver: query.receiver,
             boot_id: query.boot_id,
-            issued_ms: now_ms,
+            issued_ms: now.judged().ms(),
             takes_area,
             entries,
         };
@@ -544,25 +623,30 @@ impl Delivery {
             .is_some_and(|mut shard| shard.take_keys(receiver, content, now_ms))
     }
 
-    /// Entries held now, and their bytes.
+    /// Entries held now.
     pub fn tags(&self) -> usize {
         self.each(|shard| shard.entries)
     }
 
+    /// What the store is charged now: what its shards allocate.
     pub fn held_bytes(&self) -> usize {
-        self.tags() * TAG_BYTES
+        self.each(|shard| shard.held.bytes()) + self.strangers_bytes()
     }
 
-    /// The bytes of every entry the streams hold, counted afresh: what the gauge must read.
+    /// What the strangers' allowances are charged: [`STRANGERS_BYTES`] once charged.
+    fn strangers_bytes(&self) -> usize {
+        self.strangers
+            .lock()
+            .ok()
+            .and_then(|strangers| strangers.charge.as_ref().map(Charge::bytes))
+            .unwrap_or(0)
+    }
+
+    /// What every shard allocates, counted afresh, and the strangers' charge: what the gauge must
+    /// read.
     #[cfg(test)]
     fn counted_bytes(&self) -> usize {
-        self.each(|shard| {
-            shard
-                .streams
-                .values()
-                .map(|stream| stream.entries.len())
-                .sum::<usize>()
-        }) * TAG_BYTES
+        self.each(Shard::counted) + self.strangers_bytes()
     }
 
     /// Streams remembered now.
@@ -604,8 +688,8 @@ impl Delivery {
 }
 
 impl Shard {
-    /// Its entries charged to `gauge` from now on: moved there, or every stream forgotten early if
-    /// the gauge cannot take them.
+    /// Its charge moved to `gauge` from now on, or every stream forgotten early and its tables let
+    /// go if the gauge cannot take it.
     fn charge_to(&mut self, gauge: &std::sync::Arc<Gauge>) {
         let mut moved = gauge.empty();
         if !moved.try_grow(self.held.bytes()) {
@@ -613,8 +697,68 @@ impl Shard {
             for key in keys {
                 self.forget_stream(key, true);
             }
+            self.receivers = HashMap::new();
+            self.receivers_table = Table::default();
+            self.streams = HashMap::new();
+            self.streams_table = Table::default();
+            self.held.shrink_to(0);
+            debug_assert_eq!(self.footprint(), 0);
         }
         self.held = moved;
+    }
+
+    /// The tables kept within [`TABLE_KEPT_WITHIN`] times what they hold (`Table::kept`), and the
+    /// charge brought down to what the shard allocates.
+    fn settle(&mut self) {
+        self.receivers_table
+            .kept(&mut self.receivers, TABLE_KEPT_WITHIN);
+        self.streams_table
+            .kept(&mut self.streams, TABLE_KEPT_WITHIN);
+        let footprint = self.footprint();
+        debug_assert!(
+            footprint <= self.held.bytes(),
+            "a shard allocated {footprint} bytes past its charge of {}",
+            self.held.bytes()
+        );
+        self.held.shrink_to(footprint);
+    }
+
+    /// What holding one more entry in `key`'s stream of `receiver` may allocate, besides the
+    /// entry: the receiver's record and its boots if it is new, the stream's slot if it is new,
+    /// and its place in either order.
+    fn bookkeeping_growth(&self, receiver: &PublicKey, key: &StreamKey) -> usize {
+        let mut growth = 0;
+        if !self.receivers.contains_key(receiver) {
+            growth += self
+                .receivers_table
+                .growth::<PublicKey, Receiver>(self.receivers.len(), self.receivers.capacity())
+                + footprint::vec::<u64>(BOOTS_PER_RECEIVER);
+        }
+        if !self.streams.contains_key(key) {
+            growth += self
+                .streams_table
+                .growth::<StreamKey, Stream>(self.streams.len(), self.streams.capacity())
+                + orders_bytes(self.streams.len() + 1)
+                - orders_bytes(self.streams.len());
+        }
+        growth
+    }
+
+    /// What one more entry in `key`'s stream allocates: its entries grown, if they are full.
+    fn entry_growth(&self, key: &StreamKey) -> usize {
+        let capacity = self
+            .streams
+            .get(key)
+            .map_or(0, |stream| stream.entries.capacity());
+        let len = self
+            .streams
+            .get(key)
+            .map_or(0, |stream| stream.entries.len());
+        if len < capacity {
+            0
+        } else {
+            footprint::vec::<Tagged>(grown(capacity)) - footprint::vec::<Tagged>(capacity)
+        }
     }
 
     /// False when the batch was refused past a bound: its receiver's share, or the store's gauge.
@@ -631,18 +775,70 @@ impl Shard {
         if before.is_none() {
             self.room_for_boot(receiver);
         }
-        let record = self.receivers.entry(receiver).or_insert(Receiver {
-            since_ms: now_ms,
-            fed_ms: now_ms,
-            boots: Vec::new(),
-            unsure_until_ms: 0,
-            keys: None,
-            entries: 0,
-            allowance: Allowance::full(now_ms),
-        });
-        record.fed_ms = record.fed_ms.max(now_ms);
+        if let Some(record) = self.receivers.get_mut(&receiver) {
+            record.fed_ms = record.fed_ms.max(now_ms);
+        }
+        // The hub hands each batch once; a copy is held once.
+        if self
+            .streams
+            .get(&key)
+            .is_some_and(|stream| stream.find(sequence).is_ok())
+        {
+            self.settle();
+            return true;
+        }
+        let was_active = self
+            .streams
+            .get(&key)
+            .is_some_and(|stream| !stream.entries.is_empty());
+        self.age_stream(key, now_ms);
+        let over_quota = self
+            .receivers
+            .get(&receiver)
+            .is_some_and(|record| record.entries >= ENTRIES_PER_RECEIVER);
+        let entry = if over_quota {
+            0
+        } else {
+            self.entry_growth(&key)
+        };
+        let growth = self.bookkeeping_growth(&receiver, &key) + entry;
+        if !self.held.fits(growth) {
+            // Room the window would have made in the other streams is made before refusing.
+            self.age_all(now_ms);
+            self.settle();
+        }
+        // What it allocates is charged before it is: past the store's share the batch is
+        // refused whole, its receiver's record and stream made only if there was room for them.
+        if !self.held.try_grow(self.bookkeeping_growth(&receiver, &key)) {
+            self.refuse(key, sequence, now_ms);
+            self.settle();
+            return false;
+        }
+        let refused = over_quota || !self.held.try_grow(self.entry_growth(&key));
+        if !self.receivers.contains_key(&receiver) {
+            let boots = Vec::with_capacity(BOOTS_PER_RECEIVER);
+            self.lists += footprint::vec::<u64>(boots.capacity());
+            self.receivers.insert(
+                receiver,
+                Receiver {
+                    since_ms: now_ms,
+                    fed_ms: now_ms,
+                    boots,
+                    unsure_until_ms: 0,
+                    keys: None,
+                    entries: 0,
+                    allowance: Allowance::full(now_ms),
+                },
+            );
+            self.receivers_table.inserted(self.receivers.capacity());
+        }
+        let Some(record) = self.receivers.get_mut(&receiver) else {
+            self.settle();
+            return false;
+        };
         // A receiver first watched now may have sent earlier batches the relay did not see.
         let watched = now_ms >= record.since_ms.saturating_add(TAG_WINDOW_MS);
+        let sure_from_ms = record.unsure_until_ms;
         let tag = match &record.keys {
             Some(keys) => match keys.in_force(now_ms) {
                 Some(key) => Some((key.id, delivery_tag(&key.key, bytes))),
@@ -653,40 +849,29 @@ impl Shard {
             },
             None => None,
         };
-        let stream = self.streams.entry(key).or_insert(Stream {
-            horizon: if watched { 0 } else { sequence },
-            last_ms: now_ms,
-            entries: VecDeque::new(),
-        });
-        // The hub hands each batch once; a copy is held once.
-        if stream.find(sequence).is_ok() {
-            return true;
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.streams.entry(key) {
+            slot.insert(Stream {
+                horizon: if watched { 0 } else { sequence },
+                sure_from_ms,
+                last_ms: now_ms,
+                entries: VecDeque::new(),
+            });
+            self.streams_table.inserted(self.streams.capacity());
         }
-        let was_active = before.is_some() && !stream.entries.is_empty();
-        let freed = age(stream, now_ms);
-        self.freed(receiver, freed);
-        if !self.held.fits(TAG_BYTES) {
-            // Room the window would have made in the other streams is made before refusing.
-            for (other, freed) in age_all(&mut self.streams, &self.active, now_ms) {
-                self.freed(other, freed);
-            }
-        }
-        let over_quota = self
-            .receivers
-            .get(&receiver)
-            .is_some_and(|record| record.entries >= ENTRIES_PER_RECEIVER);
-        // Charged before it is held: past the store's share it is refused whole.
-        let refused = over_quota || !self.held.try_grow(TAG_BYTES);
         let Some(stream) = self.streams.get_mut(&key) else {
-            if !refused {
-                self.held.shrink_to(self.entries * TAG_BYTES);
-            }
-            return true;
+            self.settle();
+            return false;
         };
         if refused {
             // Refused whole: it has no entry, so it must never be said "not seen".
             stream.horizon = stream.horizon.max(sequence.saturating_add(1));
         } else {
+            let capacity = stream.entries.capacity();
+            if stream.entries.len() == capacity {
+                stream
+                    .entries
+                    .reserve_exact(grown(capacity) - stream.entries.len());
+            }
             // In sequence order: at the back but for a straggler.
             let at = match stream.entries.back() {
                 Some(last) if last.sequence > sequence => {
@@ -702,18 +887,36 @@ impl Shard {
                     tag,
                 },
             );
+            self.lists = self.lists + footprint::vec::<Tagged>(stream.entries.capacity())
+                - footprint::vec::<Tagged>(capacity);
             self.entries += 1;
             if let Some(record) = self.receivers.get_mut(&receiver) {
                 record.entries += 1;
             }
         }
+        self.arrived(key, before.map(|before| (before, was_active)), now_ms);
+        if let Some(record) = self.receivers.get_mut(&receiver) {
+            let capacity = record.boots.capacity();
+            record.boots.retain(|held| *held != boot_id);
+            record.boots.push(boot_id);
+            self.lists = self.lists + footprint::vec::<u64>(record.boots.capacity())
+                - footprint::vec::<u64>(capacity);
+        }
+        self.bound_streams();
+        self.settle();
+        !refused
+    }
+
+    /// `key`'s stream was held in at `now_ms`: moved to its place in the order it now belongs to,
+    /// from where it was (`before`: its last arrival, and whether it was active).
+    fn arrived(&mut self, key: StreamKey, before: Option<(u64, bool)>, now_ms: u64) {
         let Some(stream) = self.streams.get_mut(&key) else {
-            return true;
+            return;
         };
         stream.last_ms = stream.last_ms.max(now_ms);
         let after = stream.last_ms;
         let active = !stream.entries.is_empty();
-        if let Some(before) = before {
+        if let Some((before, was_active)) = before {
             if was_active {
                 self.active.remove(&(before, key));
             } else {
@@ -721,24 +924,54 @@ impl Shard {
             }
         }
         if active {
-            self.active.insert((after, key));
+            self.active.insert((after, key), ());
         } else {
-            self.idle.insert((after, key));
+            self.idle.insert((after, key), ());
         }
-        if let Some(record) = self.receivers.get_mut(&receiver) {
-            record.boots.retain(|held| *held != boot_id);
-            record.boots.push(boot_id);
-        }
-        self.bound_streams();
-        !refused
     }
 
-    /// `freed` of `receiver`'s entries were let go, and their bytes released.
+    /// A batch of `key`'s stream refused because the store has no room for the record or the
+    /// stream it would need: nothing is made for it, and it is never said "not seen" (it is asked
+    /// of only within the window). Its stream, if remembered, takes its horizon past it; and its
+    /// receiver, if watched, is unsure for the window, so neither a stream forgotten meanwhile
+    /// nor one made again says "not seen" of it.
+    fn refuse(&mut self, key: StreamKey, sequence: u64, now_ms: u64) {
+        if let Some(stream) = self.streams.get_mut(&key) {
+            stream.horizon = stream.horizon.max(sequence.saturating_add(1));
+        }
+        if let Some(record) = self.receivers.get_mut(&key.0) {
+            record.unsure_until_ms = record
+                .unsure_until_ms
+                .max(now_ms.saturating_add(TAG_WINDOW_MS).saturating_add(1));
+        }
+    }
+
+    /// `freed` of `receiver`'s entries were let go.
     fn freed(&mut self, receiver: PublicKey, freed: usize) {
         self.entries -= freed;
-        self.held.shrink_to(self.entries * TAG_BYTES);
         if let Some(record) = self.receivers.get_mut(&receiver) {
             record.entries = record.entries.saturating_sub(freed);
+        }
+    }
+
+    /// Ages `key`'s stream ([`age`]), its entries' capacity followed.
+    fn age_stream(&mut self, key: StreamKey, now_ms: u64) {
+        let Some(stream) = self.streams.get_mut(&key) else {
+            return;
+        };
+        let capacity = stream.entries.capacity();
+        let freed = age(stream, now_ms);
+        self.lists = self.lists + footprint::vec::<Tagged>(stream.entries.capacity())
+            - footprint::vec::<Tagged>(capacity);
+        self.freed(key.0, freed);
+    }
+
+    /// Ages every active stream (only at the bound, so a refusal is never for room the window
+    /// would have made).
+    fn age_all(&mut self, now_ms: u64) {
+        let keys: Vec<StreamKey> = self.active.keys().map(|(_, key)| *key).collect();
+        for key in keys {
+            self.age_stream(key, now_ms);
         }
     }
 
@@ -762,6 +995,7 @@ impl Shard {
         if let Some(stream) = self.streams.remove(&key) {
             self.active.remove(&(stream.last_ms, key));
             self.idle.remove(&(stream.last_ms, key));
+            self.lists -= footprint::vec::<Tagged>(stream.entries.capacity());
             self.freed(key.0, stream.entries.len());
             if early && let Some(record) = self.receivers.get_mut(&key.0) {
                 record.unsure_until_ms = record
@@ -776,8 +1010,8 @@ impl Shard {
             }
             None => false,
         };
-        if gone {
-            self.receivers.remove(&key.0);
+        if gone && let Some(record) = self.receivers.remove(&key.0) {
+            self.lists -= footprint::vec::<u64>(record.boots.capacity());
         }
     }
 
@@ -809,7 +1043,7 @@ impl Shard {
     /// Lets go entries past the window: every entry of a stream silent for the window; forgets
     /// streams silent past their memory, and receivers with none left.
     fn let_go(&mut self, now_ms: u64) {
-        while let Some((last_ms, key)) = self.active.first().copied() {
+        while let Some((last_ms, key)) = self.active.keys().next().copied() {
             if last_ms.saturating_add(TAG_WINDOW_MS) >= now_ms {
                 break;
             }
@@ -820,25 +1054,33 @@ impl Shard {
                 for held in stream.entries.drain(..) {
                     stream.horizon = stream.horizon.max(held.sequence.saturating_add(1));
                 }
+                self.lists -= footprint::vec::<Tagged>(stream.entries.capacity());
                 stream.entries = VecDeque::new();
             }
             self.freed(key.0, freed);
-            self.idle.insert((last_ms, key));
+            self.idle.insert((last_ms, key), ());
         }
-        while let Some((last_ms, key)) = self.idle.first().copied() {
+        while let Some((last_ms, key)) = self.idle.keys().next().copied() {
             if last_ms.saturating_add(STREAM_MEMORY_MS) >= now_ms {
                 break;
             }
             self.forget_stream(key, false);
         }
         // The oldest entries of a stream still active age out as it is held again or asked of.
+        self.settle();
     }
 
     /// Bounds the streams remembered: the longest silent first, idle before active, each
     /// forgotten early.
     fn bound_streams(&mut self) {
         while self.streams.len() > STREAMS_REMEMBERED / SHARDS {
-            let Some((_, key)) = self.idle.first().or_else(|| self.active.first()).copied() else {
+            let Some((_, key)) = self
+                .idle
+                .keys()
+                .next()
+                .or_else(|| self.active.keys().next())
+                .copied()
+            else {
                 break;
             };
             self.forget_stream(key, true);
@@ -852,46 +1094,97 @@ impl Shard {
         };
         let watched = now_ms >= record.since_ms.saturating_add(TAG_WINDOW_MS);
         let unsure = now_ms < record.unsure_until_ms;
-        let freed = self
-            .streams
-            .get_mut(&key)
-            .map_or(0, |stream| age(stream, now_ms));
-        self.freed(key.0, freed);
+        self.age_stream(key, now_ms);
+        self.settle();
         match self.streams.get(&key) {
             Some(stream) => match stream.find(sequence) {
                 Ok(at) => match stream.entries[at].tag {
                     Some((id, tag)) => Said::Proved(id, tag),
                     None => Said::Unknown,
                 },
-                Err(_) if sequence >= stream.horizon && watched => Said::NotSeen,
+                Err(_)
+                    if sequence >= stream.horizon && watched && now_ms >= stream.sure_from_ms =>
+                {
+                    Said::NotSeen
+                }
                 Err(_) => Said::Unknown,
             },
             None if !watched || unsure => Said::Unknown,
             None => Said::NotSeen,
         }
     }
+
+    /// What it allocates, counted afresh from every list's capacity: what its charge must read.
+    /// Its tables are within what a receiver is planned at for them.
+    #[cfg(test)]
+    fn counted(&self) -> usize {
+        assert!(
+            self.receivers_table.bytes::<PublicKey, Receiver>()
+                <= self.receivers.len()
+                    * footprint::table_per_entry::<PublicKey, Receiver>(TABLE_KEPT_WITHIN)
+        );
+        assert!(
+            self.streams_table.bytes::<StreamKey, Stream>()
+                <= self.streams.len()
+                    * footprint::table_per_entry::<StreamKey, Stream>(TABLE_KEPT_WITHIN)
+        );
+        assert!(
+            self.receivers.capacity() <= footprint::capacity_of(self.receivers_table.buckets())
+        );
+        assert!(self.streams.capacity() <= footprint::capacity_of(self.streams_table.buckets()));
+        // What `receiver_bytes` plans a stream's entries at: a quarter again what they hold and
+        // `ENTRIES_LEAST` more (`grown`, `age`).
+        for stream in self.streams.values() {
+            let len = stream.entries.len();
+            assert!(
+                stream.entries.capacity() <= len + len / 4 + ENTRIES_LEAST,
+                "{len} entries allocate {}",
+                stream.entries.capacity()
+            );
+        }
+        self.receivers_table.bytes::<PublicKey, Receiver>()
+            + self.streams_table.bytes::<StreamKey, Stream>()
+            + orders_bytes(self.active.len() + self.idle.len())
+            + self
+                .streams
+                .values()
+                .map(|stream| footprint::vec::<Tagged>(stream.entries.capacity()))
+                .sum::<usize>()
+            + self
+                .receivers
+                .values()
+                .map(|record| footprint::vec::<u64>(record.boots.capacity()))
+                .sum::<usize>()
+    }
 }
 
-/// Ages every active stream (only at the bound, so a refusal is never for room the window would
-/// have made); how many entries it let go, by receiver.
-fn age_all(
-    streams: &mut HashMap<StreamKey, Stream>,
-    active: &BTreeSet<(u64, StreamKey)>,
-    now_ms: u64,
-) -> Vec<(PublicKey, usize)> {
-    active
-        .iter()
-        .filter_map(|(_, key)| {
-            streams
-                .get_mut(key)
-                .map(|stream| (key.0, age(stream, now_ms)))
-        })
-        .filter(|(_, freed)| *freed > 0)
-        .collect()
+/// What a shard's two orders (`active`, `idle`) allocate at most while they hold `streams`
+/// between them: each its plan ([`footprint::btree_planned`]), linear in what it holds, so a stream
+/// moved from one to the other costs nothing more; nothing when they hold none.
+const fn orders_bytes(streams: usize) -> usize {
+    if streams == 0 {
+        0
+    } else {
+        2 * Tree::<(u64, StreamKey), ()>::bytes_planned(0)
+            + streams * Tree::<(u64, StreamKey), ()>::bytes_per_entry()
+    }
+}
+
+/// The capacity a stream's entries grow to when full: a quarter again, and at least
+/// [`ENTRIES_LEAST`] more. So a stream's entries allocate at most a quarter again what they hold
+/// and `ENTRIES_LEAST` more ([`age`] shrinks them back past it).
+const fn grown(capacity: usize) -> usize {
+    capacity
+        + if capacity / 4 > ENTRIES_LEAST {
+            capacity / 4
+        } else {
+            ENTRIES_LEAST
+        }
 }
 
 /// Lets go a stream's entries older than the window from its front, raising its horizon past
-/// them; how many.
+/// them, and shrinks what they allocate once it is past a quarter again what is left and
+/// [`ENTRIES_LEAST`] more; how many it let go.
 fn age(stream: &mut Stream, now_ms: u64) -> usize {
     let mut freed = 0;
     while let Some(oldest) = stream.entries.front() {
@@ -902,12 +1195,18 @@ fn age(stream: &mut Stream, now_ms: u64) -> usize {
         stream.entries.pop_front();
         freed += 1;
     }
+    let len = stream.entries.len();
+    if stream.entries.capacity() > len + len / 4 + ENTRIES_LEAST {
+        stream.entries.shrink_to(len + len / 8);
+    }
     freed
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
+    use tally_wire::Identity;
     use tally_wire::delivery::{TAG_KEY_LEN, key_period, tag_keys_for};
     use tally_wire::rendezvous::area_of;
     use tally_wire::{BatchContent, Location, Record, SequenceRange, TagKeys};
@@ -953,7 +1252,7 @@ mod tests {
     }
 
     fn batch(feeder: &Identity, boot_id: u64, sequence: u64) -> std::result::Result<Batch, String> {
-        Batch::sign(
+        crate::anchors::anchored(
             feeder,
             &BatchContent {
                 boot_id,
@@ -1060,7 +1359,7 @@ mod tests {
             self.delivery
                 .answer_at(
                     &self.selection,
-                    Some(&self.identity),
+                    Some(&self.identity.signing()),
                     query,
                     (point, query.receiver, None),
                     now_ms,
@@ -1120,7 +1419,7 @@ mod tests {
             .delivery
             .answer_at(
                 &relay.selection,
-                Some(&relay.identity),
+                Some(&relay.identity.signing()),
                 &asked,
                 (Some(relay.point), feeder.public(), None),
                 now + 1_000,
@@ -1293,7 +1592,7 @@ mod tests {
         let ask = |now_ms: u64| {
             relay.delivery.answer_at(
                 &relay.selection,
-                Some(&relay.identity),
+                Some(&relay.identity.signing()),
                 &query(&feeder, 1, 0, 63),
                 (Some(relay.point), this, None),
                 now_ms,
@@ -1328,7 +1627,7 @@ mod tests {
                 .delivery
                 .answer_at(
                     &relay.selection,
-                    Some(&relay.identity),
+                    Some(&relay.identity.signing()),
                     &query(&feeder, 1, 0, 63),
                     (Some(relay.point), prober, None),
                     now_ms,
@@ -1363,7 +1662,7 @@ mod tests {
                     .delivery
                     .answer_at(
                         &relay.selection,
-                        Some(&relay.identity),
+                        Some(&relay.identity.signing()),
                         &query(&feeder, 1, 0, 63),
                         (Some(relay.point), prober, Some(Group::of(address))),
                         now_ms,
@@ -1400,7 +1699,7 @@ mod tests {
     /// bound shared one allowance, the botnet spent it and every newcomer was refused.
     #[test]
     fn a_flood_of_groups_never_refuses_a_newcomer() {
-        let mut strangers = Strangers::default();
+        let mut strangers = Strangers::charged_to(&Gauge::unlimited(Store::Delivery));
         let group = |n: usize| Some(Group::V6(u32::try_from(n).unwrap_or(u32::MAX)));
         let queries = PROBER_QUERIES as usize;
         // The botnet floods first, from every one of its networks.
@@ -1445,13 +1744,49 @@ mod tests {
         assert!(strangers.spend_in_group(group(botnet - 1), later));
     }
 
+    /// The strangers' allowances are charged to the store, whole, before any is answered, and
+    /// what they allocate under a flood of groups churning at the cap stays within it. A store
+    /// with no room for them answers no stranger. Before, they were charged to nothing.
+    #[test]
+    fn the_strangers_allowances_are_charged_and_stay_within_it() {
+        let gauge = Gauge::new(Store::Delivery, usize::MAX / 2);
+        let delivery = Delivery::new();
+        delivery.charge_to(std::sync::Arc::clone(&gauge));
+        assert_eq!(delivery.strangers_bytes(), STRANGERS_BYTES);
+        assert_eq!(gauge.held(), delivery.held_bytes());
+        let group = |n: usize| Some(Group::V6(u32::try_from(n).unwrap_or(u32::MAX)));
+        let Ok(mut strangers) = delivery.strangers.lock() else {
+            panic!("poisoned");
+        };
+        for n in 0..4 * STRANGER_GROUPS {
+            let _ = strangers.spend_in_group(group(n), T0 + n as u64);
+            let capacity = strangers.groups.capacity();
+            let buckets = if capacity < 8 {
+                capacity + 1
+            } else {
+                (capacity * 8 / 7).next_power_of_two()
+            };
+            let allocated = footprint::table::<Option<Group>, Allowance>(buckets)
+                + footprint::btree::<(u64, Option<Group>), ()>(strangers.by_whole.len());
+            assert!(
+                allocated <= STRANGERS_BYTES,
+                "{n}: {allocated} > {STRANGERS_BYTES}"
+            );
+        }
+        drop(strangers);
+        let full = Gauge::new(Store::Delivery, 1);
+        let _taken = full.try_charge(1);
+        delivery.charge_to(full);
+        assert!(!delivery.allowed(Identity::from_seed([3; 32]).public(), group(1), T0));
+    }
+
     /// All strangers together are answered at most `STRANGER_BURST` queries at
     /// once and `1000 / STRANGER_EVERY_MS` a second after, however many network groups they ask
     /// from (each group alone is allowed `PROBER_QUERIES`, so a botnet of 4,096 groups had 16,384
     /// at once); a query the relay-wide cap refuses spends nothing of its group's.
     #[test]
     fn strangers_together_are_answered_a_relay_wide_rate() {
-        let mut strangers = Strangers::default();
+        let mut strangers = Strangers::charged_to(&Gauge::unlimited(Store::Delivery));
         let group = |n: usize| Some(Group::V6(u32::try_from(n).unwrap_or(u32::MAX)));
         let mut answered = 0;
         for n in 0..STRANGER_GROUPS {
@@ -1619,7 +1954,8 @@ mod tests {
         }
         assert_eq!(relay.delivery.refused(), 0);
         assert_eq!(relay.delivery.tags(), FEEDERS * (SECONDS as usize + 1));
-        assert!(relay.delivery.held_bytes() <= FEEDERS * PER_FEEDER_BYTES);
+        assert_eq!(relay.delivery.held_bytes(), relay.delivery.counted_bytes());
+        assert!(relay.delivery.held_bytes() <= FEEDERS * PER_FEEDER_BYTES + FIXED_BYTES);
         let feeder = feeders[FEEDERS / 2];
         let mut first = vec![0x5a; 160];
         first[..8].copy_from_slice(&0u64.to_be_bytes());
@@ -1713,7 +2049,7 @@ mod tests {
     fn past_the_relays_bound_a_batch_is_refused_whole_counted_and_never_denied() -> Result {
         let relay = Relay::new()?;
         // Room for a receiver's share in each shard, and no more.
-        let limit = SHARDS * ENTRIES_PER_RECEIVER * TAG_BYTES;
+        let limit = SHARDS * ENTRIES_PER_RECEIVER * TAG_BYTES + STRANGERS_BYTES;
         let gauge = Gauge::new(Store::Delivery, limit);
         relay.delivery.charge_to(std::sync::Arc::clone(&gauge));
         let feeders: Vec<Identity> = (0..4 * SHARDS as u64)
@@ -1728,12 +2064,13 @@ mod tests {
                 relay.hold(&unsigned(&feeder.public(), 0, sequence, 0)?, T0);
             }
         }
-        // Driven to its limit, the gauge is what the streams hold, entry by entry, and full.
+        // Driven to its limit, the gauge is what the shards allocate, and full but for less than
+        // one receiver's share (what one batch may need to grow its stream by is less).
         assert!(relay.delivery.refused() > 0);
         assert!(gauge.refused() > 0);
         assert_eq!(gauge.held(), relay.delivery.counted_bytes());
         assert_eq!(gauge.held(), relay.delivery.held_bytes());
-        assert!(gauge.held() <= limit && limit - gauge.held() < TAG_BYTES);
+        assert!(gauge.held() <= limit && limit - gauge.held() < PER_RECEIVER_BYTES);
         // Let go past the window, the entries' bytes are released with them.
         relay.hold(
             &unsigned(&feeders[0].public(), 0, ENTRIES_PER_RECEIVER as u64, 0)?,
@@ -1753,6 +2090,135 @@ mod tests {
             "a refused batch is not denied"
         );
         Ok(())
+    }
+
+    /// A shard's charge is what it allocates, read from each list's capacity and each table's
+    /// buckets, as receivers come and go, churn boots, send stragglers, fall silent past the window
+    /// and past their streams' memory, and are asked of; within what its receivers are planned at;
+    /// and, at a gauge too small for them all, within the gauge, with no batch it refused ever said
+    /// "not seen". Before, an entry was charged its 40 bytes, and the lists' spare capacity, the
+    /// tables and the orders were charged nothing.
+    #[test]
+    fn a_shards_charge_is_what_it_allocates_as_its_receivers_churn() {
+        let feeders: Vec<PublicKey> = (0..300_u64)
+            .map(|index| {
+                let mut seed = [0x55; 32];
+                seed[..8].copy_from_slice(&index.to_be_bytes());
+                Identity::from_seed(seed).public()
+            })
+            .collect();
+        for limit in [usize::MAX, 400 * 1024] {
+            let gauge = if limit == usize::MAX {
+                Gauge::unlimited(Store::Delivery)
+            } else {
+                Gauge::new(Store::Delivery, limit)
+            };
+            let mut shard = Shard::new(&gauge);
+            let mut next: HashMap<StreamKey, u64> = HashMap::new();
+            let mut refused: Vec<(StreamKey, u64, u64)> = Vec::new();
+            let mut mix = 0x5eed_u64;
+            let mut roll = |n: u64| {
+                mix = mix
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (mix >> 33) % n
+            };
+            let mut now = T0;
+            for step in 0..30_000_u64 {
+                now += roll(40);
+                if step % 3_000 == 2_999 {
+                    // Silent past the window, now and then past a stream's memory.
+                    now += if step % 9_000 == 8_999 {
+                        STREAM_MEMORY_MS
+                    } else {
+                        TAG_WINDOW_MS
+                    };
+                }
+                let feeder = feeders[roll(feeders.len() as u64) as usize];
+                let key = (feeder, roll(6));
+                let sequence = {
+                    let at = next.entry(key).or_insert(0);
+                    *at += 1;
+                    // A straggler now and then, a little behind.
+                    if roll(10) == 0 {
+                        at.saturating_sub(roll(5) + 1)
+                    } else {
+                        *at
+                    }
+                };
+                if roll(5) == 0 {
+                    let _ = shard.said(key, sequence, now);
+                } else if !shard.hold(feeder, (key.1, sequence), feeder.as_bytes(), now) {
+                    refused.push((key, sequence, now));
+                }
+                assert_eq!(shard.held.bytes(), shard.counted(), "step {step}");
+                assert!(
+                    shard.held.bytes()
+                        <= shard.receivers.len() * PER_RECEIVER_BYTES + FIXED_BYTES / SHARDS,
+                    "step {step}: {} for {} receivers",
+                    shard.held.bytes(),
+                    shard.receivers.len()
+                );
+                assert!(shard.held.bytes() <= limit);
+                if step % 97 == 0 {
+                    refused.retain(|(_, _, at)| at + TAG_WINDOW_MS >= now);
+                    for (key, sequence, at) in &refused {
+                        assert!(
+                            !matches!(shard.said(*key, *sequence, now), Said::NotSeen),
+                            "step {step}: {sequence} of boot {} refused at {at} said not seen at \
+                             {now}",
+                            key.1
+                        );
+                    }
+                }
+            }
+            if limit == usize::MAX {
+                assert_eq!(gauge.refused(), 0);
+            } else {
+                assert!(gauge.refused() > 0, "the small gauge was never full");
+            }
+            // Silent past every stream's memory, the shard allocates nothing.
+            shard.let_go(now + STREAM_MEMORY_MS + TAG_WINDOW_MS + 1);
+            assert_eq!(shard.counted(), 0);
+            assert_eq!(shard.held.bytes(), 0);
+        }
+    }
+
+    /// A stream still held as its oldest entries age out gives back what they allocated: its list
+    /// shrinks to a quarter again what is left and `ENTRIES_LEAST` more, what `receiver_bytes`
+    /// plans it at, and the charge falls with it. Before, a list kept the capacity of its fullest
+    /// window for as long as its stream was active.
+    #[test]
+    fn a_stream_still_held_gives_back_what_its_aged_entries_allocated() {
+        let mut shard = Shard::new(&Gauge::unlimited(Store::Delivery));
+        let feeder = Identity::from_seed([0x66; 32]).public();
+        let spacing = TAG_WINDOW_MS / ENTRIES_PER_RECEIVER as u64;
+        let mut sequence = 0;
+        for at in 0..ENTRIES_PER_RECEIVER as u64 {
+            sequence += 1;
+            assert!(shard.hold(feeder, (1, sequence), feeder.as_bytes(), T0 + at * spacing));
+        }
+        let full = shard.held.bytes();
+        let full_capacity = shard.streams[&(feeder, 1)].entries.capacity();
+        assert!(full_capacity >= ENTRIES_PER_RECEIVER);
+        // All but the last ten age out as one more is held.
+        let now = T0 + TAG_WINDOW_MS + (ENTRIES_PER_RECEIVER as u64 - 10) * spacing;
+        sequence += 1;
+        assert!(shard.hold(feeder, (1, sequence), feeder.as_bytes(), now));
+        let entries = &shard.streams[&(feeder, 1)].entries;
+        assert!(entries.len() <= 12, "{} left", entries.len());
+        assert!(
+            entries.capacity() <= entries.len() + entries.len() / 4 + ENTRIES_LEAST,
+            "{} entries allocate {} of {full_capacity}",
+            entries.len(),
+            entries.capacity()
+        );
+        assert_eq!(shard.held.bytes(), shard.counted());
+        assert!(
+            shard.held.bytes() < full,
+            "{} of {full}",
+            shard.held.bytes()
+        );
     }
 
     /// The streams a shard remembers are bounded over many feeders, not one;
@@ -1806,11 +2272,43 @@ mod tests {
                 Ok(relay.ask(&query(feeder, boot, 1, 1), WATCHED + 2)?.entries)
             };
         assert_eq!(asked(&honest, 1)?, vec![(1, Possession::NotSeen)]);
-        assert_eq!(asked(&churner, boots - 1)?, vec![(1, Possession::NotSeen)]);
         assert!(asked(&churner, 0)?.is_empty());
-        // An unknown boot of the churner may be one it forgot: not denied either.
+        // An unknown boot of the churner may be one it forgot: not denied either, nor is its
+        // newest, made while it may have been one of those (the next test says why).
         assert!(asked(&churner, boots + 5)?.is_empty());
+        assert!(asked(&churner, boots - 1)?.is_empty());
         Ok(())
+    }
+
+    /// A boot forgotten early that comes back (a straggler, or the feeder's own boot again) is
+    /// a stream made anew, whatever sequence it starts at: nothing it held before is denied, though
+    /// a straggler below what it held starts the new stream. Before, the stream made anew was
+    /// sure from its first batch, so a batch the forgotten one had held above that straggler was
+    /// said "not seen".
+    #[test]
+    fn a_boot_forgotten_early_and_made_anew_denies_nothing_it_held() {
+        let mut shard = Shard::new(&Gauge::unlimited(Store::Delivery));
+        let feeder = Identity::from_seed([6; 32]).public();
+        for sequence in 1..=12 {
+            assert!(shard.hold(feeder, (1, sequence), feeder.as_bytes(), T0 + sequence));
+        }
+        // Four newer boots: boot 1 is forgotten to make room.
+        for boot in 2..=5 {
+            assert!(shard.hold(feeder, (boot, 1), feeder.as_bytes(), T0 + 20 + boot));
+        }
+        assert!(!shard.streams.contains_key(&(feeder, 1)));
+        // Boot 1 again, with a straggler below what it held, once the feeder is watched.
+        let now = WATCHED + 30;
+        assert!(shard.hold(feeder, (1, 8), feeder.as_bytes(), now));
+        assert!(!matches!(
+            shard.said((feeder, 1), 12, now + 1),
+            Said::NotSeen
+        ));
+        // Once the memory of every boot forgotten to make room would have run out (boot 2 was
+        // forgotten to make room for it again), its new stream is sure again.
+        let later = T0 + 30 + STREAM_MEMORY_MS;
+        assert!(shard.hold(feeder, (1, 9), feeder.as_bytes(), later - 1));
+        assert!(matches!(shard.said((feeder, 1), 13, later), Said::NotSeen));
     }
 
     /// Through the relay's own dispatch: a prober that asks

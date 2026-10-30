@@ -49,6 +49,14 @@ It ends by printing your station's page, which says whether it is feeding. Run i
 or to change the location; `--uninstall` removes it and keeps the key (`--uninstall --purge` deletes
 the key too).
 
+**A feeder needs no time daemon setup**, and a host running
+[AWS ClockBound](https://github.com/aws/clock-bound) is used as a clock reference (RFC-0171 §3.6).
+
+**Upgrade required.** A feeder signs a relay's freshness anchor into every batch (RFC-0171 §3.6), and
+a relay uses no batch without one: a feeder from before anchors is still received and passed on, but
+none of its data reaches the map, MLAT or subscribers. Upgrade relays first (they read both formats),
+then feeders.
+
 As a container (`ghcr.io/sky-commons/tally-feed`, signed like the binaries), see
 [packaging/README.md](packaging/README.md). By hand:
 
@@ -96,8 +104,11 @@ by default) of `--ceiling`, so ADS-B always keeps the rest; a decoder's line ove
 and so is a message over 16 KiB once published. They join the relay's daily open data release
 (packaging/map/README.md).
 
-`--ceiling` caps what the feeder sends each relay per second (64 KB by default). Over the cap,
-receptions are dropped and counted, never buffered.
+`--ceiling` caps what the feeder sends each relay per second (64 KB by default, at most about
+217 KB, so what it holds while it waits for a relay's anchor fits the 64 MB its unit runs it in).
+Over the cap, receptions are dropped and counted, never buffered. Batches held while no relay's
+anchor is heard go out at the cap too once one is, the oldest within its 64 s hold; batches a relay
+session was too slow for are counted in the feeder's health (`lagged`).
 
 ## Run a relay
 
@@ -147,13 +158,12 @@ resolved by the relay, and the IP it resolved to is what it signs (nothing is si
 first resolves). `--network ASN` declares the autonomous system it is on, so feeders choose two relays on
 different networks. The duties of a full relay are on by default: it accepts feeders, runs MLAT
 for the areas it is chosen to solve (on the cores its other work leaves, below its priority, so
-MLAT that falls behind sheds rather than delaying raw; `--no-mlat` runs none), and seeds its feeders' data into their areas' sharing groups. `--no-relay-duties` turns all
+MLAT that falls behind skips to its newest step rather than delaying raw; `--no-mlat` runs none), and seeds its feeders' data into their areas' sharing groups. `--no-relay-duties` turns all
 three off, for a relay that only shares the areas it takes (a host behind NAT, or one with no
-cores to spare). `--world` gathers the live world product from every area's positions it receives
-(one fix per aircraft per second, sealed about 4 seconds after the second, MLAT by its provisional
-fix), and `--world-precise` the precise one (the same rule sealed about 90 seconds after the
-second, once final MLAT fixes can arrive, MLAT by its final fix only). A relay receives an area's
-positions by taking it, so a world relay takes every area: with either flag the `--area` cells
+cores to spare). `--world` gathers the world product from every area's positions it receives
+(one fix per aircraft per second, the newest it was shown, sealed 32.5 seconds after the
+second, once every fix of it has surely arrived). A relay receives an area's
+positions by taking it, so a world relay takes every area: with `--world` the `--area` cells
 must cover the globe (the 122 resolution 0 cells do), and a relay told otherwise refuses to start
 rather than sign part of the world as the whole. A client subscribes to each product separately.
 
@@ -170,8 +180,45 @@ relay plans memory for every member session its areas let other relays open, whi
 Connections in and out are capped overall (`--max-connections`), and those dialling in per
 address (`--max-connections-per-address`). `tally-relay --help` lists the rest.
 
+`--state-dir DIR` is where the relay keeps what a restart must know (RFC-0171 §3.6): each strike
+table's lease on the newest signed time it may have used, synced ahead of use, and on a graceful
+stop (SIGTERM) the fingerprints it holds. With it, a restarted relay forwards nothing it forwarded
+before, and a deploy is not deaf for a window. The systemd unit's `StateDirectory=tally-relay` sets
+it (`$STATE_DIRECTORY`); on Kubernetes, mount a small persistent volume (a few megabytes, one
+writer) and pass its path, and give the deployment the `Recreate` strategy: the relay holds an
+exclusive lock on the directory for its whole life and refuses to start while another process
+holds it, so a rolling update's second pod would never start. Never restore it from a backup: an old lease lets old records count as
+new. With no state directory, every table starts 40 s ahead of the clock (`J + S + K`) and uses
+nothing new for that long; possession still flows, so nobody is blamed. The relay judges by the
+host's clock as chrony keeps it, with the bound the host's
+[AWS ClockBound](https://github.com/aws/clock-bound) 2.x daemon publishes in shared memory
+(`/var/run/clockbound/shm0`), read at every judgement. **A relay host runs chrony with
+`maxclockerror 50` and `rtcsync`, and ClockBound 2.x with `--max-drift-rate 50` (ClockBound's
+README)**, and VMClock where the hypervisor offers it, readable by all as ClockBound's own unit
+makes it (`chmod a+r /dev/vmclock0`; else ClockBound runs with
+`--disable-clock-disruption-support`). The kernel's own bound (`adjtimex`'s `maxerror`) is not
+read: the kernel cannot say which daemon wrote it, a chronyd killed mid-slew leaves the clock
+slewing at up to 83,333 ppm while that bound grows at 500, and a suspend or a VM's restore is not
+aged at all. The packaged unit is ordered after `clockbound.service` and never pulls it in.
+While ClockBound is missing, unreadable, or says anything but `Synchronized` within 7.5 s, the
+relay holds what it is sent and uses none of it, and signs nothing; each such read is counted by
+why and the last stated (`/memory`, `clock_bound`). A host without ClockBound runs a relay that
+never judges. No relay refuses, drops or ends a link over a clock, synced or not: a batch signed
+too far off to use is held and passed on, and each relay judges its copy by its own clock. What
+ClockBound says when chronyd dies, and the gaps that stay (the daemons' honesty, a leap smear, a
+suspend without VMClock), are RFC-0171 §3.6's. Every state file in the directory (each
+lease, dump, table checkpoint and log) is sealed under the directory's key, `strike.key`: one
+torn, edited or of another key or build's layout is not trusted, and its table starts as if there
+were no state. Two files are not sealed: `strike.key` is the key itself, and a key file that is
+cut or changed is replaced by a fresh key, so every table starts as if there were no state; and
+`lock` holds nothing, only the lock the running relay takes on it.
+
 `tally-relay check ARGS...` refuses what a start with the same arguments would refuse, without
-starting (it reads no key file and opens no socket), and prints the relay's memory plan, one
+starting: a kernel that will not read the raw monotonic clock, and every argument (it reads no key
+file and opens no socket; of a state directory it only checks that it can be made and written, by
+an unnamed file that leaves nothing behind however the check ends, taking no lock and making no
+key, so it runs beside the live relay), and
+prints the relay's memory plan, one
 `name value` a line; a deploy's tests run it over the arguments it passes, so an argument the
 binary no longer takes fails there rather than at the next start.
 
@@ -191,8 +238,8 @@ is nearly over.
   those bytes never leave the host.
 - What goes first is fixed, highest first: control (handshakes, rate limits, heartbeats, goodbyes,
   which always have a small reserve of their own); positions and clock models; raw batches to
-  relay links and engines; the rest that relay links and engines are sent; provisional positions,
-  when there are any; and last, plain subscribers. A class gets only what the classes above it
+  relay links and engines; the rest that relay links and engines are sent; and last, plain
+  subscribers. A class gets only what the classes above it
   leave, and peers in one class share it fairly.
 - Once a send has waited 2 s for the cap, a waiting peer is dropped every quarter second until
   what is asked for fits: from the lowest class anyone is waiting in, the one asking the most. A
@@ -240,7 +287,7 @@ tally-api --relay-stats http://127.0.0.1:10901 --readsb http://127.0.0.1:30152 \
 once with `git clone --depth 1 --filter=blob:none --sparse https://github.com/vradarserver/standing-data DIR && git -C DIR sparse-checkout set routes airports`.
 Without it the routes answer `404`.
 
-`--relay` (repeatable) is where the API reads the network's MLAT positions, its world products
+`--relay` (repeatable) is where the API reads the network's MLAT positions, their clock models
 and the relays' feeder figures. Without it the aircraft carry readsb's positions alone, and no
 feeder has figures. The API is a client of the relay like any other: it is sent tagged positions
 (each checked by the relay that sent it) and clock models with no receiver sites, and no raw
@@ -249,12 +296,14 @@ hosts or carries, standing and MLAT help among them, and signs them (`FeederFigu
 §2.12); the API serves the newest its `--relay`s signed, and ranks only receivers their relay
 says have standing.
 
-- `GET /v1/aircraft?west=&south=&east=&north=` (degrees, at most 60 each way); add `&feed=precise`
-  for the precise world product, about a minute and a half behind, with every MLAT position final
-  (the answer's `feed` says which was served, and its `now_ms` is that product's own second). With
-  no recent precise product to serve (none has come from the relays, or the newest is older than
-  the age limit beyond its own delay) it answers `503` with `{"error":"precise_unavailable"}`,
-  never an empty sky. Each aircraft's `position_at_ms` is when its position was heard (readsb's
+The API's host runs chrony and ClockBound as a relay's does (RFC-0171 §3.6): it judges the
+relays' signed times (feeder figures) only while ClockBound says the
+clock is `Synchronized` within the error budget. While it does not (no ClockBound, not
+synchronised, or a bound past the budget), the API takes no feeder figures, and says nothing of
+it: the figures simply go empty.
+
+- `GET /v1/aircraft?west=&south=&east=&north=` (degrees, at most 60 each way). Each aircraft's
+  `position_at_ms` is when its position was heard (readsb's
   `seen_pos`; for MLAT, the transmission's time), which a client projects from, and
   `last_heard_at_ms` when any message was; `position_source` is `adsb`, `mlat` (Tally MLAT), `adsr`,
   `tisb` or `other`, from readsb's `type`; an MLAT aircraft's speed and track are derived from its
@@ -265,7 +314,7 @@ says have standing.
   aircraft in the box), then at most every 250 ms the aircraft that changed and the `gone`
   addresses, and a comment every 15 s while nothing changes. One read of readsb (every 200 ms,
   while any stream is open) serves every stream; an address holds at most 4 open streams (a fifth
-  is answered `429`). With `&feed=precise` each new second of the precise product is sent whole.
+  is answered `429`).
   Run readsb with `--write-json-every 0.2` so its answer is as fresh as the stream's
 - `GET /v1/network`: receivers, their message rate, and `aircraft` (readsb's positioned aircraft
   and those only Tally MLAT places) with `aircraft_by_source` summing to it

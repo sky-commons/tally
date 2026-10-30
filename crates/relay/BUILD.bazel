@@ -1,5 +1,5 @@
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test", "rustfmt_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_doc_test", "rust_library", "rust_test", "rustfmt_test")
 load("//build:opt.bzl", "opt_test")
 load("//build:resources.bzl", "test_size")
 load("//build:run_test.bzl", "run_test")
@@ -37,6 +37,14 @@ rust_library(
     ],
 )
 
+# The doc examples, which are the compile-fail checks of what the types refuse: a batch is counted
+# against its receiver only with the one `strikes::Blame` its rule made, and only once.
+rust_doc_test(
+    name = "relay_doc_test",
+    size = "small",
+    crate = ":relay",
+)
+
 # Public: an operator packs it and checks its deploy against it (`tally-relay check`).
 rust_binary(
     name = "tally-relay",
@@ -60,27 +68,36 @@ rust_binary(
 # substring); the binary's own guard (`targets::every_test_has_one_target`, in src/lib.rs), which
 # every target runs beside its module, fails every target unless each test is matched by exactly
 # one module here and each module matches a test: a module added without a line here, or a name
-# another module's paths contain (`os::` in a `pos::`), cannot pass, green.
+# another module's paths contain (`os::` in a `pos::`), cannot pass, green. A key may name a module
+# inside a file (`hub::tests`), so one slow test in its own module has a target of its own; the
+# target is named with `_` for `::`.
 _UNIT_TEST_MODULES = {
     "admission": "small",  # under 0.1 s
+    "anchors": "small",  # under 0.1 s
     "bounded": "small",  # under 0.1 s
     "budget": "small",  # 1.1 s
     "ceiling": "small",  # under 0.1 s
+    "clock": "small",  # under 0.1 s
     "config": "small",  # under 0.1 s
     "consistency": "small",  # 7.8 s
     "cores": "small",  # under 0.1 s
-    "credit": "small",  # 1.8 s
-    "delivery": "medium",  # 27.3 s
-    "directory": "medium",  # 23.9 s
+    "credit": "medium",  # 12.9 s alone; 16 s on a loaded 32-core host, 2026-10-30
+    "delivery": "medium",  # 36.1 s
+    "directory": "medium",  # 56.9 s
+    "durable": "small",  # 0.1 s
     "egress": "small",  # 0.1 s
     "exchange": "small",  # under 0.1 s
-    "fanout": "small",  # under 0.1 s
+    "fanout": "small",  # 3.0 s
     "figures": "small",  # under 0.1 s
-    "hub": "small",  # 6.1 s
+    # hub.rs's tests but its error budget end to end, and that test alone
+    # (`hub::honest_end_to_end`).
+    "hub::tests": "medium",  # 11.8 s alone; 22 s on a loaded 32-core host, 2026-10-30
+    "hub::honest_end_to_end": "medium",  # 27.4 s
     "ingest": "small",  # 0.5 s
     "link": "small",  # 12.0 s
     "listeners": "small",  # 1.0 s
     "mlat_host": "medium",  # 29.0 s
+    "models": "small",
     "network": "small",  # 0.1 s
     "os": "small",  # under 0.1 s
     "outbound": "small",  # under 0.1 s
@@ -91,10 +108,12 @@ _UNIT_TEST_MODULES = {
     "selection": "small",  # 0.8 s
     "sharing": "medium",  # 27.4 s
     "shed": "small",  # 4.6 s
+    "signer": "small",  # under 0.1 s
     "sockets": "small",  # under 0.1 s
     "standing": "small",  # 0.2 s
     "stations": "small",  # under 0.1 s
     "stats": "small",  # under 0.1 s
+    "strikes": "medium",  # 33.6 s
     "subscription": "small",  # 0.5 s
 }
 
@@ -110,12 +129,16 @@ rust_test(
         "RELAY_TEST_FILTERS": " ".join([module + "::" for module in _UNIT_TEST_MODULES]),
     },
     tags = ["manual"],
-    deps = ["@tally_crates//:serde_json"],
+    deps = [
+        "//crates/counting",
+        "//crates/feed",
+        "@tally_crates//:serde_json",
+    ],
 )
 
 [
     run_test(
-        name = "relay_test_" + module,
+        name = "relay_test_" + module.replace("::", "_"),
         size = size,
         # Its module's tests, and the guard that every test here is one target's.
         args = [
@@ -129,7 +152,7 @@ rust_test(
 
 test_suite(
     name = "relay_test",
-    tests = ["relay_test_" + module for module in _UNIT_TEST_MODULES],
+    tests = ["relay_test_" + module.replace("::", "_") for module in _UNIT_TEST_MODULES],
 )
 
 # A stand-in readsb, a real feeder, this relay and its subscribers, over loopback sockets.
@@ -144,6 +167,23 @@ rust_test(
         "//crates/feed",
         "//crates/mlat",
         "//crates/mlat-solver",
+        "//crates/wire",
+        "@tally_crates//:tokio",
+    ],
+)
+
+# A feeder's signed clock against its relay's over real sockets (RFC-0171 §3.6): a real feeder
+# whose relay's clock steps back or forward is told it again and taken in. A minute of it is a
+# refused feeder's wait to dial again.
+rust_test(
+    name = "clock_end_to_end",
+    size = "medium",
+    srcs = ["tests/clock_end_to_end.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = [
+        ":relay",
+        "//crates/feed",
         "//crates/wire",
         "@tally_crates//:tokio",
     ],
@@ -184,6 +224,7 @@ rust_test(
     lint_config = ":cargo_lints",
     deps = [
         ":relay",
+        "//crates/mlat-solver",
         "//crates/wire",
         "@tally_crates//:tokio",
     ],
@@ -217,14 +258,67 @@ rust_test(
     lint_config = ":cargo_lints",
     deps = [
         ":relay",
+        "//crates/counting",
         "//crates/mlat-solver",
         "//crates/wire",
     ],
 )
 
+# A shard's station rows at its share of the receiver figure allocate no more than they are
+# charged (`stations::planned_bytes`), measured by a counting allocator: its own binary, so nothing
+# else allocates while it measures.
+rust_test(
+    name = "stations_bytes",
+    size = "medium",  # 25 s on a loaded 32-core host, 2026-10-30
+    srcs = ["tests/stations_bytes.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = [
+        ":relay",
+        "//crates/counting",
+        "//crates/wire",
+    ],
+)
+
+# The tables that grow with what the relay is sent (the products' remembered tables, the world
+# gatherers' fixes, standing's and the positions checks') allocate no more than they are charged,
+# measured by a counting allocator: its own binary, so nothing else allocates while it measures.
+rust_test(
+    name = "tables_bytes",
+    size = "medium",  # 49 s on a loaded 32-core host, 2026-10-30: the step and the models are measured too
+    srcs = ["tests/tables_bytes.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = [
+        ":relay",
+        "//crates/counting",
+        "//crates/mlat",
+        "//crates/mlat-solver",
+        "//crates/wire",
+    ],
+)
+
+# The positions checks' twins (RFC-0181, "The positions checks") allocate no more than their
+# store is charged: one raw record a link, each the largest positions record, filled past the
+# links planned, measured by a counting allocator: its own binary, so nothing else allocates while
+# it measures.
+rust_test(
+    name = "twins_bytes",
+    size = "small",
+    srcs = ["tests/twins_bytes.rs"],
+    edition = "2024",
+    lint_config = ":cargo_lints",
+    deps = [
+        ":relay",
+        "//crates/counting",
+        "//crates/wire",
+    ],
+)
+
 # The same invariants for the hosted MLAT (RFC-0181 §3, §5, §9): the same stamped trace makes the
-# same clock models, positions and provisional positions on any number of threads, and at
-# capacity the same receivers are refused whole whatever the order.
+# same clock models and positions on any number of threads, with delays or none, as the reference
+# engine stepped a second at a time; at capacity the same receivers are refused whole whatever the
+# order; and an overloaded host's cut makes the same bytes on the relay offered it.
 rust_test(
     name = "staged_mlat",
     size = "medium",
@@ -241,18 +335,19 @@ rust_test(
 )
 
 # Each test of the binary is its own target, so each runs alone and declares what it alone needs,
-# measured (2026-10-08, release build, `/usr/bin/time -v`, each test alone): the three
-# single-network tests are a relay or two over a 45 s scenario (60 s: models ripen
-# 15 s after their window step), the relays' clock walking it a step at a time (`TestClock`): at most 25 MiB resident and under a second of CPU each, up to 16 s (the
-# first waits for a window to come due). The three-relay test runs three relays through 2.5 min of
-# scenario: 76 MiB resident, 6 s of CPU in 150 s. The four-relay test waits out a dead relay's
+# measured (2026-10-08, release build, `/usr/bin/time -v`, each test alone, on the window steps
+# the one step a second replaced; not measured again since): the three single-network tests are a
+# relay or two over a 60 s scenario, its first 30 s past, the relays' clock walking it a step a
+# second (`TestClock`): at most 25 MiB resident and under a second of CPU each, up to 16 s. The
+# three-relay test runs three relays through 2.5 min of scenario: 76 MiB resident, 6 s of CPU in
+# 150 s. The four-relay test waits out a dead relay's
 # offers (`directory::OFFER_LIFETIME_MS`, 3 min), its relays idle. Each declared at twice its
 # resident peak or more and a core or two, to the local scheduler and the remote one alike
 # (//build:resources.bzl); the binary's two threads of tokio and the hosts' solver threads
 # run in short bursts.
 _MLAT_HOST_TESTS = {
     "mlat_host_feeders": (
-        "feeders_of_a_relay_hosting_mlat_give_its_clients_verifiable_positions_and_provisionals",
+        "feeders_of_a_relay_hosting_mlat_give_its_clients_verifiable_positions",
         "medium",
         test_size(
             cpu = 2,
@@ -260,7 +355,7 @@ _MLAT_HOST_TESTS = {
         ),
     ),
     "mlat_host_seed_53": (
-        "every_final_a_relay_publishes_passes_the_verifier_seed_53",
+        "every_fix_a_relay_publishes_passes_the_verifier_seed_53",
         "small",
         test_size(
             cpu = 2,
@@ -276,7 +371,7 @@ _MLAT_HOST_TESTS = {
         ),
     ),
     "mlat_host_three_relays": (
-        "three_relays_share_solve_and_serve_verifiable_positions_and_both_world_products",
+        "three_relays_share_solve_and_serve_verifiable_positions_and_the_world_product",
         "large",
         test_size(
             cpu = 2,
@@ -295,8 +390,8 @@ _MLAT_HOST_TESTS = {
 
 # One program: the simulator's receivers feed a relay hosting MLAT (and, apart, a relay that
 # passes their raw one hop to it), and a client verifies what it publishes; then three relays as
-# RFC-0174 runs them, with sharing, selection and both world products (about 3 minutes: the
-# precise world seals a second 90 s after it). The relays' clock walks a scenario no faster than
+# RFC-0174 runs them, with sharing, selection and the world product (about 2 minutes: the world
+# seals a second `products::WORLD_SETTLE_MS` after it). The relays' clock walks a scenario no faster than
 # they keep up and no faster than the wall clock, whose pace a debug build cannot keep, so the
 # binary is built optimised (`mlat_host_*`, below) and runs only so.
 rust_test(
@@ -349,8 +444,12 @@ rust_test(
     name = "check",
     size = "small",
     srcs = ["tests/check.rs"],
-    # The cores' plan RFC-0181 quotes, which the test holds equal to what the relay prints.
-    compile_data = ["tests/cores-10.txt"],
+    # The plans RFC-0181 quotes (ten cores, the world relay), which the test holds equal to what
+    # the relay prints.
+    compile_data = [
+        "tests/cores-10.txt",
+        "tests/world-relay.txt",
+    ],
     data = [
         ":tally-relay",
         "//packaging/systemd:tally-relay.service",
@@ -361,16 +460,22 @@ rust_test(
         "TALLY_RELAY_UNIT": "$(rootpath //packaging/systemd:tally-relay.service)",
     },
     lint_config = ":cargo_lints",
-    # A member link's share (`peers::WAITING_PER_LINK_BYTES`), which the plan's line is made of.
-    deps = [":relay"],
+    # A member link's share (`peers::WAITING_PER_LINK_BYTES`), which the plan's line is made of,
+    # and how the unit reads the clock's bound (`tally_wire::clock_bound::unit_faults`).
+    deps = [
+        ":relay",
+        "//crates/wire",
+    ],
 )
 
 rustfmt_test(
     name = "rustfmt",
     targets = [
         ":check",
+        ":clock_end_to_end",
         ":end_to_end",
         ":figures_bytes",
+        ":stations_bytes",
         ":flood",
         ":mlat_host_binary",
         ":panic",

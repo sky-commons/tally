@@ -14,21 +14,29 @@
 # host's plan in /etc/default/tally-relay, for example TALLY_RELAY_MAX_UPLOAD=6Mbit/s on a $12
 # Lightsail plan (at most about 2.01 TB in 31 days, leaving about 1 TB of its 3 TB for what feeders
 # send in, which counts toward it too; 10Mbit/s would be up to about 3.35 TB out alone). The cap keeps
-# no state, so nothing needs to survive a restart.
+# no state.
 #
 # Needs systemd 248 or later (LoadCredential and the %d specifier).
 
 [Unit]
 Description=Tally relay: verifies and forwards Tally receivers' batches
 Documentation=https://github.com/sky-commons/tally
-# A relay stamps what it ingests by its own ingest clock, anchored to the wall clock it starts on
-# and never going back: started on a clock still seconds behind, it would refuse every feeder's
-# raw as ahead of it until it caught up. So it starts once
-# the clock is synchronized, where the host says so: time-sync.target is reached after a wait
-# service (systemd-time-wait-sync.service, chrony-wait.service) when one is enabled, and at once
-# where none is, so a host with no time daemon still starts its relay.
-After=network-online.target time-sync.target
-Wants=network-online.target time-sync.target
+# A relay judges what it compares across machines by the host's wall clock as chrony keeps it,
+# with the error bound the host's ClockBound daemon publishes (/var/run/clockbound/shm0), read at
+# every judgement, and times every duration by the monotonic clock (RFC-0171 §3.6). A step of the
+# wall clock ends nothing: the relay tells its feeders the new time. While ClockBound is missing or
+# does not say Synchronized within 7.5 s less 418 ms (what its word may leave unsaid), the relay
+# states its error as unbounded, judges nothing and refuses no one for clock, so it starts
+# whatever the clock's state, but it judges only on a
+# host that has: chrony with `maxclockerror 50` and `rtcsync`, and ClockBound 2.x run with
+# `--max-drift-rate 50`, and VMClock where the hypervisor offers one, readable by all as
+# ClockBound's own unit makes it (chmod a+r /dev/vmclock0; else ClockBound runs with
+# `--disable-clock-disruption-support`). The kernel's own bound (adjtimex's maxerror) is not read: it cannot say which daemon
+# wrote it, and a daemon that died mid-slew leaves it understating the error.
+# The relay starts after ClockBound and never pulls it in: a host without it runs a relay that
+# judges nothing, and says so (`/memory`, clock_bound).
+After=network-online.target clockbound.service
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -44,6 +52,11 @@ RestartSec=5
 
 DynamicUser=yes
 ConfigurationDirectory=tally
+# What survives a restart (RFC-0171 §3.6): each strike table's lease on the newest time it may have
+# used, and on a graceful stop the fingerprints it holds, so a restarted relay forwards nothing
+# twice and a deploy is not deaf: /var/lib/tally-relay, kept across restarts with DynamicUser and
+# found through $STATE_DIRECTORY, which systemd sets from this line.
+StateDirectory=tally-relay
 UMask=0077
 # One descriptor per connection its caps admit: those under --max-connections (2048), the member
 # sessions its areas bring (up to as many), the subscribers (64) and beast-out clients (8), every
@@ -67,12 +80,22 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-PrivateDevices=yes
+# No PrivateDevices=, which would hide /dev/vmclock0: ClockBound's client reads it beside the
+# segment where the hypervisor offers one (systemd.exec(5): "When access to some but not all
+# devices must be possible, the DeviceAllow= setting might be used instead"). Every other device
+# stays closed.
+DevicePolicy=closed
+DeviceAllow=/dev/vmclock0 r
+# PrivateDevices= gave the process a /dev/shm of its own; without it the host's is shared, so it
+# is made private here (systemd.exec(5), TemporaryFileSystem=), as PrivateDevices= mounted it.
+TemporaryFileSystem=/dev/shm:mode=1777,nosuid,nodev,noexec
 PrivateUsers=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
+# Nothing here reads or sets the clock's discipline: the bound is ClockBound's, read from shared
+# memory, so every call that could set the clock is filtered too.
 ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
@@ -89,9 +112,10 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-# @resources stays allowed: the async runtime may set a thread's affinity or priority, and a
-# denied call kills the process.
+# @resources stays allowed: the async runtime may set a thread's affinity or priority.
 SystemCallFilter=~@privileged
+# A refused call fails with EPERM rather than killing the process with SIGSYS unsaid.
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

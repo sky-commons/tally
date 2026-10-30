@@ -50,7 +50,9 @@ pub struct Headroom {
 pub struct EchoReplyContent {
     /// The probe's nonce.
     pub nonce: u64,
-    /// The relay's wall clock, Unix milliseconds.
+    /// The relay's judging clock as it answered, Unix milliseconds; 0 when that clock did not
+    /// judge (`EchoReply::answer`): a reply never states a time its relay could not judge. A
+    /// feeder weighs it for nothing: the nonce is what makes the reply fresh.
     pub issued_ms: u64,
     /// The autonomous system the relay says it is on (0 when it does not say): two destinations on
     /// different networks (§2.2).
@@ -99,10 +101,99 @@ signed_record!(
     256
 );
 
+impl EchoReply {
+    /// A relay's answer to `echo`, signed by `signer` whatever its clock: a probe is how a feeder
+    /// finds and chooses a relay, and possession never depends on a clock (RFC-0171 §3.6), so a
+    /// relay that cannot judge time still answers, and is still chosen and fed. The answer decides
+    /// the time it states (`issued_ms`) itself: `at`'s milliseconds only while `signer`'s clock
+    /// judges and `at` is a reading of that clock that judged, else 0. `at` is a reading
+    /// (`clocks::Judged`), never a number, and a signer whose clock does not judge states 0
+    /// whatever reading it is handed, so no code holding a `Signer` signs a time its clock could
+    /// not judge by asking for an answer. The one record signed apart from the judging clock
+    /// (`Signer::untimed`). Before, the answer took the time as a number and stated it whatever
+    /// the signer's clock, so any code with a `Signer` could get an arbitrary time signed.
+    ///
+    /// A number is refused by the compiler:
+    ///
+    /// ```compile_fail,E0308
+    /// # use tally_wire::{Echo, EchoReply, Headroom, Signer};
+    /// fn forged(signer: &Signer) -> Result<EchoReply, tally_wire::WireError> {
+    ///     EchoReply::answer(signer, Echo { nonce: 1 }, Some(4_102_444_800_000), 0, Headroom::default())
+    /// }
+    /// ```
+    pub fn answer(
+        signer: &crate::key::Signer,
+        echo: Echo,
+        at: Option<crate::clocks::Judged>,
+        network: u32,
+        headroom: Headroom,
+    ) -> Result<Self, WireError> {
+        let issued_ms = match at {
+            Some(judged) if signer.signs() => judged.ms(),
+            _ => 0,
+        };
+        Self::sign(
+            &signer.untimed(),
+            &EchoReplyContent {
+                nonce: echo.nonce,
+                issued_ms,
+                network,
+                headroom,
+            },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::key::Identity;
+
+    /// A relay whose clock does not judge still answers a probe, signed, its time unstated
+    /// whatever reading it is handed; one whose clock judges states the judged reading. Before,
+    /// the time was a number stated whatever the signer's clock.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test's signers, on clocks scripted to judge and not to, and its readings"
+    )]
+    fn an_answer_is_signed_whatever_the_clock_and_states_only_a_judged_time()
+    -> Result<(), WireError> {
+        let public = Identity::from_seed([3; 32]).public();
+        let unjudging =
+            crate::key::Signer::new(Identity::from_seed([3; 32]), std::sync::Arc::new(|| false));
+        let headroom = Headroom {
+            feeder_slots: 4,
+            pace_headroom_bytes_per_sec: 1 << 20,
+            mlat_cores: 0,
+        };
+        let reading = crate::clocks::recorded::judged(1_791_244_800_000);
+        for at in [
+            None,
+            Some(reading),
+            Some(crate::clocks::recorded::judged(u64::MAX)),
+        ] {
+            let reply = EchoReply::answer(&unjudging, Echo { nonce: 11 }, at, 7, headroom)?;
+            reply.verify()?;
+            assert_eq!(reply.signer()?, public);
+            assert_eq!(
+                reply.content()?,
+                EchoReplyContent {
+                    nonce: 11,
+                    issued_ms: 0,
+                    network: 7,
+                    headroom,
+                }
+            );
+        }
+        let judging =
+            crate::key::Signer::new(Identity::from_seed([3; 32]), std::sync::Arc::new(|| true));
+        let judged = EchoReply::answer(&judging, Echo { nonce: 12 }, Some(reading), 7, headroom)?;
+        assert_eq!(judged.content()?.issued_ms, 1_791_244_800_000);
+        let unread = EchoReply::answer(&judging, Echo { nonce: 13 }, None, 7, headroom)?;
+        assert_eq!(unread.content()?.issued_ms, 0);
+        Ok(())
+    }
 
     #[test]
     fn an_echo_reply_round_trips_and_is_bound_to_its_signer() -> Result<(), WireError> {

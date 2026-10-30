@@ -3,6 +3,7 @@
 //! writes, so a field renamed, retyped or re-meant here turns this test red before any client can
 //! read the old shape.
 
+#![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use tally_api_types::fixtures;
 use tally_relay::stations::{StationReport, StationsReport, cell_name};
 use tally_wire::{Identity, Location, Region};
@@ -77,6 +78,7 @@ fn report_of(cell: Option<String>, software: Option<&str>, observations: u64) ->
         last_seen_ms: NOW_MS - 1_000,
         batches: 9_001,
         gaps: 3,
+        late_batches: 0,
         observations,
         cell,
         software: software.map(str::to_owned),
@@ -129,55 +131,15 @@ fn mlat_fix(address: u32, lat: f64, lon: f64, transmitted_ms: u64) -> Served {
         altitude_ft: Some(12_000),
         horizontal_sigma_m: 42.5,
         check: tally_api_types::MlatCheck::Model,
-        kind: tally_api_types::MlatKind::Final,
         confidence: tally_api_types::MlatConfidence::Standing,
         contested: false,
-        source: tally_api_types::PositionSource::Mlat,
         transmitted_ms,
         gs_kt: None,
         track_deg: None,
     }
 }
 
-/// The precise world feed's answer: one second of the precise world product, an ADS-B aircraft
-/// decoded from regional data and an MLAT aircraft by its final fix, both as the relay signed
-/// them (unweighed by the API).
-#[test]
-fn the_precise_feed_answer_is_the_fixture() -> Result<(), String> {
-    let one = |address: u32, source, altitude_ft| Served {
-        address,
-        lat: 37.71,
-        lon: -122.45,
-        altitude_ft,
-        horizontal_sigma_m: 61.25,
-        check: tally_api_types::MlatCheck::Signature,
-        kind: tally_api_types::MlatKind::Final,
-        confidence: tally_api_types::MlatConfidence::Unconfirmed,
-        contested: false,
-        source,
-        transmitted_ms: 1_791_219_908_100,
-        gs_kt: None,
-        track_deg: None,
-    };
-    let served = [
-        one(
-            0xa1b2c3,
-            tally_api_types::PositionSource::Adsb,
-            Some(35_000),
-        ),
-        one(
-            0xc0ffee,
-            tally_api_types::PositionSource::Mlat,
-            Some(12_000),
-        ),
-    ];
-    same(
-        &crate::routes::precise_answer(&served, 1_791_219_908_000, SENT_AT_MS),
-        fixtures::AIRCRAFT_PRECISE,
-    )
-}
-
-/// The live feed of a readsb answer and the MLAT positions served beside it, as the API lists them.
+/// A readsb answer and the MLAT positions served beside it, as the API lists them.
 fn live(readsb: &str, positions: &mlat::Positions) -> Result<(u64, Vec<Aircraft>), String> {
     let answer = readsb::parse(readsb.as_bytes())?;
     let mlat = positions.current(0, std::time::Duration::MAX);
@@ -195,7 +157,6 @@ fn the_aircraft_answer_is_the_fixture() -> Result<(), String> {
     same(
         &tally_api_types::AircraftResponse {
             now_ms,
-            feed: tally_api_types::Feed::Live,
             aircraft,
             sent_at_ms: SENT_AT_MS,
         },
@@ -222,7 +183,6 @@ fn the_streams_update_is_the_fixture() -> Result<(), String> {
         &tally_api_types::AircraftUpdate {
             now_ms,
             sent_at_ms: SENT_AT_MS + 1_000,
-            feed: tally_api_types::Feed::Live,
             full: false,
             aircraft,
             gone,
@@ -249,7 +209,11 @@ fn the_network_and_station_answers_are_the_fixtures() -> Result<(), String> {
     let located = Stations::from_report(
         StationsReport {
             now_ms: NOW_MS,
-            stations: vec![report(place.clone(), Some("tally-feed 0.3.1"))],
+            // Seven of its batches came too late to take (a clock behind): the station says so.
+            stations: vec![StationReport {
+                late_batches: 7,
+                ..report(place.clone(), Some("tally-feed 0.3.1"))
+            }],
         },
         Some(&earlier(place.clone(), Some("tally-feed 0.3.1"))),
     );
@@ -291,6 +255,7 @@ fn the_network_and_station_answers_are_the_fixtures() -> Result<(), String> {
                 last_seen_ms: connected_ms,
                 batches: 0,
                 gaps: 0,
+                late_batches: 0,
                 observations: 0,
                 cell: None,
                 software: Some("tally-feed 0.3.0".to_owned()),
@@ -391,7 +356,7 @@ fn no_public_answer_carries_a_receivers_exact_place() -> Result<(), String> {
 /// figures of two placed feeders with standing and one that names no cell), read as issued.
 fn board() -> crate::feeders::Board {
     use crate::feeders::tests::{H, T, ledger, records};
-    ledger(&records()).board(T + H)
+    ledger(&records()).board(tally_wire::clocks::recorded::judged(T + H))
 }
 
 #[test]
@@ -417,7 +382,8 @@ fn the_feeder_and_leaderboard_answers_are_the_fixtures() -> Result<(), String> {
     )?;
     // The same records while no feeder has standing: the area is answered, nobody is ranked.
     use crate::feeders::tests::{H, T, ledger, records_standing};
-    let unranked = ledger(&records_standing(false, false)).board(T + H);
+    let unranked =
+        ledger(&records_standing(false, false)).board(tally_wire::clocks::recorded::judged(T + H));
     same(
         &unranked.leaderboard(&area).ok_or("no board")?,
         fixtures::LEADERBOARD_UNRANKED,

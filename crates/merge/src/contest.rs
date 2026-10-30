@@ -2,10 +2,12 @@
 //! `tally_mlat_solver::standing`'s, once for relays and clients; this is how the merge holds it
 //! over tag sets.
 //!
-//! The merge rule's superset preference holds only when the solution over the larger tag set
-//! agrees with the smaller within the smaller's uncertainty (a chi-square test of the difference,
-//! [`superset_verdict`]). A superset that disagrees is contested: a fault, never the answer. The
-//! smaller fix stands, both are kept as evidence (`Transmission::refused` and
+//! The merge rule's superset preference holds only when the fix over the larger considered tag
+//! set agrees with the smaller within the smaller's uncertainty (a chi-square test of the
+//! difference, [`superset_verdict`]). A superset that disagrees supersedes only when a holder of
+//! its raw verified it and its receivers carry more standing, neither of which a client has: here
+//! it is contested, a fault, never the answer, while it is unjudged. The smaller fix stands until
+//! a fault proof convicts its engine, both are kept as evidence (`Transmission::refused` and
 //! `Transmission::contests`), and the tags the superset added are named ([`Contest::added`]): a
 //! relay, which can rematch them to receivers (`tally_mlat_solver::publish::rematch`), makes those
 //! receivers pay for it in standing. A client keeps no standing: it cannot tell who heard what
@@ -58,13 +60,13 @@ pub fn superset_verdict(smaller: &Fix, larger: &Fix) -> SupersetVerdict {
     if agreement.agrees() {
         return SupersetVerdict::Agrees;
     }
-    let theirs = smaller.observations.tags();
+    let theirs = smaller.considered.tags();
     SupersetVerdict::Contested(Contest {
         kept: smaller.input_set,
         refused: larger.input_set,
         chi2: agreement.chi2,
         added: larger
-            .observations
+            .considered
             .tags()
             .iter()
             .filter(|tag| theirs.binary_search(tag).is_err())

@@ -10,7 +10,7 @@ use blake2::{Blake2s256, Digest};
 
 use crate::WireError;
 use crate::batch::{Hash, domain, split_signature};
-use crate::key::{Identity, KEY_LEN, PublicKey, SIGNATURE_LEN};
+use crate::key::{KEY_LEN, PublicKey, SIGNATURE_LEN, Signs};
 use crate::record::{Body, MAX_BODY};
 
 /// The rules a value of a record body obeys beyond parsing: one function per type, run by both
@@ -94,9 +94,16 @@ pub(crate) trait Fields: Check + Sized {
         Ok(out)
     }
 
-    /// Read alone, from an unsigned record's body.
+    /// Read alone, from an unsigned record's body, without a session.
+    #[cfg(test)]
     fn from_body(bytes: &[u8]) -> Result<Self, WireError> {
         Self::decode(&mut Body::new(bytes))
+    }
+
+    /// Read alone, from an unsigned record's body that arrived on a session that negotiated
+    /// `version` (`Record::decode`), which is what a stream bit it names is read by.
+    fn from_session(bytes: &[u8], version: u16) -> Result<Self, WireError> {
+        Self::decode(&mut Body::at(bytes, version))
     }
 }
 
@@ -113,7 +120,7 @@ impl Signed {
     pub(crate) fn sign(
         label: &[u8],
         format: u8,
-        identity: &Identity,
+        identity: &impl Signs,
         body: &[u8],
         max: usize,
     ) -> Result<Self, WireError> {
@@ -128,6 +135,11 @@ impl Signed {
         let signature = identity.sign(&domain(label, &bytes));
         bytes.extend_from_slice(&signature);
         Ok(Self { bytes })
+    }
+
+    /// What its bytes allocate (`footprint::vec`): their capacity.
+    pub(crate) fn allocated(&self) -> usize {
+        crate::footprint::vec::<u8>(self.bytes.capacity())
     }
 
     /// Whether a body of `body` bytes makes a record of at most `max` bytes, signature included.
@@ -200,7 +212,7 @@ macro_rules! signed_record {
             pub const MAX_LEN: usize = $max;
 
             pub fn sign(
-                identity: &$crate::key::Identity,
+                identity: &impl $crate::key::Signs,
                 content: &$content,
             ) -> Result<Self, $crate::WireError> {
                 let mut body = Vec::new();
@@ -224,6 +236,11 @@ macro_rules! signed_record {
 
             pub fn as_bytes(&self) -> &[u8] {
                 self.0.as_bytes()
+            }
+
+            /// What it allocates of its own: its bytes' capacity.
+            pub fn allocated(&self) -> usize {
+                self.0.allocated()
             }
 
             pub fn format(&self) -> u8 {

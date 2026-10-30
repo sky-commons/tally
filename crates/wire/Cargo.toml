@@ -12,9 +12,13 @@ publish.workspace = true
 base64.workspace = true
 blake2.workspace = true
 bytes.workspace = true
+# The one read of the host clock's error bound, ClockBound's (src/clock_bound.rs).
+clock-bound-client.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
 h3o.workspace = true
+# The one read of the host's raw monotonic clock (src/kernel_clock.rs).
+libc.workspace = true
 miniz_oxide.workspace = true
 # An ACARS-family decoder's line, projected to the one flat schema (src/acars.rs).
 serde.workspace = true
@@ -24,6 +28,11 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# A fake ClockBound segment, written as the daemon writes one (src/clock_bound.rs's tests).
+clock-bound-shm = { workspace = true, features = ["writer"] }
+nix = { workspace = true, features = ["time"] }
+# The tests' counting allocator: test support, outside every production build.
+tally-counting = { path = "../counting" }
 # `test-util` pauses time, so a timeout test waits no real seconds.
 tokio = { workspace = true, features = ["test-util"] }
 

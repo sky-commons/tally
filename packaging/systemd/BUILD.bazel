@@ -1,6 +1,13 @@
 # The packaged units. //crates/relay:check holds the relay's to its memory budget, through
-# `tally-relay check` (RFC-0181 §9).
+# `tally-relay check` (RFC-0181 §9), and to how it reads the clock's bound from ClockBound
+# (`tally_wire::clock_bound::unit_faults`).
 exports_files(
     ["tally-relay.service"],
     visibility = ["//crates/relay:__pkg__"],
+)
+
+# The feeder's: //crates/feed:unit holds it to the same read of ClockBound.
+exports_files(
+    ["tally-feed.service"],
+    visibility = ["//crates/feed:__pkg__"],
 )

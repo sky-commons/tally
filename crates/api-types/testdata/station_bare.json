@@ -9,6 +9,7 @@
   "messages_per_sec": 42.25,
   "batches": 9001,
   "gaps": 3,
+  "late_batches": 0,
   "location": null,
   "software": null
 }

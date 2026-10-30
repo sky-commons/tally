@@ -52,7 +52,28 @@ rust_test(
     crate = ":feed",
     edition = "2024",
     lint_config = ":cargo_lints",
-    deps = ["@tally_crates//:serde_json"],
+    deps = [
+        "//crates/counting",
+        "@tally_crates//:clock-bound-shm",
+        "@tally_crates//:nix",
+        "@tally_crates//:serde_json",
+    ],
+)
+
+# The packaged unit's read of the host clock's bound (ordered after ClockBound, needing none), and
+# its MemoryMax, the memory the feeder sizes its hold for an anchor by.
+rust_test(
+    name = "unit",
+    size = "small",
+    srcs = ["tests/unit.rs"],
+    data = ["//packaging/systemd:tally-feed.service"],
+    edition = "2024",
+    env = {"TALLY_FEED_UNIT": "$(rootpath //packaging/systemd:tally-feed.service)"},
+    lint_config = ":cargo_lints",
+    deps = [
+        ":feed",
+        "//crates/wire",
+    ],
 )
 
 rustfmt_test(
@@ -61,5 +82,6 @@ rustfmt_test(
         ":feed",
         ":feed_test",
         ":tally-feed",
+        ":unit",
     ],
 )

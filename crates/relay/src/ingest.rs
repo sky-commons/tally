@@ -16,8 +16,8 @@
 //!
 //! A batch runs on the worker that owns its receiver's raw shard (`exchange::raw_shard`, fixed
 //! logical shards mapped onto the workers), so one receiver's batches are admitted, and reach every
-//! subscriber, in the order its connection read them, and its admission state (sequence windows,
-//! hashes) and station counters are touched by that worker alone.
+//! subscriber, in the order its connection read them, and its admission state (what its shard took
+//! in, `strikes`) and station counters are touched by that worker alone.
 //!
 //! Every batch is stamped here ([`Stamp`]): the ingest clock's reading and the batch's place in the
 //! ingest order, never going back on one worker. Every later decision (which epoch a reception is
@@ -49,7 +49,10 @@ use tally_wire::{Batch, Decoded, ObsRef, Undecodable};
 use tokio::sync::Notify;
 
 use crate::budget::{Charge, Gauge, PLANNED_BYTES_PER_SEC, PLANNED_RECEPTIONS_PER_SEC, Store};
+use crate::clock::RelayClock;
 use crate::exchange::{Gauges, MessageExchange, Sink};
+use crate::footprint::{self, Table};
+use tally_wire::clocks::{Judged, Moment, Mono, Raw, recorded};
 use tally_wire::decoded::NotDecoded;
 
 /// Records one feeder's connection may have in the ingest stage at once. Two: one being worked on,
@@ -61,7 +64,7 @@ pub const CREDIT: usize = 2;
 
 /// What a batch costs from the moment it is read, from what the batch states: the decode's struct
 /// in its `Arc`, its signed bytes (`wire`) in the allocation that carries their charge
-/// (`Batch::owned_by`), its observations inflated (`inflated`) with the header `Bytes` adds, and a
+/// (`Batch::owned_by`) with its kept key (`batch::KEPT_BYTES`), its observations inflated (`inflated`) with the header `Bytes` adds, and a
 /// reference for each reception it can hold (`receptions`). At least `Decoded::footprint` of its
 /// decode and `Batch::footprint` of its bytes together, so what is charged at ingest bounds what
 /// the decode and the bytes are charged for their life.
@@ -70,6 +73,7 @@ pub const fn charge_for(wire: usize, inflated: usize, receptions: usize) -> usiz
         + std::mem::size_of::<Decoded>()
         + wire
         + tally_wire::batch::OWNED_HEADER
+        + tally_wire::batch::KEPT_BYTES
         + inflated
         + tally_wire::decoded::BYTES_HEADER
         + receptions * std::mem::size_of::<ObsRef>()
@@ -191,17 +195,28 @@ pub const fn member_records_per_sec(member_feeders: usize) -> u64 {
 /// share of each (the rate over the sessions waiting now, [`FairPace`]) and then for the shared
 /// total, so one member sending large batches cannot take the rate from the rest, and the members
 /// together never pass it.
+///
+/// Their MLAT records (positions of either form, clock models and their parts, client clock
+/// models) spend a pace of their own, the products', by their signed bytes each
+/// (`Admitted::in_flight`): one seat's products a second for each seat whose products they bring
+/// (`budget::Plan::member_products_bytes_per_sec`), what the stores that hold them (the models',
+/// the checks' twins, the ingest pool) are planned from, so the products follow the seats and
+/// never spend the raw rate. Before (2026-10-27), they spent the raw rate, and the plan bounded the
+/// seats by it.
 pub struct MemberPace {
     bytes: Arc<FairPace>,
     receptions: Arc<FairPace>,
+    products: Arc<FairPace>,
 }
 
 impl MemberPace {
-    /// The pace for `bytes_per_sec` of signed batches all together: the charged bytes and the
-    /// receptions of the feeders it is worth.
-    pub fn new(bytes_per_sec: u64) -> Self {
+    /// The pace for `bytes_per_sec` of signed batches all together (the charged bytes and the
+    /// receptions of the feeders it is worth), and `products_bytes_per_sec` of signed MLAT
+    /// records beside them.
+    pub fn new(bytes_per_sec: u64, products_bytes_per_sec: u64) -> Self {
         let feeders = crate::budget::feeders_for_rate(bytes_per_sec) as u64;
         Self {
+            products: Arc::new(FairPace::new(products_bytes_per_sec.max(1))),
             bytes: Arc::new(FairPace::new(
                 feeders.saturating_mul(PLANNED_BATCH_CHARGE as u64),
             )),
@@ -216,6 +231,7 @@ impl MemberPace {
         MemberSession {
             bytes: FairSession::new(&self.bytes),
             receptions: FairSession::new(&self.receptions),
+            products: FairSession::new(&self.products),
         }
     }
 
@@ -223,12 +239,18 @@ impl MemberPace {
     pub fn rates(&self) -> (u64, u64) {
         (self.bytes.total.rate(), self.receptions.total.rate())
     }
+
+    /// The products' signed bytes a second, all member sessions together.
+    pub fn products_rate(&self) -> u64 {
+        self.products.total.rate()
+    }
 }
 
 /// One member session's place in the [`MemberPace`].
 pub struct MemberSession {
     bytes: FairSession,
     receptions: FairSession,
+    products: FairSession,
 }
 
 impl MemberSession {
@@ -236,6 +258,12 @@ impl MemberSession {
     /// while it owes more than has refilled.
     pub async fn take(&self, bytes: u64, receptions: u64) {
         tokio::join!(self.bytes.take(bytes), self.receptions.take(receptions));
+    }
+
+    /// Spends `bytes` of an MLAT record of the session's share of the products' pace and its
+    /// total, waiting while it owes more than has refilled.
+    pub async fn take_products(&self, bytes: u64) {
+        self.products.take(bytes).await;
     }
 }
 
@@ -349,8 +377,8 @@ pub const INGEST_NANOS_PER_RECORD: usize = 30_000;
 
 /// The wanted receptions a second (`tally_wire::modes::wanted_reception`) one receiver's feeder may
 /// send, at most (RFC-0181 §10, "The cores", decided 2026-10-09): the one ceiling a receiver is
-/// held to, the same constant MLAT's raw holder sizes a receiver's open bins by
-/// (`tally_mlat_solver::held::Rates::MEASURED`, `ceiling_per_s`, which counts wanted receptions
+/// held to, the same constant MLAT's arrived pool sizes a receiver's share by
+/// (`tally_mlat_solver::arrived::Rates::MEASURED`, `ceiling_per_s`, which counts wanted receptions
 /// too), five times the 360 wanted a planned feeder sends of its 600 (`budget::PLANNED_RECEPTIONS_PER_SEC`).
 /// A feeder is told it with its `RateLimit` (`wanted_per_sec`) and sheds what is past it before it
 /// signs (`tally_feed::source::Batcher`), counted in its batches' `dropped`. The relay holds each
@@ -361,7 +389,7 @@ pub const INGEST_NANOS_PER_RECORD: usize = 30_000;
 /// or not, against a ceiling stated in wanted ones (1,800 wanted is some 3,000 in all), and the
 /// feeder, told nothing, fell behind by seconds while its batches went stale for MLAT.
 pub const FEEDER_RECEPTIONS_PER_SEC: u64 =
-    tally_mlat_solver::held::Rates::MEASURED.ceiling_per_s as u64;
+    tally_mlat_solver::arrived::Rates::MEASURED.ceiling_per_s as u64;
 
 /// The seconds of [`FEEDER_RECEPTIONS_PER_SEC`] a receiver may send at once, by its batches'
 /// stamps: the second a feeder keeping to its ceiling may seal in one batch (its own bucket holds
@@ -376,17 +404,69 @@ pub const FEEDER_RECEPTIONS_BURST_SECS: u64 = 2;
 /// ingest worker that owns the shard alone, so a receiver's batches meet it in the order they were
 /// stamped. A receiver whose bucket has refilled holds nothing a fresh one would not, so it is
 /// forgotten once the map has grown past twice what it held after its last pruning: what is held
-/// is the receivers that sent within the last [`FEEDER_RECEPTIONS_BURST_SECS`].
-#[derive(Default)]
+/// is the receivers that sent within the last [`FEEDER_RECEPTIONS_BURST_SECS`]. Its table is
+/// charged what it allocates to the paces' entries ([`PaceRoom`]), growth before it grows; a
+/// receiver the room has no place for, once the refilled are forgotten, shares one bucket with
+/// every other such receiver, so a flood of keys neither grows the table past its room nor gets a
+/// bucket each.
 pub struct ReceptionCeilings {
     /// Tokens held (wanted receptions), as of a stamp.
-    held: std::collections::HashMap<tally_wire::PublicKey, (f64, u64)>,
+    held: std::collections::HashMap<tally_wire::PublicKey, Bucket>,
     pruned_to: usize,
+    room: PaceRoom,
+    /// The bucket every receiver past the room shares.
+    overflow: Bucket,
+}
+
+/// Tokens held, as of a stamp.
+type Bucket = (f64, u64);
+
+impl Default for ReceptionCeilings {
+    fn default() -> Self {
+        Self::within(PaceRoom::unlimited())
+    }
 }
 
 impl ReceptionCeilings {
     const RATE_PER_MS: f64 = FEEDER_RECEPTIONS_PER_SEC as f64 / 1_000.0;
     const BURST: f64 = (FEEDER_RECEPTIONS_PER_SEC * FEEDER_RECEPTIONS_BURST_SECS) as f64;
+
+    /// Held in `room`.
+    pub fn within(room: PaceRoom) -> Self {
+        Self {
+            held: std::collections::HashMap::new(),
+            pruned_to: 0,
+            room,
+            overflow: (Self::BURST, 0),
+        }
+    }
+
+    /// The receivers whose buckets have refilled forgotten, and the table kept to what is left.
+    fn prune(&mut self, stamp_ms: u64) {
+        self.held
+            .retain(|_, held| Self::refilled(*held, stamp_ms) < Self::BURST);
+        self.pruned_to = self.held.len();
+        self.room.settle(&mut self.held, 0);
+    }
+
+    /// `receiver`'s bucket: its own, made full if it has none and the room holds one more (the
+    /// refilled forgotten first if it does not), else the one every receiver past the room shares.
+    fn bucket(&mut self, receiver: tally_wire::PublicKey, stamp_ms: u64) -> &mut Bucket {
+        if !self.held.contains_key(&receiver) {
+            if !self.room.room_for(&self.held, 0) {
+                self.prune(stamp_ms);
+                if !self.room.room_for(&self.held, 0) {
+                    return &mut self.overflow;
+                }
+            }
+            self.held.insert(receiver, (Self::BURST, stamp_ms));
+            self.room.inserted(&mut self.held, 0);
+        }
+        match self.held.get_mut(&receiver) {
+            Some(held) => held,
+            None => &mut self.overflow,
+        }
+    }
 
     fn refilled((tokens, at_ms): (f64, u64), stamp_ms: u64) -> f64 {
         (tokens + stamp_ms.saturating_sub(at_ms) as f64 * Self::RATE_PER_MS).min(Self::BURST)
@@ -397,11 +477,9 @@ impl ReceptionCeilings {
     /// it would have spent stays for the next).
     pub fn take(&mut self, receiver: tally_wire::PublicKey, wanted: usize, stamp_ms: u64) -> bool {
         if self.held.len() > 2 * self.pruned_to.max(64) {
-            self.held
-                .retain(|_, held| Self::refilled(*held, stamp_ms) < Self::BURST);
-            self.pruned_to = self.held.len();
+            self.prune(stamp_ms);
         }
-        let held = self.held.entry(receiver).or_insert((Self::BURST, stamp_ms));
+        let held = self.bucket(receiver, stamp_ms);
         let tokens = Self::refilled(*held, stamp_ms);
         let within = wanted as f64 <= tokens;
         *held = (
@@ -423,6 +501,134 @@ impl ReceptionCeilings {
     pub fn is_empty(&self) -> bool {
         self.held.is_empty()
     }
+
+    /// What its table is charged now.
+    pub fn charged(&self) -> usize {
+        self.room.charged()
+    }
+}
+
+/// What one pace map is charged ([`footprint::Table`], the store's `Store::Paces`): its table and
+/// what each entry owns beside its slot, charged to the entries' share of the paces' store
+/// (`Budget::pace_entries`) and to the store itself alike, so the maps together never take the
+/// room planned for what the connections hold of their own ([`OWN_BYTES_PER_CONNECTION`], charged
+/// to the store alone).
+/// Growth is charged before a map grows (`room_for`), and the charge is brought down to what the
+/// map allocates once it has (`inserted`, `settle`).
+pub struct PaceRoom {
+    table: Table,
+    share: Charge,
+    store: Charge,
+}
+
+impl PaceRoom {
+    /// Charged to `store` and to `share`, its entries' share (`Budget::pace_entries`).
+    pub fn within(store: &Arc<Gauge>, share: &Arc<Gauge>) -> Self {
+        Self {
+            table: Table::default(),
+            share: share.empty(),
+            store: store.empty(),
+        }
+    }
+
+    /// Charged to no budget: a part built without one (a test's).
+    pub fn unlimited() -> Self {
+        Self::within(
+            &Gauge::unlimited(Store::Paces),
+            &Gauge::unlimited(Store::Paces),
+        )
+    }
+
+    /// What it is charged now.
+    pub fn charged(&self) -> usize {
+        self.store.bytes()
+    }
+
+    /// `bytes` more on both, or on neither.
+    fn try_grow(&mut self, bytes: usize) -> bool {
+        if !self.share.try_grow(bytes) {
+            return false;
+        }
+        if self.store.try_grow(bytes) {
+            return true;
+        }
+        let back = self.share.bytes() - bytes;
+        self.share.shrink_to(back);
+        false
+    }
+
+    /// Whether one more entry of `map`, owning `owned` bytes beside its slot, has room: what the
+    /// map grows by and what the entry owns, charged now if it has.
+    fn room_for<K, V>(&mut self, map: &std::collections::HashMap<K, V>, owned: usize) -> bool {
+        let growth = self.table.growth::<K, V>(map.len(), map.capacity());
+        self.try_grow(growth + owned)
+    }
+
+    /// An entry went into `map`, each owning `owned`: its table followed, and the charge settled.
+    fn inserted<K, V>(&mut self, map: &mut std::collections::HashMap<K, V>, owned: usize)
+    where
+        K: Eq + std::hash::Hash,
+    {
+        self.table.inserted(map.capacity());
+        self.settle(map, owned);
+    }
+
+    /// `map`, each entry owning `owned`, kept within [`PACES_KEPT_WITHIN`] times what it holds, and
+    /// charged what it allocates.
+    fn settle<K, V>(&mut self, map: &mut std::collections::HashMap<K, V>, owned: usize)
+    where
+        K: Eq + std::hash::Hash,
+    {
+        self.table.kept(map, PACES_KEPT_WITHIN);
+        let bytes = self.table.bytes::<K, V>() + map.len() * owned;
+        self.share.shrink_to(bytes);
+        self.store.shrink_to(bytes);
+    }
+}
+
+/// A pace map's table is kept within this many times what it holds (`footprint::Table::kept`).
+const PACES_KEPT_WITHIN: usize = 4;
+/// The entries one connection can bring into each pace map it touches: its own (its receiver's
+/// bucket, its group's grant, its group's directory share), and the room for one of another's
+/// while that is not yet forgotten.
+pub const PACE_ENTRIES_PER_CONNECTION: usize = 2;
+/// A connection's own record pace (`link`'s `Paces`), one allocation for its session, charged to
+/// the paces' store.
+pub const OWN_PACE_BYTES: usize = footprint::arc::<RecordPace>();
+/// One receiver's entry in its shard's reception ceilings, at the most an entry of a table kept
+/// within [`PACES_KEPT_WITHIN`] allocates ([`footprint::table_per_entry`]).
+pub const CEILING_ENTRY_BYTES: usize =
+    footprint::table_per_entry::<tally_wire::PublicKey, Bucket>(PACES_KEPT_WITHIN);
+/// One network group's entry in the burst grants ([`BurstGrants`]): its pace, in its slot.
+pub const GRANT_ENTRY_BYTES: usize =
+    footprint::table_per_entry::<Option<Group>, RecordPace>(PACES_KEPT_WITHIN);
+/// What one directory group's entry owns beside its slot: its place and its pace.
+const DIRECTORY_OWNED_BYTES: usize =
+    footprint::arc::<DirectoryGroup>() + footprint::arc::<RecordPace>();
+/// One network group's entry in the directory's shares ([`DirectoryPaces`]).
+pub const DIRECTORY_ENTRY_BYTES: usize =
+    footprint::table_per_entry::<Option<Group>, Arc<DirectoryGroup>>(PACES_KEPT_WITHIN)
+        + DIRECTORY_OWNED_BYTES;
+/// The entries one connection holds in the pace maps at most: a feeder's receiver's bucket and its
+/// group's grant, or a relay's group's directory share (a relay has no own pace, so no grant), each
+/// [`PACE_ENTRIES_PER_CONNECTION`] times.
+pub const PACE_ENTRIES_BYTES: usize = {
+    let feeder = PACE_ENTRIES_PER_CONNECTION * (CEILING_ENTRY_BYTES + GRANT_ENTRY_BYTES);
+    let relay = PACE_ENTRIES_PER_CONNECTION * DIRECTORY_ENTRY_BYTES;
+    if feeder > relay { feeder } else { relay }
+};
+/// What one connection holds of its own for its session at most, whatever its role, charged to
+/// the paces' store alone: its own record pace ([`OWN_PACE_BYTES`]), and a feeder's entry in its
+/// receiver's station connections (`stations::CONNECTION_BYTES`).
+pub const OWN_BYTES_PER_CONNECTION: usize = OWN_PACE_BYTES + crate::stations::CONNECTION_BYTES;
+/// What one connection's pace state allocates at most, whatever its role: what it holds of its
+/// own and its entries in the pace maps. Every connection is planned at it (`budget::Store::Paces`).
+pub const PACE_BYTES_PER_CONNECTION: usize = OWN_BYTES_PER_CONNECTION + PACE_ENTRIES_BYTES;
+
+/// The entries' share of the paces' store of `limit` bytes (`Budget::pace_entries`): all but the
+/// own paces of the connections it is planned for.
+pub fn pace_entries_part(limit: usize) -> usize {
+    limit - limit / PACE_BYTES_PER_CONNECTION * OWN_BYTES_PER_CONNECTION
 }
 
 /// The receptions a second (all of them, wanted or not) one source's share of the relay's rate is
@@ -525,8 +731,30 @@ impl BurstGrants {
     pub fn new(shared: RolePace, group: RolePace) -> Self {
         Self {
             shared: shared.pace(),
-            groups: Mutex::new(ByGroup::new(group)),
+            groups: Mutex::new(ByGroup::new(group, PaceRoom::unlimited())),
         }
+    }
+
+    /// Its groups held in `room`.
+    pub fn within(self, room: PaceRoom) -> Self {
+        let pace = self
+            .groups
+            .into_inner()
+            .map_or(GROUP_BURST_GRANTS, |groups| groups.pace);
+        Self {
+            shared: self.shared,
+            groups: Mutex::new(ByGroup::new(pace, room)),
+        }
+    }
+
+    /// What its groups' table is charged now.
+    pub fn charged(&self) -> usize {
+        self.groups.lock().map_or(0, |groups| groups.room.charged())
+    }
+
+    /// The groups held now.
+    pub fn groups_held(&self) -> usize {
+        self.groups.lock().map_or(0, |groups| groups.held.len())
     }
 
     /// Up to `wanted` tokens for a new session from `group`, taken now: what both its group and
@@ -549,34 +777,50 @@ impl BurstGrants {
 /// Paces kept by network group, across that group's sessions: each made at `pace` the first time
 /// its group is seen, full. One whose bucket has refilled holds nothing a new one would not, so
 /// once the map has grown past twice what it held after its last pruning, those are forgotten:
-/// what is held is the groups that spent within one refill.
+/// what is held is the groups that spent within one refill. Its table is charged what it
+/// allocates ([`PaceRoom`]); a group the room has no place for, once the refilled are forgotten,
+/// shares one pace with every other such group.
 struct ByGroup {
     pace: RolePace,
-    held: std::collections::HashMap<Option<Group>, Arc<RecordPace>>,
+    held: std::collections::HashMap<Option<Group>, RecordPace>,
     pruned_to: usize,
+    room: PaceRoom,
+    /// The pace every group past the room shares.
+    overflow: RecordPace,
 }
 
 impl ByGroup {
-    fn new(pace: RolePace) -> Self {
+    fn new(pace: RolePace, room: PaceRoom) -> Self {
         Self {
             pace,
             held: std::collections::HashMap::new(),
             pruned_to: 0,
+            room,
+            overflow: pace.pace(),
         }
     }
 
-    fn get(&mut self, group: Option<Group>) -> Arc<RecordPace> {
+    fn prune(&mut self) {
+        self.held.retain(|_, pace| !pace.is_full());
+        self.pruned_to = self.held.len();
+        self.room.settle(&mut self.held, 0);
+    }
+
+    fn get(&mut self, group: Option<Group>) -> &RecordPace {
         if self.held.len() > 2 * self.pruned_to.max(64) {
-            self.held
-                .retain(|_, pace| Arc::strong_count(pace) > 1 || !pace.is_full());
-            self.pruned_to = self.held.len();
+            self.prune();
         }
-        let pace = self.pace;
-        Arc::clone(
-            self.held
-                .entry(group)
-                .or_insert_with(|| Arc::new(pace.pace())),
-        )
+        if !self.held.contains_key(&group) {
+            if !self.room.room_for(&self.held, 0) {
+                self.prune();
+                if !self.room.room_for(&self.held, 0) {
+                    return &self.overflow;
+                }
+            }
+            self.held.insert(group, self.pace.pace());
+            self.room.inserted(&mut self.held, 0);
+        }
+        self.held.get(&group).unwrap_or(&self.overflow)
     }
 }
 
@@ -588,12 +832,32 @@ impl ByGroup {
 /// its own share alone, and every other group's links keep theirs. Before, every link shared one
 /// pace: a link's evidence owed up to 128 tokens to it a bundle, so one hostile link held every
 /// other link's gossip back, and kept doing so after it hung up.
+///
+/// Its table and each group's place and pace are charged what they allocate ([`PaceRoom`]); a
+/// group the room has no place for, once the groups that owe nothing and have no link are
+/// forgotten, shares one place with every other such group (one share of the rate between them).
 pub struct DirectoryPaces {
     pace: RolePace,
     /// The groups with a link now: the share's divisor.
     live: Arc<std::sync::atomic::AtomicUsize>,
-    groups: Mutex<std::collections::HashMap<Option<Group>, Arc<DirectoryGroup>>>,
+    groups: Mutex<DirectoryGroups>,
     pruned_to: std::sync::atomic::AtomicUsize,
+    /// The place every group past the room shares: the struct's own, made with it.
+    overflow: Arc<DirectoryGroup>,
+}
+
+struct DirectoryGroups {
+    held: std::collections::HashMap<Option<Group>, Arc<DirectoryGroup>>,
+    room: PaceRoom,
+}
+
+impl DirectoryGroups {
+    /// The groups that owe nothing and have no link forgotten, and the table kept to the rest.
+    fn prune(&mut self) {
+        self.held
+            .retain(|_, held| held.links.load(Ordering::SeqCst) > 0 || !held.pace.is_full());
+        self.room.settle(&mut self.held, DIRECTORY_OWNED_BYTES);
+    }
 }
 
 struct DirectoryGroup {
@@ -606,6 +870,8 @@ pub struct DirectoryLink {
     paces: Arc<DirectoryPaces>,
     group: Option<Group>,
     held: Arc<DirectoryGroup>,
+    /// Whether its place is its group's own, not the one the groups past the room share.
+    own: bool,
 }
 
 impl DirectoryLink {
@@ -624,8 +890,10 @@ impl Drop for DirectoryLink {
             self.paces.live.fetch_sub(1, Ordering::SeqCst);
             // A group that owes nothing and has refilled is forgotten with its last link; one in
             // debt is kept, so its debt is paid by its next link and no other group's.
-            if self.held.pace.is_full() {
-                groups.remove(&self.group);
+            if self.own && self.held.pace.is_full() {
+                let groups = &mut *groups;
+                groups.held.remove(&self.group);
+                groups.room.settle(&mut groups.held, DIRECTORY_OWNED_BYTES);
             }
         }
     }
@@ -633,30 +901,61 @@ impl Drop for DirectoryLink {
 
 impl DirectoryPaces {
     pub fn new(pace: RolePace) -> Arc<Self> {
+        Self::within(pace, PaceRoom::unlimited())
+    }
+
+    /// Its groups held in `room`.
+    pub fn within(pace: RolePace, room: PaceRoom) -> Arc<Self> {
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Arc::new(Self {
             pace,
-            live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            groups: Mutex::new(std::collections::HashMap::new()),
+            overflow: Self::group(pace, &live),
+            live,
+            groups: Mutex::new(DirectoryGroups {
+                held: std::collections::HashMap::new(),
+                room,
+            }),
             pruned_to: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
-    /// A link from `group` takes its place in its group's share.
+    fn group(pace: RolePace, live: &Arc<std::sync::atomic::AtomicUsize>) -> Arc<DirectoryGroup> {
+        Arc::new(DirectoryGroup {
+            pace: Arc::new(RecordPace::shared_by(pace, Arc::clone(live))),
+            links: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// A link from `group` takes its place in its group's share: its group's own, made if it has
+    /// none and the room holds one more, else the one the groups past the room share.
     pub fn join(self: &Arc<Self>, group: Option<Group>) -> Option<DirectoryLink> {
         let mut groups = self.groups.lock().ok()?;
         let pruned_to = self.pruned_to.load(Ordering::Relaxed);
-        if groups.len() > 2 * pruned_to.max(64) {
-            groups.retain(|_, held| held.links.load(Ordering::SeqCst) > 0 || !held.pace.is_full());
-            self.pruned_to.store(groups.len(), Ordering::Relaxed);
+        if groups.held.len() > 2 * pruned_to.max(64) {
+            groups.prune();
+            self.pruned_to.store(groups.held.len(), Ordering::Relaxed);
         }
-        let pace = self.pace;
-        let live = Arc::clone(&self.live);
-        let held = Arc::clone(groups.entry(group).or_insert_with(|| {
-            Arc::new(DirectoryGroup {
-                pace: Arc::new(RecordPace::shared_by(pace, live)),
-                links: std::sync::atomic::AtomicUsize::new(0),
-            })
-        }));
+        let groups = &mut *groups;
+        let held = match groups.held.get(&group) {
+            Some(held) => Some(Arc::clone(held)),
+            None => {
+                let room = groups.room.room_for(&groups.held, DIRECTORY_OWNED_BYTES) || {
+                    groups.prune();
+                    self.pruned_to.store(groups.held.len(), Ordering::Relaxed);
+                    groups.room.room_for(&groups.held, DIRECTORY_OWNED_BYTES)
+                };
+                room.then(|| {
+                    let held = Self::group(self.pace, &self.live);
+                    groups.held.insert(group, Arc::clone(&held));
+                    groups
+                        .room
+                        .inserted(&mut groups.held, DIRECTORY_OWNED_BYTES);
+                    held
+                })
+            }
+        };
+        let own = held.is_some();
+        let held = held.unwrap_or_else(|| Arc::clone(&self.overflow));
         if held.links.fetch_add(1, Ordering::SeqCst) == 0 {
             self.live.fetch_add(1, Ordering::SeqCst);
         }
@@ -664,6 +963,7 @@ impl DirectoryPaces {
             paces: Arc::clone(self),
             group,
             held,
+            own,
         })
     }
 
@@ -674,7 +974,12 @@ impl DirectoryPaces {
 
     /// The groups whose pace is held now, linked or still owing.
     pub fn groups_held(&self) -> usize {
-        self.groups.lock().map_or(0, |groups| groups.len())
+        self.groups.lock().map_or(0, |groups| groups.held.len())
+    }
+
+    /// What its groups are charged now.
+    pub fn charged(&self) -> usize {
+        self.groups.lock().map_or(0, |groups| groups.room.charged())
     }
 
     /// The records a minute every group's share comes to together: the one rate planned.
@@ -707,7 +1012,8 @@ pub const ENGINE_RECORDS: RolePace = RolePace {
 };
 
 /// A measurement session (`Role::Probe`): a feeder's round of echoes (five, `tally_feed::probe`,
-/// each sent once the one before is answered) or one delivery query, then it hangs up, and the
+/// each sent once the one before is answered) and one timed heartbeat asking this relay's clock,
+/// or one delivery query, then it hangs up, and the
 /// feeder probes again minutes later. Its burst holds a round; past it, one every ten seconds.
 pub const PROBE_RECORDS: RolePace = RolePace {
     per_minute: 6,
@@ -895,16 +1201,158 @@ pub const REPLIES_BYTES: usize = tally_wire::noise::MAX_MESSAGE;
 /// makes a busy one tick: a shard's watermark is at most this behind the ingest clock.
 pub const TICK_MS: u64 = 10;
 
-/// When a batch was taken, by the ingest clock, and its place in the ingest order. Ordered by
-/// `(stamp_ms, ingest_seq)`: a watermark (`exchange::Envelope::Tick`) is a stamp.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// When a batch, a record or a tick was taken, and its place in the ingest order: the relay's
+/// monotonic clock (`mono`, what the epochs, ticks and paces run on), its judging clock read with
+/// it as one pair (`judged`, what a signed time is judged by and what is signed for it), the raw
+/// clock beside them (`raw`, what this relay's own anchors are aged by), and whether the judging
+/// clock judged (`judging`): all read at one instant (`clock::RelayClock::stamp`), so whatever the
+/// stamp decides later is decided by what was true as it was taken, never by a clock read then.
+/// Ordered by `(mono, ingest_seq)`: a watermark (`exchange::Envelope::Tick`) is a stamp.
+///
+/// Made only by the relay's clock, or given back by a trace or a test ([`Stamp::recorded`],
+/// [`Stamp::at`], which Clippy refuses elsewhere). It has no default: a stamp is a reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Stamp {
-    pub stamp_ms: u64,
-    pub ingest_seq: u64,
+    moment: Moment,
+    ingest_seq: u64,
+    raw: Raw,
+    judging: bool,
 }
 
-/// What reads the ingest clock: the system's wall clock in a relay, a script in a test.
-pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
+impl Ord for Stamp {
+    /// By `(mono, ingest_seq)`, then the rest, so it is a total order.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            self.moment.mono(),
+            self.ingest_seq,
+            self.moment.judged(),
+            self.raw,
+            self.judging,
+        )
+            .cmp(&(
+                other.moment.mono(),
+                other.ingest_seq,
+                other.moment.judged(),
+                other.raw,
+                other.judging,
+            ))
+    }
+}
+
+impl PartialOrd for Stamp {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Stamp {
+    /// The stamp of one read of the relay's clocks (`clock::RelayClock::stamp`).
+    pub(crate) const fn read(moment: Moment, ingest_seq: u64, raw: Raw, judging: bool) -> Self {
+        Self {
+            moment,
+            ingest_seq,
+            raw,
+            judging,
+        }
+    }
+
+    /// A stamp a trace or a test recorded: its monotonic reading `mono_ms`, place `ingest_seq`,
+    /// judging reading `judged_ms`, raw reading `raw_ms`, and whether its judging clock judged.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a recorded stamp is made from recorded readings"
+    )]
+    pub const fn recorded(
+        mono_ms: u64,
+        ingest_seq: u64,
+        judged_ms: u64,
+        raw_ms: u64,
+        judging: bool,
+    ) -> Self {
+        Self {
+            moment: recorded::moment(mono_ms, judged_ms),
+            ingest_seq,
+            raw: recorded::raw(raw_ms),
+            judging,
+        }
+    }
+
+    /// A recorded stamp whose clocks read alike, judging: a trace's or a test's.
+    #[allow(clippy::disallowed_methods, reason = "a recorded stamp, made of one")]
+    pub const fn at(stamp_ms: u64, ingest_seq: u64) -> Self {
+        Self::recorded(stamp_ms, ingest_seq, stamp_ms, stamp_ms, true)
+    }
+
+    /// The monotonic reading.
+    pub const fn mono(self) -> Mono {
+        self.moment.mono()
+    }
+
+    /// The monotonic reading's milliseconds: what the epochs, ticks and paces count.
+    pub const fn mono_ms(self) -> u64 {
+        self.moment.mono().ms()
+    }
+
+    /// Its place in the ingest order.
+    pub const fn ingest_seq(self) -> u64 {
+        self.ingest_seq
+    }
+
+    /// The judging reading.
+    pub const fn judged(self) -> Judged {
+        self.moment.judged()
+    }
+
+    /// The raw reading.
+    pub const fn raw(self) -> Raw {
+        self.raw
+    }
+
+    /// Whether the judging clock judged as the stamp was taken: what usability, blame and signing
+    /// of what it stamps are decided by, never the clock as it is later read.
+    pub const fn judging(self) -> bool {
+        self.judging
+    }
+
+    /// Both clocks' readings, as one instant.
+    pub const fn moment(self) -> Moment {
+        self.moment
+    }
+
+    /// The stamp carried on to `last`, the producer's newest stamp's monotonic reading, when it
+    /// reads before it (a producer's stamps never go back): its judging reading moved with it by
+    /// the pair's offset just read (`Moment::at`). Its raw reading is the one taken: the raw clock
+    /// is no daemon's, so a span of `M` never moves it.
+    #[must_use]
+    pub(crate) fn not_before(self, last: Mono) -> Self {
+        if self.moment.mono() >= last {
+            return self;
+        }
+        Self {
+            moment: self.moment.at(last),
+            ..self
+        }
+    }
+
+    /// The stamp moved to `mono`, a reading of its monotonic clock on that clock's own grid (an
+    /// epoch's end, `seal::Epoch::end`): its judging reading moved with it by the pair's offset
+    /// (`Moment::at`), its judging bit its own. Its raw reading is the one taken: the raw clock is
+    /// no daemon's and runs apart from `M`, so a span of `M` never moves it. What the products
+    /// sign an epoch at, by its newest tick.
+    #[must_use]
+    pub(crate) fn at_mono(self, mono: Mono) -> Self {
+        Self {
+            moment: self.moment.at(mono),
+            ..self
+        }
+    }
+
+    /// The same readings at place `ingest_seq`.
+    #[must_use]
+    pub const fn with_seq(self, ingest_seq: u64) -> Self {
+        Self { ingest_seq, ..self }
+    }
+}
 
 /// A stage that a [`Pause`] holds up, at the point where it holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1076,86 +1524,57 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     }
 }
 
-/// The ingest clock of a relay: the wall clock, followed without ever going back and without
-/// ever jumping ([`Slewed`]). Stamps advance with a monotonic clock, between [`SLOWEST`] and
-/// [`FASTEST`] times its pace, closing on the wall clock whenever they are apart: a stamp never
-/// steps with the wall clock (a step forward would close every open epoch at once and shed the
-/// hosted MLAT's steps; a step back would hold every epoch open, charged), and stamps stay near
-/// the wall time feeders and peers read.
-///
-/// Before, the wall clock was read once, at the start, and only the monotonic clock after it: a
-/// relay started before the host's clock was synchronised (the unit now starts after
-/// `time-sync.target`), or a virtual machine suspended and resumed (the monotonic clock stops
-/// while it sleeps), stayed seconds behind the wall clock for as long as it ran, so every
-/// feeder's raw was refused as ahead of its stamp (`held::AHEAD_MS`, 1 s) and MLAT stopped,
-/// silently.
-pub fn anchored_wall_clock() -> Clock {
-    let started = std::time::Instant::now();
-    let slewed = Slewed::new(crate::network::wall_ms());
-    Arc::new(move || slewed.read(started.elapsed(), crate::network::wall_ms()))
-}
-
-/// The most the ingest clock runs ahead of a monotonic clock's pace while it catches up with a
-/// wall clock ahead of it: a gap of `g` closes in `g` (a stamp runs two seconds a second). Twice,
-/// so the deduplication's window (`exchange::DEDUP_WINDOW_MS`) never spans less than a second of
-/// arrivals while it closes, and an epoch never less than half a second.
-pub const FASTEST: f64 = 2.0;
-
-/// The least it runs while a wall clock behind it catches up: half the monotonic pace, so epochs
-/// still close while a gap of `g` closes in `2g`.
-pub const SLOWEST: f64 = 0.5;
-
-/// A clock that follows a wall clock it is read beside, never going back, its pace held between
-/// [`SLOWEST`] and [`FASTEST`] times a monotonic clock's: what [`anchored_wall_clock`] reads.
-/// Kept to fractions of a millisecond, so a clock read every microsecond still advances.
-pub struct Slewed {
-    /// The stamp last read, in milliseconds, and the monotonic time it was read at.
-    state: Mutex<(f64, Duration)>,
-}
-
-impl Slewed {
-    /// Starting at `wall_ms`, at monotonic time zero.
-    pub fn new(wall_ms: u64) -> Self {
-        Self {
-            state: Mutex::new((wall_ms as f64, Duration::ZERO)),
-        }
-    }
-
-    /// The stamp at monotonic time `monotonic`, the wall clock reading `wall_ms`: as far toward
-    /// the wall clock as the pace allows since the last read, never before it.
-    pub fn read(&self, monotonic: Duration, wall_ms: u64) -> u64 {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (stamp, at) = *state;
-        let elapsed = monotonic.saturating_sub(at).as_secs_f64() * 1_000.0;
-        let wall = wall_ms as f64;
-        let next = if wall > stamp + elapsed {
-            wall.min(stamp + elapsed * FASTEST)
-        } else {
-            wall.max(stamp + elapsed * SLOWEST)
-        }
-        .max(stamp);
-        *state = (next, monotonic.max(at));
-        next as u64
-    }
-}
-
-/// A connection's verdict from the ingest stage: a batch it sent failed its signature, so the
-/// connection ends, as it did when the check ran inline.
+/// A connection's verdict from the ingest stage: a batch it sent failed its signature or could
+/// not be read, so the connection ends without a word, as it did when the check ran inline. A
+/// clock never ends one (RFC-0171 §3.6): short of that, whether its feeder signed a batch by a
+/// clock drifting from the relay's (`drifted`), which its link answers by stating the relay's
+/// clock again (`RateLimit`'s `clock_ms`) at its next heartbeat, but only to a feeder that signed
+/// in step with the clock last stated (`in_step`) since it was stated.
 #[derive(Default)]
 pub struct Refusal {
     why: Mutex<Option<String>>,
     notify: Notify,
+    drifted: std::sync::atomic::AtomicBool,
+    in_step: std::sync::atomic::AtomicBool,
 }
 
 impl Refusal {
+    /// Ends the connection without a word: it broke a rule it cannot have broken by accident.
     pub fn refuse(&self, why: String) {
         if let Ok(mut held) = self.why.lock() {
             held.get_or_insert(why);
         }
         self.notify.notify_one();
+    }
+
+    /// Its feeder signed a batch by a clock drifting from the relay's: its link states the
+    /// relay's clock again.
+    pub fn drifted(&self) {
+        self.drifted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Its feeder signed a batch in step with the relay's clock (within half the tolerance): its
+    /// clock is good now, so any drift noted before it is forgotten. A reconnect's backlog (batches
+    /// that waited, too old, then the ones signed now, in step) is a wait and no drift, and alone
+    /// never has the clock stated again: to a feeder that predates `clock_ms` a `RateLimit` starts
+    /// its pace again.
+    pub fn in_step(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.drifted.store(false, Relaxed);
+        self.in_step.store(true, Relaxed);
+    }
+
+    /// Whether its link states the relay's clock again: its feeder's clock drifted since this was
+    /// last asked and since it last signed in step, and it had signed in step since the clock was
+    /// last stated, so it reads what it is told (or kept good time of its own until now). A
+    /// `RateLimit` is a feeder's pace, and one that predates `clock_ms` (0.5.2, 0.6.x) starts its
+    /// pace again on each, so a feeder whose clock is off from the start, or stays off after it
+    /// was told, is not told again: its batches are judged by the window alone, and the ones too
+    /// old to use are counted against its receiver (`stations::StationReport`'s `late_batches`).
+    pub fn take_drift(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.drifted.swap(false, Relaxed) && self.in_step.swap(false, Relaxed)
     }
 
     /// Why, if a batch was refused.
@@ -1166,7 +1585,7 @@ impl Refusal {
     /// Resolves with why, once a batch was refused.
     pub async fn refused(&self) -> String {
         loop {
-            if let Some(why) = self.why.lock().ok().and_then(|held| held.clone()) {
+            if let Some(why) = self.now() {
                 return why;
             }
             self.notify.notified().await;
@@ -1417,9 +1836,9 @@ enum Pool {
     },
 }
 
-/// The ingest clock, every worker's stamps, and the message exchange the workers feed.
+/// The relay's clocks, every worker's stamps, and the message exchange the workers feed.
 struct Core {
-    clock: Clock,
+    clock: RelayClock,
     next: AtomicU64,
     /// Per producer: the newest stamp it took or ticked.
     last: Box<[AtomicU64]>,
@@ -1430,41 +1849,39 @@ struct Core {
 }
 
 impl Core {
-    fn now(&self, producer: usize) -> u64 {
-        let last = self.last[producer].load(Ordering::Relaxed);
-        (self.clock)().max(last)
+    /// The producer's stamp now (`clock::RelayClock::stamp`), at place `ingest_seq`, carried on
+    /// to its last stamp when the monotonic clock reads before it ([`Stamp::not_before`]).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the producer's own newest monotonic reading, kept as a number between stamps and given back"
+    )]
+    fn now(&self, producer: usize, ingest_seq: u64) -> Stamp {
+        let last = recorded::mono(self.last[producer].load(Ordering::Relaxed));
+        self.clock.stamp(ingest_seq).not_before(last)
     }
 
     fn stamp(&self, producer: usize) -> Stamp {
-        let stamp_ms = self.now(producer);
-        self.last[producer].store(stamp_ms, Ordering::Relaxed);
-        Stamp {
-            stamp_ms,
-            ingest_seq: self.next.fetch_add(1, Ordering::Relaxed),
-        }
+        let stamp = self.now(producer, self.next.fetch_add(1, Ordering::Relaxed));
+        self.last[producer].store(stamp.mono_ms(), Ordering::Relaxed);
+        stamp
     }
 
     /// A stamp the trace gave: kept, and the producer's stamps go on from it.
     fn stamped(&self, producer: usize, stamp: Stamp) -> Stamp {
-        self.last[producer].fetch_max(stamp.stamp_ms, Ordering::Relaxed);
+        self.last[producer].fetch_max(stamp.mono_ms(), Ordering::Relaxed);
         stamp
     }
 
     /// Ticks `producer` at its stamps' newest when `TICK_MS` has passed since its last tick, or
     /// always when `force`.
     fn tick(&self, producer: usize, force: bool) {
-        let now = self.now(producer);
+        let stamp = self.now(producer, 0);
+        let now = stamp.mono_ms();
         let ticked = self.ticked[producer].load(Ordering::Relaxed);
         if force || now >= ticked + TICK_MS {
             self.last[producer].store(now, Ordering::Relaxed);
             self.ticked[producer].store(now, Ordering::Relaxed);
-            self.message.tick(
-                producer,
-                Stamp {
-                    stamp_ms: now,
-                    ingest_seq: 0,
-                },
-            );
+            self.message.tick(producer, stamp);
         }
     }
 
@@ -1483,7 +1900,7 @@ pub struct Stages {
 
 impl Stages {
     /// Every stage run by the caller (one producer, one message thread): for tests.
-    pub fn inline(clock: Clock, sink: Sink, gauges: Gauges) -> Self {
+    pub fn inline(clock: RelayClock, sink: Sink, gauges: Gauges) -> Self {
         Self {
             core: Arc::new(Core {
                 clock,
@@ -1503,7 +1920,7 @@ impl Stages {
     /// cannot be started fails the relay at its start, since every message thread waits for every
     /// worker's tick and one missing would close no epoch ever.
     pub fn threaded(
-        clock: Clock,
+        clock: RelayClock,
         threads: Threads,
         (sink, gauges, room): (&Sink, &Gauges, Room),
         pause: Option<Pause>,
@@ -1670,22 +2087,22 @@ impl Stages {
         self.core.stamped(producer, stamp)
     }
 
-    /// The ingest clock.
-    pub fn clock(&self) -> Clock {
-        Arc::clone(&self.core.clock)
+    /// The relay's clocks.
+    pub fn clock(&self) -> RelayClock {
+        self.core.clock.clone()
     }
 
-    /// The ingest clock now: the stamp of a record that is not a batch (a description, positions)
-    /// for a subscriber queue's age.
+    /// The monotonic clock now: the stamp of a record that is not a batch (a description,
+    /// positions) for a subscriber queue's age.
     pub fn now_ms(&self) -> u64 {
-        (self.core.clock)()
+        self.core.clock.mono().ms()
     }
 
     /// Decodes `batch`, verified, stamped `stamp`: the one decode every later stage shares. A
     /// batch of a format this build cannot read comes back whole, to be forwarded raw and read by
     /// nothing else.
     pub fn decode(batch: Batch, stamp: Stamp) -> Result<Arc<Decoded>, Box<Undecodable>> {
-        Decoded::from_verified(batch, stamp.stamp_ms, stamp.ingest_seq)
+        Decoded::from_verified_stamped(batch, (stamp.moment(), stamp.judging()), stamp.ingest_seq)
     }
 
     /// As `decode`, the batch's signed bytes and its decode each charged once, for their life, to
@@ -1702,6 +2119,19 @@ impl Stages {
         gauge: &Arc<Gauge>,
         covered: &'static crate::budget::Covered,
     ) -> Result<Arc<Decoded>, NotDecoded> {
+        Self::decode_inflated_owned(batch, None, stamp, gauge, covered)
+    }
+
+    /// As [`Stages::decode_owned`], from the batch's plain bytes already inflated
+    /// (`tally_wire::Batch::inflated`, as a feeder's batch is to read its wanted receptions), so a
+    /// compressed batch is inflated once.
+    pub fn decode_inflated_owned(
+        batch: Batch,
+        inflated: Option<&tally_wire::Inflated>,
+        stamp: Stamp,
+        gauge: &Arc<Gauge>,
+        covered: &'static crate::budget::Covered,
+    ) -> Result<Arc<Decoded>, NotDecoded> {
         let batch = batch
             .owned_by(|bytes| {
                 gauge
@@ -1710,9 +2140,10 @@ impl Stages {
             })
             .map_err(NotDecoded::NoRoom)?;
         let charged = std::cell::Cell::new(0);
-        Decoded::from_verified_owned(
+        Decoded::from_inflated_owned(
             batch,
-            stamp.stamp_ms,
+            inflated,
+            (stamp.moment(), stamp.judging()),
             stamp.ingest_seq,
             |decoded| {
                 charged.set(decoded.footprint());
@@ -1794,25 +2225,178 @@ impl Drop for Stages {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
     use super::*;
+
+    /// The keys and network groups the pace maps' tests fill them with.
+    fn pace_keys(count: usize) -> Result<(Vec<tally_wire::PublicKey>, Vec<Option<Group>>), String> {
+        let keys = (0..count)
+            .map(|_| tally_wire::Identity::generate().map(|identity| identity.public()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let groups = (0..count)
+            .map(|n| {
+                let n = u8::try_from(n % 200).unwrap_or(0);
+                group_of(Some(std::net::IpAddr::from([20 + n, 1, 0, 1])))
+            })
+            .collect();
+        Ok((keys, groups))
+    }
+
+    /// Every pace map is charged what its table and its entries allocate, read from the
+    /// allocator, as entries come and are forgotten, and never more than its entries planned
+    /// (`CEILING_ENTRY_BYTES`, `GRANT_ENTRY_BYTES`, `DIRECTORY_ENTRY_BYTES`). Before, none of them
+    /// was charged to any store: a connection's pace state was planned at a kibibyte
+    /// (`PACE_STATE_BYTES`) whatever the maps allocated.
+    #[test]
+    fn the_pace_maps_are_charged_what_they_allocate() -> Result<(), String> {
+        use tally_counting::Counting;
+        let (keys, groups) = pace_keys(200)?;
+        let room = || {
+            PaceRoom::within(
+                &Gauge::unlimited(Store::Paces),
+                &Gauge::unlimited(Store::Paces),
+            )
+        };
+
+        let mut ceilings = ReceptionCeilings::within(room());
+        let base = Counting::live();
+        for (n, key) in keys.iter().enumerate() {
+            // A millisecond apart: the buckets before refill, and the pruning forgets them.
+            assert!(ceilings.take(*key, 1, n as u64));
+            assert_eq!(Counting::since(base), ceilings.charged() as isize, "{n}");
+            assert!(ceilings.charged() <= ceilings.len() * CEILING_ENTRY_BYTES);
+        }
+        assert!(ceilings.len() < keys.len(), "nothing was forgotten");
+        drop(ceilings);
+        // A pruning that keeps only a receiver already held gives the table's room back at once,
+        // with no insert after it to do so: one receiver spent, then a hundred and twenty-eight
+        // others refilled by the time it sends again.
+        let mut ceilings = ReceptionCeilings::within(room());
+        let base = Counting::live();
+        let burst = ReceptionCeilings::BURST as usize;
+        assert!(ceilings.take(keys[0], burst, 0));
+        for key in &keys[1..=128] {
+            assert!(ceilings.take(*key, 1, 0));
+        }
+        assert!(!ceilings.take(keys[0], burst, 1_000));
+        assert_eq!(ceilings.len(), 1);
+        assert_eq!(Counting::since(base), ceilings.charged() as isize);
+        assert!(ceilings.charged() <= CEILING_ENTRY_BYTES);
+        drop(ceilings);
+
+        let grants = BurstGrants::new(
+            RolePace {
+                per_minute: 1 << 40,
+                burst: 1 << 40,
+            },
+            GROUP_BURST_GRANTS,
+        )
+        .within(room());
+        let base = Counting::live();
+        for (n, group) in groups.iter().enumerate() {
+            assert_eq!(grants.grant(*group, 1), 1);
+            assert_eq!(Counting::since(base), grants.charged() as isize, "{n}");
+            assert!(grants.charged() <= grants.groups_held() * GRANT_ENTRY_BYTES);
+        }
+        assert_eq!(grants.groups_held(), groups.len());
+        drop(grants);
+
+        let directory = DirectoryPaces::within(DIRECTORY_RECORDS, room());
+        let mut links = Vec::with_capacity(groups.len());
+        let base = Counting::live();
+        for (n, group) in groups.iter().enumerate() {
+            links.push(directory.join(*group).ok_or("joined")?);
+            assert_eq!(Counting::since(base), directory.charged() as isize, "{n}");
+            assert!(directory.charged() <= directory.groups_held() * DIRECTORY_ENTRY_BYTES);
+        }
+        // Each group owes nothing, so it is forgotten with its last link, and its room given back.
+        while let Some(link) = links.pop() {
+            drop(link);
+            assert_eq!(Counting::since(base), directory.charged() as isize);
+        }
+        assert_eq!((directory.groups_held(), directory.charged()), (0, 0));
+        Ok(())
+    }
+
+    /// A pace map holds no more than its entries' share of the store: a receiver, or a group, the
+    /// room has no place for shares one entry with every other such newcomer, so a flood of keys
+    /// or networks neither grows a map past its room nor gets a bucket each.
+    #[test]
+    fn a_pace_map_past_its_room_shares_one_entry() -> Result<(), String> {
+        // Three entries' room, and forty newcomers: a small table's buckets hold more than three
+        // (`table_per_entry` is an entry's most), never forty.
+        let (keys, groups) = pace_keys(40)?;
+        let store = Gauge::unlimited(Store::Paces);
+
+        let share = Gauge::new(Store::Paces, 3 * CEILING_ENTRY_BYTES);
+        let mut ceilings = ReceptionCeilings::within(PaceRoom::within(&store, &share));
+        for key in &keys {
+            assert!(ceilings.take(*key, 1, 0));
+        }
+        assert!(
+            (1..keys.len()).contains(&ceilings.len()),
+            "{}",
+            ceilings.len()
+        );
+        assert!(share.held() <= share.limit());
+        // The first receiver still has its own bucket; the ones past the room spent theirs together.
+        let burst = ReceptionCeilings::BURST as usize;
+        assert!(ceilings.take(keys[0], burst - 1, 0));
+        assert!(!ceilings.take(keys[39], burst, 0));
+
+        let share = Gauge::new(Store::Paces, 3 * GRANT_ENTRY_BYTES);
+        let grants = BurstGrants::new(
+            RolePace {
+                per_minute: 1 << 40,
+                burst: 1 << 40,
+            },
+            GROUP_BURST_GRANTS,
+        )
+        .within(PaceRoom::within(&store, &share));
+        let whole = GROUP_BURST_GRANTS.burst;
+        let granted: Vec<u64> = groups
+            .iter()
+            .map(|group| grants.grant(*group, whole))
+            .collect();
+        let held = grants.groups_held();
+        assert!((1..groups.len()).contains(&held), "{held}");
+        assert!(share.held() <= share.limit());
+        // Each group held was granted its whole burst, and the rest one burst between them.
+        assert_eq!(granted.iter().sum::<u64>(), (held as u64 + 1) * whole);
+
+        let share = Gauge::new(Store::Paces, 3 * DIRECTORY_ENTRY_BYTES);
+        let directory = DirectoryPaces::within(DIRECTORY_RECORDS, PaceRoom::within(&store, &share));
+        let links = groups
+            .iter()
+            .map(|group| directory.join(*group))
+            .collect::<Option<Vec<_>>>()
+            .ok_or("joined")?;
+        let held = directory.groups_held();
+        assert!((1..groups.len()).contains(&held), "{held}");
+        assert!(share.held() <= share.limit());
+        // The groups past the room hold one share of the rate between them.
+        assert_eq!(directory.groups_linked(), held + 1);
+        drop(links);
+        assert_eq!(directory.groups_linked(), 0);
+        Ok(())
+    }
 
     #[test]
     fn stamps_read_the_ingest_clock_never_go_back_and_count_up() {
         let sink: Sink = Arc::new(|_| Ok(()));
-        let stages = Stages::inline(Arc::new(|| 42), sink, Gauges::unlimited());
+        let stages = Stages::inline(
+            RelayClock::scripted(Arc::new(|| 42)),
+            sink,
+            Gauges::unlimited(),
+        );
         let first = stages.stamp(0);
         let second = stages.stamp(0);
-        assert_eq!((first.stamp_ms, first.ingest_seq), (42, 0));
-        assert_eq!((second.stamp_ms, second.ingest_seq), (42, 1));
+        assert_eq!((first.mono_ms(), first.ingest_seq()), (42, 0));
+        assert_eq!((second.mono_ms(), second.ingest_seq()), (42, 1));
         assert!(first < second);
-        stages.stamped(
-            0,
-            Stamp {
-                stamp_ms: 100,
-                ingest_seq: 9,
-            },
-        );
-        assert_eq!(stages.stamp(0).stamp_ms, 100);
+        stages.stamped(0, Stamp::recorded(100, 9, 100, 100, true));
+        assert_eq!(stages.stamp(0).mono_ms(), 100);
     }
 
     /// A batch the relay hands in itself waits for room on its own thread, however many times it
@@ -1940,7 +2524,7 @@ mod tests {
     /// batch moved sixty-four times the bytes of a 1 KiB one.)
     #[tokio::test(start_paused = true)]
     async fn member_sessions_share_the_rate_evenly_whatever_their_batch_size() {
-        let pace = Arc::new(MemberPace::new(1 << 20));
+        let pace = Arc::new(MemberPace::new(1 << 20, 1 << 20));
         let moved = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
         let started = tokio::time::Instant::now();
         let mut tasks = Vec::new();
@@ -1979,7 +2563,7 @@ mod tests {
     /// bytes cannot bring in more than the plan holds for the members' rate.
     #[tokio::test(start_paused = true)]
     async fn a_members_receptions_are_paced_beside_its_bytes() {
-        let pace = MemberPace::new(1 << 20);
+        let pace = MemberPace::new(1 << 20, 1 << 20);
         let (_, receptions_per_sec) = pace.rates();
         let session = pace.session();
         let started = tokio::time::Instant::now();
@@ -2007,7 +2591,7 @@ mod tests {
             tally_wire::batch::Codec::Plain,
             tally_wire::batch::Codec::Deflate,
         ] {
-            let batch = Batch::sign_with(
+            let batch = crate::anchors::anchored_with(
                 &identity,
                 &tally_wire::BatchContent {
                     boot_id: 1,
@@ -2029,12 +2613,20 @@ mod tests {
             )
             .map_err(|error| error.to_string())?;
             let charge = charge_of(&batch);
+            let at_most = batch
+                .receptions_at_most()
+                .map_err(|error| error.to_string())?;
+            let unfloored = charge_for(
+                batch.as_bytes().len(),
+                batch.inflated_len().map_err(|error| error.to_string())?,
+                at_most,
+            );
             let pool = Gauge::new(Store::Ingest, charge);
             let in_flight = InFlight::trusted(&pool, charge);
             let decoded_store = Gauge::unlimited(Store::Decoded);
             let decoded = Stages::decode_owned(
                 batch,
-                Stamp::default(),
+                Stamp::at(0, 0),
                 &decoded_store,
                 crate::budget::Covered::process(),
             )
@@ -2044,80 +2636,23 @@ mod tests {
             let both = decoded.footprint() + decoded.batch().footprint();
             assert_eq!(decoded_store.held(), both);
             assert!(charge >= both, "{codec:?}: {charge} charged, {both} held");
+            // Charged, before the floor, no more than that and its slack, to the byte: the references for the
+            // receptions its length could hold and it does not, and a plain batch's inflated
+            // bytes, which are its signed bytes' own (each part of the charge is a part of what the
+            // two allocate, the kept key's included, `batch::KEPT_BYTES`).
+            let slack = (at_most - decoded.receptions()) * std::mem::size_of::<ObsRef>()
+                + match codec {
+                    tally_wire::batch::Codec::Plain => {
+                        decoded.inflated_len() + tally_wire::decoded::BYTES_HEADER
+                    }
+                    tally_wire::batch::Codec::Deflate | tally_wire::batch::Codec::DeflateAt(_) => 0,
+                };
+            assert_eq!(unfloored, both + slack, "{codec:?}");
             assert_eq!(decoded.plain().len(), decoded.inflated_len());
             drop(decoded);
             assert_eq!(decoded_store.held(), 0);
         }
         Ok(())
-    }
-
-    /// RFC-0181 invariant 2: the relay's ingest clock is the wall clock now, never going back.
-    #[test]
-    fn the_relays_clock_follows_the_wall_and_never_goes_back() {
-        let clock = anchored_wall_clock();
-        let wall = crate::network::wall_ms();
-        let first = clock();
-        assert!(first.abs_diff(wall) < 60_000);
-        let mut last = first;
-        for _ in 0..1_000 {
-            let now = clock();
-            assert!(now >= last);
-            last = now;
-        }
-    }
-
-    /// A relay started behind the wall clock (before the host's clock was synchronised), or
-    /// resumed after a suspend (its monotonic clock stood still while it slept), catches up: its
-    /// stamps run at most twice the monotonic pace, never jump, and meet the wall clock in as long
-    /// as they were behind; then they follow it. Read every microsecond, they still advance. The
-    /// clock read once from the wall stayed the five seconds behind for ever.
-    #[test]
-    fn a_clock_behind_the_wall_catches_up_at_a_bounded_pace() {
-        let clock = Slewed::new(10_000);
-        let mut last = clock.read(Duration::ZERO, 15_000);
-        assert_eq!(last, 10_000);
-        let mut met = None;
-        for tenth in 1..=100u64 {
-            let monotonic = Duration::from_millis(100 * tenth);
-            let wall = 15_000 + 100 * tenth;
-            let stamp = clock.read(monotonic, wall);
-            assert!(stamp >= last && stamp - last <= 200, "{last} then {stamp}");
-            assert!(stamp <= wall);
-            if stamp == wall && met.is_none() {
-                met = Some(tenth);
-            }
-            last = stamp;
-        }
-        // Five seconds behind, two seconds a second: met after five seconds, and kept.
-        assert_eq!(met, Some(50));
-        assert_eq!(last, 25_000);
-        let fine = Slewed::new(0);
-        let mut stamp = 0;
-        for micro in 1..=5_000u64 {
-            stamp = fine.read(Duration::from_micros(micro), 1_000_000);
-        }
-        assert_eq!(stamp, 10);
-    }
-
-    /// A wall clock stepped back is never followed back: the stamps slow to half the monotonic
-    /// pace, so epochs still close, until the wall clock catches them up.
-    #[test]
-    fn a_clock_ahead_of_the_wall_slows_and_never_goes_back() {
-        let clock = Slewed::new(20_000);
-        let mut last = clock.read(Duration::ZERO, 20_000);
-        for tenth in 1..=100u64 {
-            let monotonic = Duration::from_millis(100 * tenth);
-            // The wall clock stepped back three seconds.
-            let wall = 17_000 + 100 * tenth;
-            let stamp = clock.read(monotonic, wall);
-            assert!(
-                stamp >= last + 50 && stamp - last <= 100,
-                "{last} then {stamp}"
-            );
-            last = stamp;
-        }
-        // Three seconds ahead, losing half a second a second: met after six seconds.
-        assert_eq!(last, 27_000);
     }
 
     /// RFC-0181 §2: a batch a connection read holds the store for its own bytes for as long as
@@ -2155,7 +2690,7 @@ mod tests {
     async fn a_connection_holds_at_most_its_records_in_flight_however_small() -> Result<(), String>
     {
         let identity = tally_wire::Identity::generate().map_err(|error| error.to_string())?;
-        let tiny = Batch::sign(
+        let tiny = crate::anchors::anchored(
             &identity,
             &tally_wire::BatchContent {
                 boot_id: 1,
@@ -2211,7 +2746,7 @@ mod tests {
             seal: 1,
         };
         let stages = Stages::threaded(
-            Arc::new(|| 0),
+            crate::clock::RelayClock::scripted(Arc::new(|| 0)),
             threads,
             (&sink, &Gauges::unlimited(), room),
             None,
@@ -2361,7 +2896,7 @@ mod tests {
         let clock = Arc::new(AtomicU64::new(0));
         let reading = Arc::clone(&clock);
         let stages = Arc::new(Stages::threaded(
-            Arc::new(move || reading.load(Ordering::Relaxed)),
+            crate::clock::RelayClock::scripted(Arc::new(move || reading.load(Ordering::Relaxed))),
             threads,
             (&sink, &Gauges::unlimited(), unlimited_room()),
             Some(pause),
@@ -2372,7 +2907,7 @@ mod tests {
         const BATCHES: u64 = 2_000;
         const MS_APART: u64 = 10;
         for sequence in 0..BATCHES {
-            let batch = Batch::sign(
+            let batch = crate::anchors::anchored(
                 &identity,
                 &tally_wire::BatchContent {
                     boot_id: 1,
@@ -2404,8 +2939,9 @@ mod tests {
                 sequence as usize,
                 Box::new(move |producer| {
                     let stamp = working.stamp(producer);
+                    let raw = stamp.raw();
                     if let Ok(decoded) = Stages::decode(batch, stamp) {
-                        working.message().route(producer, &decoded, None);
+                        working.message().route(producer, &decoded, None, raw);
                     }
                     let _ = done.send(());
                 }),
@@ -2443,5 +2979,29 @@ mod tests {
         }
         drop(stages);
         Ok(())
+    }
+
+    /// A stamp moved along the monotonic clock (to an epoch's end, or on to its producer's last
+    /// stamp) carries its judging reading by the pair's offset, and keeps the raw reading it took:
+    /// the raw clock runs apart from `M` (a daemon slews `M` with `J`, and never the raw clock), so
+    /// a span of `M` is no span of it. Before, both moves added the monotonic span to the raw
+    /// reading too, and an anchor's age was reckoned on a raw time no clock read.
+    #[test]
+    fn a_stamp_moved_on_the_monotonic_clock_keeps_its_raw_reading() {
+        // `J` an hour ahead of `M`, the raw clock on an origin of its own.
+        let stamp = Stamp::recorded(10_000, 7, 3_610_000, 500, true);
+        let moved = stamp.at_mono(recorded::mono(12_000));
+        assert_eq!(
+            (moved.mono_ms(), moved.judged().ms(), moved.raw().ms()),
+            (12_000, 3_612_000, 500)
+        );
+        assert_eq!((moved.ingest_seq(), moved.judging()), (7, true));
+        let carried = stamp.not_before(recorded::mono(11_000));
+        assert_eq!(
+            (carried.mono_ms(), carried.judged().ms(), carried.raw().ms()),
+            (11_000, 3_611_000, 500)
+        );
+        // Never back.
+        assert_eq!(stamp.not_before(recorded::mono(9_000)), stamp);
     }
 }
