@@ -128,16 +128,20 @@ pub const BUSY_PERCENT: usize = 50;
 // (`crates/relay/tests/world-relay.txt`: 16 cores, its memory, so 4 MLAT threads), the relay on
 // cores 0-15 of the 32-core build host and the harness on 16-31 (`--relay-cores 16`), 2,000
 // feeders sending the measured mix (`tally_load::traffic`, about 600 receptions a second a
-// receiver, 60% of them messages MLAT wants), 60 s measured after a 60 s ramp and a 110 s warm-up,
-// 2026-10-27, its seats at the 546 its plan printed: each thread's CPU time from
-// `/proc/<pid>/task/*/stat` (the step's own threads come and go, so theirs is the process's less
-// every named thread's), the steps' fit and solve times from `GET /mlat` (`steps_total`, read at
-// both ends of the window). Before (2026-10-27, 457 seats), 5.37 ms a seat: refits 1.72, solving
-// 1.02, the host 0.27, the rest 1.57, publishing 0.41; the refit since gathers its area's
-// receptions into compact items sorted once and reads its sync points through integer ranks and
-// one list of hearers, and the step's intake sorts light tuples and builds a reception only for
-// those it keeps (`tally_mlat_solver`). Before that (2026-10-26, 522 seats), 5.97 ms: refits
-// 1.87, solving 0.86, the host 0.32, the rest 1.89, publishing 0.64. A relay
+// receiver, 60% of them messages MLAT wants), 100 s measured after a 60 s ramp and a 70 s warm-up,
+// 2026-10-31, its seats where the governor settled them, 335 the whole window (its plan printed 614
+// before this measure): each thread's CPU time from `/proc/<pid>/task/*/stat` (the step's own
+// threads come and go, so theirs is the process's less every named thread's), the steps' fit and
+// solve times from `GET /mlat` (`steps_total`, read at both ends of the window, the seats every
+// second). Before the pair blocks (2026-10-27, 546 seats), 4.80 ms a seat: refits 1.47, solving
+// 1.00, the host 0.28, the rest 1.24, publishing 0.42; the blocks' refits cost 24.8 ms each against
+// 11.1, at about the refits a second (68 against 72.5) over fewer seats, so the plan printed 614
+// seats and its load settled at 335 to 424. Before that (2026-10-27, 457 seats), 5.37 ms a seat:
+// refits 1.72, solving 1.02, the host 0.27, the rest 1.57, publishing 0.41; the refit since
+// gathers its area's receptions into compact items sorted once and reads its sync points through
+// integer ranks and one list of hearers, and the step's intake sorts light tuples and builds a
+// reception only for those it keeps (`tally_mlat_solver`). Before that (2026-10-26, 522 seats),
+// 5.97 ms: refits 1.87, solving 0.86, the host 0.32, the rest 1.89, publishing 0.64. A relay
 // alone verifies no neighbour's model, so that one part is the pairwise path sweep's
 // (`tally-mlat-solver`'s `pairwise_path_sweep`, world density, seed 9000). Every figure is
 // milliseconds of one core a seat-second. `//crates/load:plan_seats` runs the same load and holds
@@ -150,13 +154,13 @@ pub const BUSY_PERCENT: usize = 50;
 /// Nanoseconds of one core a second an area's refits cost for each of its receivers: the pair
 /// fits of its model every `tally_wire::budget::REFIT_EVERY_MS`, each pair sought from its knots in
 /// the area's previous model, over the trailing window, as the host runs them on MLAT's threads
-/// (the steps' `fit_ms`, 803 ms a second over 546 seats, 72.5 refits a second at 11.1 ms; the
-/// sweep's "sync" was 0.872, one thread over an even scene). Dearer than the sweep for its refits,
-/// not their cost: each area refit cost what the sweep's did (11.1 ms against 15.6), but the load's
-/// seats lie over more areas each, 0.133 refits a seat-second against the sweep's 0.056. A refit
+/// (the steps' `fit_ms`, 1,689 ms a second over 335 seats, 68 refits a second at 24.8 ms; the
+/// sweep's "sync" was 0.872, one thread over an even scene). Dearer than the sweep twice over: each
+/// area refit costs more than the sweep's (24.8 ms against 15.6), and the load's seats lie over
+/// more areas each, 0.203 refits a seat-second against the sweep's 0.056. A refit
 /// has no fixed part: over the world's areas its cost follows its points, about 640 ns a point and
 /// rising with them, the pair fits most of it (`pair_tests`, `a_refits_cost_follows_its_points`).
-pub const MLAT_REFIT_NANOS_PER_FEEDER: usize = 1_470_000;
+pub const MLAT_REFIT_NANOS_PER_FEEDER: usize = 5_040_000;
 /// Nanoseconds of one core a second verifying the neighbouring areas' models costs a seat: each
 /// such model checked once over the raw the engine holds (`Engine::verify_model`, `mlat_host`),
 /// and only when a fix the engine publishes or judges cites it (`mlat_host`, unneeded): the
@@ -169,29 +173,29 @@ pub const MLAT_VERIFY_NANOS_PER_FEEDER: usize = 387_000;
 /// relays take up grouped into its transmissions, and of them one an aircraft a slot of 0.7 s
 /// solved (`tally_mlat_solver::backoff`, mlat-server's `RESOLVE_BACKOFF`), and again as its set
 /// closes bigger, from at most `pair::HEARERS_MOST` (32) receivers, with its verification and
-/// signing (the steps' `solve_ms`, 548 ms a second over 546 seats; the sweep's "fixes" was 0.682).
-pub const MLAT_SOLVE_NANOS_PER_FEEDER: usize = 1_000_000;
+/// signing (the steps' `solve_ms`, 211 ms a second over 335 seats; the sweep's "fixes" was 0.682).
+pub const MLAT_SOLVE_NANOS_PER_FEEDER: usize = 628_000;
 /// Nanoseconds of one core a second the host's own thread spends a seat: taking each step's due
 /// batches from the inboxes, admitting them into the pool in order once MLAT's threads have
 /// classified them (`mlat_host`, take), settling the pool's charge, applying the cuts and judging
 /// the step (the governor), and the serial parts of the step it starts: the `tally-mlat` thread,
-/// 0.153 of a core over 546 seats.
-pub const MLAT_HOST_NANOS_PER_FEEDER: usize = 280_000;
+/// 0.107 of a core over 335 seats.
+pub const MLAT_HOST_NANOS_PER_FEEDER: usize = 320_000;
 /// Nanoseconds of one core a second MLAT's threads spend a seat beyond its refits and its solving:
 /// classifying its batches (hashing each message, finding its positions,
 /// `tally_mlat::engine::classify`), building and judging the due sets taken up (`fix::choose`),
 /// weighing them, building their records, letting go of what the step took, and the background
-/// work beside the steps (standing's checks, forgetting receivers): the step threads' CPU, 2.029
-/// of a core, less `fit_ms` and `solve_ms`, 0.678 over 546 seats.
+/// work beside the steps (standing's checks, forgetting receivers): the step threads' CPU, 2.316
+/// of a core, less `fit_ms` and `solve_ms`, 0.416 over 335 seats.
 pub const MLAT_STEP_REST_NANOS_PER_FEEDER: usize = 1_240_000;
 /// Nanoseconds of one core a second publishing a seat's share of MLAT's output costs the relay's
 /// duties thread: each step's positions, tagged positions and the clock models they cite signed
 /// into the hub, forwarded and released (`Hub::publish_from`, `publish_positions`,
 /// `publish_clock_model`), and the consistency checks of what it published: the duties thread's
-/// CPU hosting MLAT, 0.259 of a core, less what it spends not hosting it at the same feeders
-/// (0.028, `--no-mlat`), 0.231 over 546 seats (0.335 over 522 before each positions record's keys
+/// CPU hosting MLAT, 0.190 of a core, less what it spends not hosting it at the same feeders
+/// (0.028, `--no-mlat`), 0.162 over 335 seats (0.335 over 522 before each positions record's keys
 /// were checked once for its five readers, `tally_wire::Positions::fixes`).
-pub const MLAT_PUBLISH_NANOS_PER_FEEDER: usize = 420_000;
+pub const MLAT_PUBLISH_NANOS_PER_FEEDER: usize = 484_000;
 
 /// The most of MLAT's threads the plan fills with its measured cost: the governor's target
 /// (`mlat_host::STEP_TARGET_MS` of `STEP_BUDGET_MS`), where a cut aims a step, so seats planned at
