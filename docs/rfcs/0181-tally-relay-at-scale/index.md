@@ -870,23 +870,26 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     seat costs the host what the load test measured it to (amended 2026-10-26: `tally-load`, 2,000
     feeders sending the measured mix against the world relay's plan on its 16 cores and 4 MLAT
     threads; amended again 2026-10-27 at 457 seats, after the profile's cuts below, and again at
-    546 seats after the refit's and the intake's; `cores::mlat_per_feeder`, 4.80 ms a seat-second,
-    5.37 and 5.97 before): its area's refits, `cores::MLAT_REFIT_NANOS_PER_FEEDER` (1.47 ms, the
-    steps' fit time; 1.72 before; the pair sweep's one thread over an even scene read 0.87: an
-    area's refit costs what the sweep's does, 11.1 ms against 15.6, but the load's seats lie over
-    more areas each, 0.133 refits a seat-second against the sweep's 0.056; a refit has no fixed
-    part, its cost following its points, about 640 ns a point and rising, the pair fits most of
-    it), verifying
+    546 seats after the refit's and the intake's; and again 2026-10-31 at the 335 seats the
+    governor held, the pair blocks of 2026-10-27 having left the plan's 614 seats settling at 335 to
+    424; `cores::mlat_per_feeder`, 8.10 ms a seat-second, 4.80, 5.37 and 5.97 before): its area's
+    refits, `cores::MLAT_REFIT_NANOS_PER_FEEDER` (5.04 ms, the steps' fit time; 1.47 before the
+    pair blocks and 1.72 before that; the pair sweep's one thread over an even scene read 0.87: an
+    area's refit costs more than the sweep's, 24.8 ms against 15.6 (11.1 before the pair blocks),
+    and the load's seats lie over more areas each, 0.203 refits a seat-second against the sweep's
+    0.056; a refit has no fixed part, its cost following its points, about 640 ns a point and
+    rising, the pair fits most of it), verifying
     its neighbours' models, `cores::MLAT_VERIFY_NANOS_PER_FEEDER` (0.39 ms, the sweep's: a relay
-    alone verifies none), its solving, `cores::MLAT_SOLVE_NANOS_PER_FEEDER` (1.00 ms; 1.02 and 0.86
-    before; the sweep read 0.68), the host thread's taking and judging,
-    `cores::MLAT_HOST_NANOS_PER_FEEDER` (0.28 ms), the rest of MLAT's threads' work around the
+    alone verifies none), its solving, `cores::MLAT_SOLVE_NANOS_PER_FEEDER` (0.63 ms; 1.00, 1.02
+    and 0.86 before; the sweep read 0.68), the host thread's taking and judging,
+    `cores::MLAT_HOST_NANOS_PER_FEEDER` (0.32 ms; 0.28 before), the rest of MLAT's threads' work around the
     solver (classifying the batches used, choosing and weighing the due sets, building records,
     letting go of what a step took, standing's checks), `cores::MLAT_STEP_REST_NANOS_PER_FEEDER`
     (1.24 ms; 1.57 before the intake sorted light tuples and built a reception only for those it
     keeps, 1.89 before a step classified only the batches its intake uses), and publishing what
-    it solved on the duties thread, `cores::MLAT_PUBLISH_NANOS_PER_FEEDER` (0.42 ms; 0.64 before
-    each positions record's keys were checked once for its five readers). The cuts of 2026-10-27
+    it solved on the duties thread, `cores::MLAT_PUBLISH_NANOS_PER_FEEDER` (0.48 ms; 0.42 before
+    the pair blocks, 0.64 before each positions record's keys were checked once for its five
+    readers). The cuts of 2026-10-27
     came from a profile of that load (`perf record` with frame pointers): the read's lists made at
     their length, a transmission's receptions looking up their slice once, the CPR zone counts a
     table, the feeder figures' cells found once for every feeder that placed an aircraft at a
@@ -910,7 +913,9 @@ Measured on main (tally-load, commit b3e3571809 on branch tally-load):
     and no `arrived_over`; and after the refit's and the intake's cuts, with the members'
     products paced apart from their rate, 614 seats settled of 614 planned at the default members'
     rate, steps 703 ms on average, publishing 5.40 MB/s (8.8 KB a seat a second), with 3.53 cores
-    busy. One run
+    busy. After the pair blocks it failed on a quiet machine (2026-10-31): 424 seats settled of 614
+    planned, and 335 on a second run, the arrived store passed 8 and 3 times, so the costs were
+    measured again at those seats. One run
     before it, on the shared box with other work on the relay's cores, settled at 301 after a cut
     and passed its `Arrived` store once (`arrived_over`), so the target asks a quiet machine. MLAT
     runs below the stages, so what it cannot do in time it collapses and cuts. The load the cores
@@ -1163,7 +1168,9 @@ the cores), and 614 seats hosting it, bound by the cores (1,505 by the memory), 
 members' rate. Measured again on 2026-10-30 with the pair blocks of 2026-10-27 (`tables_bytes`: a
 step's working set 553 KiB a seat, an area's memos 208 KiB a receiver, a model decoded at 520% of
 its wire bytes), 15,070 connections without MLAT, bound by the memory, and 614 seats hosting it,
-bound by the cores (1,334 by the memory). The floors stand; the costs are what the cores must be given or the code made to cost less. No figure of it is copied here: this section held them in
+bound by the cores (1,334 by the memory). With MLAT's costs measured again at the seats the pair
+blocks settle at (2026-10-31, 8.10 ms a seat-second against 4.80), 363 seats hosting it, bound by
+the cores. The floors stand; the costs are what the cores must be given or the code made to cost less. No figure of it is copied here: this section held them in
 a table, and by 2026-10-22 its memory before feeders and its rates no longer matched what the relay
 printed, with nothing to say so.
 
@@ -2011,8 +2018,8 @@ thread sustained:
 | Sealer and its pool (2026-10-27) | 1.23 M: 3, 0.068 to 0.080; 2.97 M: 3, 0.194; raw held 1.22 M: 3, 0.076 | 15 M (65 ns); 5.6 M (178 ns) and 3.2 M raw held (305 ns) on 2026-10-09 |
 | Async runtime (2026-10-27, 16 workers) | 2,000 feeders: 0.119 to 0.128; 5,000: 0.303; raw held 2,000: 0.142 to 0.161 | 15,000 feeders a core, 12,000 raw held; 12,000 and 8,000 on 2026-10-09 |
 | MLAT window steps (until 2026-10-24) | 500 feeders: 0.27 + seals 0.058 + engine 0.008; 2,000: 0.96 + 0.21 + 0.085 | 0.70 ms a feeder |
-| MLAT provisional steps (now the solving, `MLAT_SOLVE_NANOS_PER_FEEDER`) | 500 feeders: 0.14 to 0.20; 2,000: 0.72 to 0.80 | 0.41 ms a feeder; since 2026-10-26 0.86 ms a seat measured in the load test ("MLAT in the cores") |
-| MLAT refits (since 2026-10-24, `MLAT_REFIT_NANOS_PER_FEEDER`) | not run on this harness; planned from the pair sweep: 0.43 cores at 500 feeders, 1.72 at 2,000 | 0.86 ms a feeder (`pairwise_path_sweep`, world density); since 2026-10-26 measured in the load test, 1.87 ms a seat, 1.47 since 2026-10-27 |
+| MLAT provisional steps (now the solving, `MLAT_SOLVE_NANOS_PER_FEEDER`) | 500 feeders: 0.14 to 0.20; 2,000: 0.72 to 0.80 | 0.41 ms a feeder; since 2026-10-26 0.86 ms a seat measured in the load test ("MLAT in the cores"), 0.63 since 2026-10-31 |
+| MLAT refits (since 2026-10-24, `MLAT_REFIT_NANOS_PER_FEEDER`) | not run on this harness; planned from the pair sweep: 0.43 cores at 500 feeders, 1.72 at 2,000 | 0.86 ms a feeder (`pairwise_path_sweep`, world density); since 2026-10-26 measured in the load test, 1.87 ms a seat, 1.47 since 2026-10-27, 5.04 since the pair blocks (2026-10-31) |
 | MLAT verifying neighbours' models (since 2026-10-26, `MLAT_VERIFY_NANOS_PER_FEEDER`) | not run on this harness; planned: 0.20 cores at 500 feeders, 0.78 at 2,000 | 0.39 ms a feeder (the same sweep) |
 
 The message exchange costs less a reception the more threads it has (a thread's shards fit its

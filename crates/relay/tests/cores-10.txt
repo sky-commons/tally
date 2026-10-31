@@ -3,10 +3,10 @@ cores 10
 connection-limit 6250
 connections-by-cores 6250
 connection-limit-bound cores
-max-receptions-per-sec 3750523
-rate-by-cores 3750523
+max-receptions-per-sec 3753642
+rate-by-cores 3753642
 rate-bound cores
-mlat-seats 379
+mlat-seats 224
 mlat-seats-bound cores
 feeder-records 8
 general-sessions 2048
