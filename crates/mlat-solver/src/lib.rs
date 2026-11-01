@@ -485,16 +485,23 @@
 //! (least `a` count, then `b`). The line passes through the medians, `x` and `y` taken
 //! separately, of the first `n / 2` pooled points and of the rest, and its scale is `1.4826` times
 //! the median absolute residual about it, at least `sync::MIN_NOISE_S` times the square root of
-//! two; with fewer than `pair::LINE_LEAST` (4) pooled points the block has no inliers. The block's
+//! two; with fewer than `pair::LINE_LEAST` (4) pooled points the block has no inliers. When the
+//! first half's median `x` is not below the rest's, the line's slope is zero. A median of an even
+//! count, here and in the scale, is the mean of its two middle values in total order. The block's
 //! own points within `sync::SYNC_CUTOFF` (10) scales of its line are its inliers, and the rest
 //! are outliers for every window that holds the block. Its inliers are summed by interval of
 //! `a`'s knot grid (`Timebase::knot_counts`, 5 s of nominal counts from count zero, so the grid is
-//! the same in every window): per interval the block line's value at the interval's start and its
+//! the same in every window). A point's interval is `q = floor(la / knot_counts)`, and its place
+//! in it `into = (la - q knot_counts) ka - range_a` nanoseconds; when `into` is below zero the
+//! interval is `q - 1` and `into` grows by the knot's length, when it is a knot's length or more the
+//! interval is `q + 1` and `into` falls by it, once either way, and `f = into` over the knot's
+//! length. Per interval the block line's value at the interval's start and its
 //! change across it, the upper triangles of `sum w0 z zᵀ` and `sum z zᵀ` over the regressors `z =
 //! (1 - f, f, r, range_a, -range_b)` (`f` the point's place in its interval, `r` its residual about
 //! the block's line), `sum w0²`, and per aircraft `sum z`, `sum w0 z` and `sum w0²`. Its steps are
 //! those of its pooled residuals about its line past `sync::JUMP_THRESHOLD` (§ Jumps), the largest
-//! located in each second. So a block is a function of the receptions of seconds `s -
+//! located in each second, the first in point order on ties. So a block is a function of the
+//! receptions of seconds `s -
 //! pair::READ_BACK_MS / 1000` to `s + sync::SPAN_AFTER_S` among the window's inputs alone: the
 //! same in every window whose inputs hold the same receptions of that span, which the newest
 //! seconds' blocks are not, since a window's inputs end at its edge (`Trailing::reads`). A holder
@@ -532,7 +539,8 @@
 //! start; from either start it passes its verifier, with the same pairs
 //! (`a_warm_refit_publishes_what_a_cold_refit_publishes`).
 //!
-//! **Jumps.** A pair's jump is the largest of its blocks' steps in the window's seconds. A block's
+//! **Jumps.** A pair's jump is the largest of its blocks' steps in the window's seconds, taken in
+//! ascending order of second, the earlier block's on ties. A block's
 //! step is, in its pooled points' order, the change between the medians of the `sync::JUMP_SIDE`
 //! (5) residuals about its line before and after a point, scored against the residuals'
 //! consecutive scatter (`1.4826 * median |r_{i+1} - r_i| / sqrt 2`, at least 10 ns, times the
