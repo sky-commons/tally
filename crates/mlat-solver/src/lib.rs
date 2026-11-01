@@ -431,9 +431,11 @@
 //! models of its used hearers' areas by their ids (§ Areas). A holder of the window verifies a
 //! model once a refit ([`verify::verify_pair_model`]); a verifier holding the verified models and a
 //! fix's own receptions verifies the fix ([`verify::verify_pair_fix`]), reading no other raw.
-//! What a refit carries from the last is where the fixed point is sought from and, as the holder's
-//! cache, the blocks whose raw did not change (§ The pairwise path, blocks); neither changes what is
-//! published.
+//! What a refit carries from the last is where the fixed point is sought from (the previous model's
+//! noise and rates, each kept while within half the verifier's band of its new estimate) and, as
+//! the holder's cache, the blocks whose raw did not change (§ The pairwise path, blocks). The cache
+//! changes nothing published; the start may change a model's bytes, never whether it passes
+//! verification against its cited raw, which is the property a model has.
 //!
 //! **The network** ([`pair::Network`]). Which pairs of receivers exist is decided by their site
 //! records alone: each usable receiver keeps its `pair::PAIR_NEIGHBOURS` (40) nearest usable
@@ -493,8 +495,10 @@
 //! the block's line), `sum w0²`, and per aircraft `sum z`, `sum w0 z` and `sum w0²`. Its steps are
 //! those of its pooled residuals about its line past `sync::JUMP_THRESHOLD` (§ Jumps), the largest
 //! located in each second. So a block is a function of the receptions of seconds `s -
-//! pair::READ_BACK_MS / 1000` to `s + sync::SPAN_AFTER_S` alone, and the same in every window that
-//! holds it. A holder may keep blocks between refits by a digest of the receptions they read,
+//! pair::READ_BACK_MS / 1000` to `s + sync::SPAN_AFTER_S` among the window's inputs alone: the
+//! same in every window whose inputs hold the same receptions of that span, which the newest
+//! seconds' blocks are not, since a window's inputs end at its edge (`Trailing::reads`). A holder
+//! may keep blocks between refits by a digest of the receptions they read,
 //! under a key of its own (the reference engine's `BlockCache`), and build one again only when they
 //! changed; whether a block was kept or built changes nothing it holds. A block whose pooled points
 //! reach before either clock's kept segment start is built again from the kept points alone, and
@@ -523,8 +527,10 @@
 //!
 //! **The warm start.** A refit seeks the fixed point (below) from the noise and rates of the area's
 //! previous model where it holds a clock, else each timebase's default noise and no rate. No knot
-//! is carried: each pass solves every pair in closed form from its sums. What is published is the
-//! same from either start, within the verifier's tolerance.
+//! is carried: each pass solves every pair in closed form from its sums. A clock's noise is kept
+//! while within `verify::NOISE_BAND / 2` of its estimate, so a model's bytes may depend on the
+//! start; from either start it passes its verifier, with the same pairs
+//! (`a_warm_refit_publishes_what_a_cold_refit_publishes`).
 //!
 //! **Jumps.** A pair's jump is the largest of its blocks' steps in the window's seconds. A block's
 //! step is, in its pooled points' order, the change between the medians of the `sync::JUMP_SIDE`
