@@ -1,0 +1,26 @@
+diff --git a/mlat/coordinator.py b/mlat/coordinator.py
+index 5d8a3f1..0bb808b 100644
+--- a/mlat/coordinator.py
++++ b/mlat/coordinator.py
+@@ -102,7 +102,7 @@ class Receiver(object):
+         if self.bad_syncs > 3 and len(new_sync) > 3:
+             new_sync = set(random.sample(list(new_sync), k=3))
+ 
+-        if self.bad_syncs > 0:
++        if False:  # RFC-0198 sensitivity: was self.bad_syncs > 0
+             new_mlat = set()
+ 
+         for added in new_adsb.difference(self.adsb_seen):
+diff --git a/mlat/jsonclient.py b/mlat/jsonclient.py
+index 5e5af8f..f77d1d4 100644
+--- a/mlat/jsonclient.py
++++ b/mlat/jsonclient.py
+@@ -590,7 +590,7 @@ class JsonClient(connection.Connection):
+ 
+         elif 'mlat' in msg:
+             now = time.time()
+-            if self.receiver.bad_syncs > 0 or now - self.receiver.last_sync > 20:
++            if now - self.receiver.last_sync > 20:  # RFC-0198 sensitivity: bad-sync receivers kept
+                 return
+             mlat = msg['mlat']
+             #self.process_mlat(float(mlat['t']), bytes.fromhex(mlat['m']), now)

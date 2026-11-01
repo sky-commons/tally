@@ -431,7 +431,11 @@
 //! models of its used hearers' areas by their ids (§ Areas). A holder of the window verifies a
 //! model once a refit ([`verify::verify_pair_model`]); a verifier holding the verified models and a
 //! fix's own receptions verifies the fix ([`verify::verify_pair_fix`]), reading no other raw.
-//! Nothing is carried from one refit to the next but where the fixed point is sought from.
+//! What a refit carries from the last is where the fixed point is sought from (the previous model's
+//! noise and rates, each kept while within half the verifier's band of its new estimate) and, as
+//! the holder's cache, the blocks whose raw did not change (§ The pairwise path, blocks). The cache
+//! changes nothing published; the start may change a model's bytes, never whether it passes
+//! verification against its cited raw, which is the property a model has.
 //!
 //! **The network** ([`pair::Network`]). Which pairs of receivers exist is decided by their site
 //! records alone: each usable receiver keeps its `pair::PAIR_NEIGHBOURS` (40) nearest usable
@@ -455,29 +459,70 @@
 //! clock's lowest linear count over its sync receptions in the window is what a fix's raw is
 //! unwrapped near.
 //!
-//! **A pair's points.** Each event gives each pair of its hearers `a < b` (by clock key) one point:
-//! `x` is `a`'s nominal nanoseconds from the pair's anchor less its range from the event's prior
-//! in its own nominal time (`(1 + rho_a) * range / c`), `y` the same for `b` less `x`. The anchor
-//! is the kept point with the lowest `a` count (ties: the lowest `b`), so the anchor, and every
-//! point, is the same in any read of the window. A point weighs `2 / (h (sigma_a^2 + sigma_b^2))`,
+//! **A pair's points.** Each event of a block (below) gives each pair of its hearers `a < b` (by
+//! clock key) that the network names one point: `x` is `a`'s nominal nanoseconds from a reference
+//! count less its range from the event's prior in nanoseconds of light time, `y` the same for `b`
+//! less `x`. A clock's rate scales its range term, which the fit carries as two regressors of their
+//! own (`range_a` and `-range_b`, their coefficients the two rates), so nothing a block holds moves
+//! with the rates. A point weighs `2 / (h (sigma_a^2 + sigma_b^2))`,
 //! `h` the event's hearers, from the pair's two clocks and the raw alone: at equal noise it is
 //! `w_a w_b / W` with `w_k = 1 / sigma_k^2` and `W` the sum over the hearers, and by the identity
 //! `sum_k w_k (t_k - T)^2 = sum_{i<j} w_i w_j / W (t_i - t_j)^2` at the weighted mean transmit time
 //! `T` the pairs of an event together carry a joint fit's information with its transmit time
-//! eliminated. A point's own variance is `sigma_a^2 + sigma_b^2`. The points are ordered, and the
-//! knots placed, by `x` at no rate (`a`'s nominal time less its range), so neither moves with the
-//! rates.
+//! eliminated. A point's own variance is `sigma_a^2 + sigma_b^2`. The weight's `w0 = 2 / h` is the
+//! raw's; the noise enters only when a pair is solved.
 //!
-//! **A pair's fit**, from its points alone: `y` as a function of `x`, linear between knots
-//! `KNOT_PS` apart from the first point (at most `pair::PAIR_KNOTS_MOST`, 5, over the window), the
-//! second difference of consecutive knots held by the curvature prior `sigma_c^2 = curvature_a^2 +
-//! curvature_b^2` (§ Clocks, curvature), scaled by the points' `sum w / sum 1 / var`
-//! so the prior keeps the pair's own strength. The start is the line through the medians of the
-//! two halves of the points; then `pair::HUBER_PASSES` (3) passes Huber-weighted at
-//! `sync::HUBER_K`, then passes with points past `sync::SYNC_CUTOFF` own standard deviations left
-//! out until the inliers at the knots are the inliers the knots were solved with (at most
-//! `pair::CUTOFF_PASSES_MOST`, 8; a pair that does not settle is not valid). So the published knots
-//! are the optimum of their own inliers under the published noise and rates, which is what a
+//! **Blocks** (`pair::blocks`). A pair's points are taken one second of signed wall clock at a
+//! time, as blocks. The block of a pair at second `s` holds the points of the sync events new in
+//! `s`: each reference aircraft's position message heard by a member in `s` and by none in the
+//! `sync::LOOK_BACK_S` (2) seconds before it, with every member's reception of it within
+//! `sync::SPAN_AFTER_S` (2) seconds after `s` (a clock that heard it twice there left out), its
+//! prior read from its aircraft's CPR reference (§ The window) and NACp found in that span, and
+//! at least two hearers within `sync::MAX_RANGE_M` of the prior. A block's robust line is drawn
+//! through its pooled points: those of `s` and of the `pair::LINE_BLOCKS - 1` (4) seconds before
+//! it, less any before either clock's kept segment start (§ Jumps), sorted by `x` then `a`'s count,
+//! `b`'s count, the address and the second, each read from the first of the block's own points
+//! (least `a` count, then `b`). The line passes through the medians, `x` and `y` taken
+//! separately, of the first `n / 2` pooled points and of the rest, and its scale is `1.4826` times
+//! the median absolute residual about it, at least `sync::MIN_NOISE_S` times the square root of
+//! two; with fewer than `pair::LINE_LEAST` (4) pooled points the block has no inliers. When the
+//! first half's median `x` is not below the rest's, the line's slope is zero. A median of an even
+//! count, here and in the scale, is the mean of its two middle values in total order. The block's
+//! own points within `sync::SYNC_CUTOFF` (10) scales of its line are its inliers, and the rest
+//! are outliers for every window that holds the block. Its inliers are summed by interval of
+//! `a`'s knot grid (`Timebase::knot_counts`, 5 s of nominal counts from count zero, so the grid is
+//! the same in every window). A point's interval is `q = floor(la / knot_counts)`, and its place
+//! in it `into = (la - q knot_counts) ka - range_a` nanoseconds; when `into` is below zero the
+//! interval is `q - 1` and `into` grows by the knot's length, when it is a knot's length or more the
+//! interval is `q + 1` and `into` falls by it, once either way, and `f = into` over the knot's
+//! length. Per interval the block line's value at the interval's start and its
+//! change across it, the upper triangles of `sum w0 z zᵀ` and `sum z zᵀ` over the regressors `z =
+//! (1 - f, f, r, range_a, -range_b)` (`f` the point's place in its interval, `r` its residual about
+//! the block's line), `sum w0²`, and per aircraft `sum z`, `sum w0 z` and `sum w0²`. Its steps are
+//! those of its pooled residuals about its line past `sync::JUMP_THRESHOLD` (§ Jumps), the largest
+//! located in each second, the first in point order on ties. So a block is a function of the
+//! receptions of seconds `s -
+//! pair::READ_BACK_MS / 1000` to `s + sync::SPAN_AFTER_S` among the window's inputs alone: the
+//! same in every window whose inputs hold the same receptions of that span, which the newest
+//! seconds' blocks are not, since a window's inputs end at its edge (`Trailing::reads`). A holder
+//! may keep blocks between refits by a digest of the receptions they read,
+//! under a key of its own (the reference engine's `BlockCache`), and build one again only when they
+//! changed; whether a block was kept or built changes nothing it holds. A block whose pooled points
+//! reach before either clock's kept segment start is built again from the kept points alone, and
+//! one whose own points all lie before it is dropped.
+//!
+//! **A pair's fit**, from its blocks' sums alone: `y` as a function of `x`, linear between knots
+//! on `a`'s grid, from the start of the lowest interval its blocks' inliers fall in to the end of
+//! the highest (at most `pair::PAIR_KNOTS_MOST`, 5, knots; more, and the pair is not valid). The
+//! first knot is at `a`'s count of that interval's start, and `b`'s anchor is `b`'s count where it
+//! reads what `a` reads there, by the first block's first point; each block's sums are moved to
+//! these anchors by the difference of its own reference counts and summed in ascending block order.
+//! The second difference of consecutive knots is held by the curvature prior `sigma_c^2 =
+//! curvature_a^2 + curvature_b^2` (§ Clocks, curvature), scaled by the inliers' `sum w0 / sum 1`
+//! over `sigma_c^2`, so the prior keeps the pair's own strength. The inliers are the blocks'; there
+//! is no robust pass at the pair. Under given noise and rates the knots are the weighted
+//! least-squares solution of the summed normal equations, in closed form. So the published knots
+//! are the optimum of their blocks' inliers under the published noise and rates, which is what a
 //! verifier checks: at the knots, the inliers' normal equations hold within
 //! `pair::PAIR_OPTIMALITY_TOLERANCE` (the Gauss-Newton step's squared Mahalanobis length). Its
 //! covariance is the inverse of that normal matrix; its share is `sum w^2 var / sum w` over its
@@ -485,24 +530,19 @@
 //! a multiple of that covariance's (exact for a constant; the weights split an event's information
 //! among its hearers' pairs, so the covariance alone is each pair's part of the network's joint
 //! information, not its own variance). A pair with fewer than `sync::SPAN_RECEPTIONS_LEAST` points
-//! is not valid.
+//! (its blocks' own points, inliers and outliers) is not valid.
 //!
-//! **The warm start.** A refit seeks each pair's optimum from the pair's knots in the area's
-//! previous model (when neither of its clocks had a jump there or has one now), read at the present
-//! knots in the present anchors' terms (a point's `x` moves by the move of `a`'s anchor in nominal
-//! time, its `y` by that less `b`'s), and goes straight to the cutoff passes; a later pass of the
-//! fixed point starts each pair from its knots of the last. With no such knots, or when the cutoff
-//! passes from them do not settle or end on a jump, the pair takes the closed-form start above. In
-//! the steady state a pair is one cutoff pass and its check, where the closed-form start is the
-//! medians, three Huber passes and two cutoff passes. What is published is unchanged: a refit from
-//! the previous knots publishes the bytes one from the closed-form start does
-//! (`a_warm_refit_publishes_what_a_cold_refit_publishes`). The points are not carried: a pair's
-//! normal equations are of its points under the present noise and rates, at knots placed from the
-//! window's first point, with the inliers the knots choose, so no sum over them survives the slide
-//! of the window, and each refit forms them again.
+//! **The warm start.** A refit seeks the fixed point (below) from the noise and rates of the area's
+//! previous model where it holds a clock, else each timebase's default noise and no rate. No knot
+//! is carried: each pass solves every pair in closed form from its sums. A clock's noise is kept
+//! while within `verify::NOISE_BAND / 2` of its estimate, so a model's bytes may depend on the
+//! start; from either start it passes its verifier, with the same pairs
+//! (`a_warm_refit_publishes_what_a_cold_refit_publishes`).
 //!
-//! **Jumps.** A pair's jump is the largest step in its residuals (in point order) between the
-//! medians of the `sync::JUMP_SIDE` before and after a point, scored against the residuals'
+//! **Jumps.** A pair's jump is the largest of its blocks' steps in the window's seconds, taken in
+//! ascending order of second, the earlier block's on ties. A block's
+//! step is, in its pooled points' order, the change between the medians of the `sync::JUMP_SIDE`
+//! (5) residuals about its line before and after a point, scored against the residuals'
 //! consecutive scatter (`1.4826 * median |r_{i+1} - r_i| / sqrt 2`, at least 10 ns, times the
 //! spread of two medians of five), above `sync::JUMP_THRESHOLD`; it lies on each of its clocks
 //! between the counts of the two points either side. A jump is the clock's when its pairs agree on

@@ -1,0 +1,21 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rustfmt_test")
+
+# RFC-0198's baseline load generator, never shipped: N mlat-clients replaying tally-load's scene to
+# wiedehopf's mlat-server, and `eval`, which scores fixes against the scene's truth. Run with the
+# scripts beside it (sweep.sh). Built optimised: `bazel build -c opt //tools/mlat-baseline:mlat-emu`.
+rust_binary(
+    name = "mlat-emu",
+    srcs = ["mlat-emu.rs"],
+    edition = "2024",
+    deps = [
+        "//crates/mlat-solver",
+        "//crates/wire",
+        "@tally_crates//:miniz_oxide",
+        "@tally_crates//:serde_json",
+    ],
+)
+
+rustfmt_test(
+    name = "rustfmt",
+    targets = [":mlat-emu"],
+)

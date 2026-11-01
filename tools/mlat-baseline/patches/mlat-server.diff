@@ -1,0 +1,37 @@
+diff --git a/mlat/constants.py b/mlat/constants.py
+index c81242d..310a856 100644
+--- a/mlat/constants.py
++++ b/mlat/constants.py
+@@ -23,7 +23,7 @@ Useful constants for unit conversion.
+ import math
+ 
+ # signal propagation speed in metres per second
+-Cair = 299792458 / 1.00032
++Cair = 299792458  # RFC-0198 baseline: the scene propagates at c (was / 1.00032)
+ 
+ # degrees to radians
+ DTOR = math.pi / 180.0
+diff --git a/mlat/output.py b/mlat/output.py
+index 2cd3b50..051e1a3 100644
+--- a/mlat/output.py
++++ b/mlat/output.py
+@@ -53,8 +53,8 @@ def csv_quote(s):
+ class LocalCSVWriter(object):
+     """Writes multilateration results to a local CSV file"""
+ 
+-    TEMPLATE = '{t:.3f},{address:06X},{callsign},{squawk},{lat:.4f},{lon:.4f},{alt},{err:.0f},{n},{d},{receivers},{dof},{vrate}'  # noqa
+-    KTEMPLATE = '{t:.3f},{address:06X},{callsign},{squawk},{lat:.4f},{lon:.4f},{alt},{err:.0f},{n},{d},{receivers},{dof},{klat:.4f},{klon:.4f},{kalt:.0f},{kheading:.0f},{kspeed:.0f},{vrate},{kerr:.0f}'  # noqa
++    TEMPLATE = '{t:.3f},{address:06X},{callsign},{squawk},{lat:.6f},{lon:.6f},{alt},{err:.0f},{n},{d},{receivers},{dof},{vrate}'  # noqa
++    KTEMPLATE = '{t:.3f},{address:06X},{callsign},{squawk},{lat:.6f},{lon:.6f},{alt},{err:.0f},{n},{d},{receivers},{dof},{klat:.4f},{klon:.4f},{kalt:.0f},{kheading:.0f},{kspeed:.0f},{vrate},{kerr:.0f}'  # noqa
+ 
+     def __init__(self, coordinator, filename):
+         self.logger = logging.getLogger("csv")
+@@ -66,7 +66,7 @@ class LocalCSVWriter(object):
+         self.pos_logger.setLevel(logging.DEBUG)
+ 
+         self.pos_handler = logging.handlers.RotatingFileHandler(
+-                self.filename, maxBytes=(1*1024*1024), backupCount=10)
++                self.filename, maxBytes=(4*1024*1024*1024), backupCount=1)
+         self.pos_logger.addHandler(self.pos_handler)
+ 
+     def start(self):

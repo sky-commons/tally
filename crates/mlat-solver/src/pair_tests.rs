@@ -405,22 +405,13 @@ fn areas(
                 let Some(inputs) = arrived.area_inputs_over(area, &sites, trailing) else {
                     continue;
                 };
-                // Cold: the previous noise and rates, and no pair's knots to start from.
-                let knotless =
-                    current
-                        .get(&area)
-                        .filter(|_| options.cold)
-                        .map(|prepared| PairModel {
-                            pairs: Vec::new(),
-                            ..prepared.model.clone()
-                        });
-                let fitted = pair::fit(
-                    &inputs,
-                    knotless
-                        .as_ref()
-                        .or(current.get(&area).map(|prepared| &prepared.model)),
-                    caches.entry(area).or_default(),
-                );
+                // Cold: nothing from the area's previous model, the fixed point sought from each
+                // timebase's default noise and no rate.
+                let warm = current
+                    .get(&area)
+                    .filter(|_| !options.cold)
+                    .map(|prepared| &prepared.model);
+                let fitted = pair::fit(&inputs, warm, caches.entry(area).or_default());
                 path.sync_ns += started.elapsed().as_nanos();
                 path.refits += 1;
                 let fitted = match fitted {
@@ -1284,35 +1275,70 @@ fn the_same_batches_in_any_order_and_copies_publish_the_same_models() -> Result 
     Ok(())
 }
 
-/// A refit whose pairs are fitted from their knots in the area's previous model (the cutoff passes
-/// alone) publishes the same model bytes as one whose pairs are fitted from the closed-form start
-/// (the medians' line and the Huber passes first), at every area and edge: the warm start changes
-/// where each pair's optimum is sought from, never which one is found.
+/// A warm refit (its fixed point sought from the area's previous model's noise and rates) and a
+/// cold one (from each timebase's default noise and no rate, nothing of the previous model) of the
+/// same inputs both publish models their verifier passes, with the same clocks and the same valid
+/// pairs, each clock's noise within the verifier's band of the other's: the warm start changes
+/// where the fixed point is sought from and may change the bytes (the noise held within
+/// `NOISE_HOLD` of its estimate), never which pairs are published or whether a model is honest.
 #[test]
 fn a_warm_refit_publishes_what_a_cold_refit_publishes() -> Result {
     let scenario = world_density(9000, 20.0);
     let mut simulation = sim::run(&scenario);
     let arrivals = sim::arrivals(&mut simulation, scenario.seed);
     let sites = simulation.sites();
-    let run = |cold: bool| {
+    let run = |cold: bool| -> Result<(Ran, Path)> {
         let options = Options {
             verify_every: usize::MAX,
             keep: true,
             cold,
         };
-        areas(
+        let mut path = Path::default();
+        let ran = areas(
             &scenario,
             &simulation,
             &sites,
             &arrivals,
             options,
-            &mut Path::default(),
-        )
+            &mut path,
+        )?;
+        Ok((ran, path))
     };
-    let (warm, cold) = (run(false)?, run(true)?);
+    let ((warm, warm_path), (cold, cold_path)) = (run(false)?, run(true)?);
+    assert_eq!(
+        warm_path.models_refused, 0,
+        "{:?}",
+        warm_path.model_failures
+    );
+    assert_eq!(
+        cold_path.models_refused, 0,
+        "{:?}",
+        cold_path.model_failures
+    );
     assert_eq!(warm.models.len(), cold.models.len());
     for (at, bytes) in &warm.models {
-        assert_eq!(Some(bytes), cold.models.get(at), "{at:?}");
+        let other = cold
+            .models
+            .get(at)
+            .ok_or_else(|| format!("{at:?} not fitted cold"))?;
+        let (a, b) = (
+            publish::decode_pairs(bytes).map_err(text)?,
+            publish::decode_pairs(other).map_err(text)?,
+        );
+        let pairs = |model: &PairModel| -> Vec<(u32, u32)> {
+            model.pairs.iter().map(|pair| (pair.a, pair.b)).collect()
+        };
+        assert_eq!(pairs(&a), pairs(&b), "{at:?}");
+        assert_eq!(a.clocks.len(), b.clocks.len(), "{at:?}");
+        for (x, y) in a.clocks.iter().zip(&b.clocks) {
+            assert_eq!(x.key, y.key, "{at:?}");
+            assert!(
+                (x.noise_ns - y.noise_ns).abs() <= crate::verify::NOISE_BAND * y.noise_ns,
+                "{at:?}: noise {} warm, {} cold",
+                x.noise_ns,
+                y.noise_ns
+            );
+        }
     }
     assert!(warm.models.len() >= 60, "{} models", warm.models.len());
     Ok(())

@@ -1,0 +1,36 @@
+diff --git a/crates/load/src/feeders.rs b/crates/load/src/feeders.rs
+index a745702..680d783 100644
+--- a/crates/load/src/feeders.rs
++++ b/crates/load/src/feeders.rs
+@@ -76,6 +76,7 @@ pub fn spawn(run: Run, counts: Arc<Counts>, start: tokio::time::Instant) {
+         .map_or(0, |since| since.as_millis() as u64)
+         .saturating_sub(start.elapsed().as_millis() as u64);
+     // The simulation runs a few seconds ahead of this clock (`Traffic::begin`).
++    eprintln!("TALLY-LOAD-START unix_ms={start_unix_ms}");
+     traffic.begin(start.into_std());
+     // A feeder on a relay at a loopback address connects from one of its own (`Networks`).
+     let loopback = relays.iter().all(|relay| {
+diff --git a/crates/relay/src/hub.rs b/crates/relay/src/hub.rs
+index 5871267..b3bc219 100644
+--- a/crates/relay/src/hub.rs
++++ b/crates/relay/src/hub.rs
+@@ -3679,6 +3679,19 @@ impl Hub {
+     /// Forwards verified positions by `engine` if they are new (`strikes`), as this relay's own.
+     /// True when they were.
+     pub fn publish_positions(&self, source: u64, positions: Positions) -> bool {
++        // RFC-0198 baseline only: every raw-form fix this relay publishes to TALLY_RELAY_FIXES_CSV.
++        static DUMP: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
++        if let Some(file) = DUMP.get_or_init(|| std::env::var("TALLY_RELAY_FIXES_CSV").ok().and_then(|path| std::fs::File::create(path).ok()).map(std::sync::Mutex::new))
++            && let Ok(content) = positions.fixes()
++            && let Ok(mut file) = file.lock()
++        {
++            use std::io::Write as _;
++            let mut text = String::new();
++            for fix in &content.fixes {
++                text.push_str(&format!("{:06X},{:.6},{:.7},{:.7}\n", fix.address, fix.transmitted.unix_ms as f64 / 1000.0 + f64::from(fix.transmitted.sub_ms_ps) * 1e-15, f64::from(fix.lat_e7) * 1e-7, f64::from(fix.lon_e7) * 1e-7));
++            }
++            let _ = file.write_all(text.as_bytes());
++        }
+         self.take_positions(
+             source,
+             positions,

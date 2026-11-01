@@ -1,0 +1,107 @@
+diff --git a/crates/mlat-solver/src/pair.rs b/crates/mlat-solver/src/pair.rs
+index d8cf747..73cca03 100644
+--- a/crates/mlat-solver/src/pair.rs
++++ b/crates/mlat-solver/src/pair.rs
+@@ -21,6 +21,9 @@ use crate::sync::{self, ReadCache};
+ use crate::verify::PairModelFailure;
+ 
+ mod blocks;
++/// Measurement only (RFC-0198): nanoseconds by phase.
++pub static PROF: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
++pub(crate) fn prof(i: usize, t: std::time::Instant) { PROF[i].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
+ 
+ use blocks::{BlockCache, Kept, PairBlock, Raw, Step};
+ pub use blocks::{LINE_BLOCKS, LINE_LEAST, READ_BACK_MS};
+@@ -309,7 +312,10 @@ impl Window {
+             blocks,
+         } = cache;
+         let network = PairCache::network_of(network, blocks, inputs.area, &inputs.scope);
++        let t0 = std::time::Instant::now();
+         let reader = sync::Reader::new(inputs, read);
++        prof(0, t0);
++        let t1 = std::time::Instant::now();
+         let first_ms = inputs.trailing.first_ms();
+         let (first, end) = (first_ms / 1000, inputs.trailing.edge_ms / 1000);
+         // The window's clocks: those heard in its own seconds, each with its lowest count there
+@@ -371,7 +377,9 @@ impl Window {
+             })
+             .collect();
+         let mut raw = Raw::new(reader, window_of, above);
++        prof(1, t1);
+         let (built, reused) = blocks.update(&mut raw, &clocks, (first, end));
++        let t4 = std::time::Instant::now();
+         let mut events = 0;
+         let mut found: FoundBlocks = BTreeMap::new();
+         for second in first..end {
+@@ -388,6 +396,7 @@ impl Window {
+                 }
+             }
+         }
++        prof(4, t4);
+         // A pair with fewer points than a span needs is never valid.
+         found.retain(|_, list| {
+             list.iter()
+@@ -1581,8 +1590,10 @@ pub fn fit(
+         }
+     }
+     let all: Vec<u32> = (0..window.keys.len() as u32).collect();
++    let t5 = std::time::Instant::now();
+     let (outcomes, from) = settle(&window, &mut raw, &all);
+     raw.finish();
++    prof(5, t5);
+     let valid: Vec<(u32, &PairSums)> = outcomes
+         .iter()
+         .filter_map(|(at, outcome)| match outcome {
+diff --git a/crates/mlat-solver/src/pair/blocks.rs b/crates/mlat-solver/src/pair/blocks.rs
+index 1064edf..f5e2cc8 100644
+--- a/crates/mlat-solver/src/pair/blocks.rs
++++ b/crates/mlat-solver/src/pair/blocks.rs
+@@ -579,7 +579,10 @@ impl BlockCache {
+         clocks: &[Clock],
+         (first, end): (u64, u64),
+     ) -> (usize, usize) {
++        let t2 = std::time::Instant::now();
+         let digests = self.digests(&raw.reader);
++        super::prof(2, t2);
++        let t3 = std::time::Instant::now();
+         let of = |second: u64| digests.get(&second).copied().unwrap_or(0);
+         self.seconds
+             .retain(|second, _| (first..end).contains(second));
+@@ -621,6 +624,7 @@ impl BlockCache {
+                 },
+             );
+         }
++        super::prof(3, t3);
+         (built, reused)
+     }
+ 
+diff --git a/crates/mlat-solver/src/pair_tests.rs b/crates/mlat-solver/src/pair_tests.rs
+index 88ac4ab..5da0300 100644
+--- a/crates/mlat-solver/src/pair_tests.rs
++++ b/crates/mlat-solver/src/pair_tests.rs
+@@ -1766,6 +1766,7 @@ fn grouping_and_normalising_are_invariant_to_reception_order() -> Result {
+     Ok(())
+ }
+ 
++thread_local! { static PTS: std::cell::RefCell<(usize,usize,usize,usize,usize,usize,usize)> = const { std::cell::RefCell::new((0,0,0,0,0,0,0)) }; }
+ /// What a refit costs, split as an engine pays it (`tally_mlat::fix::refit`): gathering an area's
+ /// window from what has arrived (`Arrived::area_inputs_over`), reading it (`pair::Stats::read_ns`)
+ /// and fitting it (`pair::Stats::fit_ns`); each area's whole refit against its points, by least
+@@ -1818,6 +1819,7 @@ fn a_refits_cost_follows_its_points() -> Result {
+                 if now >= measured_from {
+                     gather_ns += gathered;
+                     read_ns += u128::from(fitted.stats.read_ns);
++                    PTS.with(|c| { let mut c = c.borrow_mut(); c.0 += fitted.stats.points; c.1 += fitted.stats.valid; c.2 += fitted.stats.events; c.3 += fitted.stats.clocks; c.4 += fitted.stats.inliers; c.5 += fitted.stats.blocks_built; c.6 += fitted.stats.blocks_reused; });
+                     fit_ns += u128::from(fitted.stats.fit_ns);
+                     refits += 1;
+                     points += inputs.sync.len();
+@@ -1861,6 +1863,9 @@ fn a_refits_cost_follows_its_points() -> Result {
+         slope,
+         intercept / 1e6,
+     );
++    let p: Vec<f64> = crate::pair::PROF.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6).collect();
++    eprintln!("PROF ms over every refit (incl. warm-up): reader {:.0}, clocks+above {:.0}, digests {:.0}, block build {:.0}, gather blocks {:.0}, settle {:.0}", p[0], p[1], p[2], p[3], p[4], p[5]);
++    PTS.with(|c| { let c = c.borrow(); let r = refits.max(1) as f64; eprintln!("PTS a refit: pair points {:.0}, valid pairs {:.1}, points a pair {:.1}, inliers {:.0}, events {:.0}, clocks {:.1}, blocks built {:.2}, reused {:.2}", c.0 as f64 / r, c.1 as f64 / r, c.0 as f64 / c.1.max(1) as f64, c.4 as f64 / r, c.2 as f64 / r, c.3 as f64 / r, c.5 as f64 / r, c.6 as f64 / r); });
+     assert!(refits > 0, "no refit measured");
+     Ok(())
+ }
