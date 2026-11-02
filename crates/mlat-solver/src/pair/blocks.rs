@@ -423,6 +423,17 @@ pub(super) struct Raw<'r> {
     runs: BTreeMap<((u32, u32), u64), Run>,
     #[cfg(tally_refit_probe)]
     builds: u64,
+    /// The re-read probe's: each second's formed points' digest this refit, the last refit's, and
+    /// each second's receptions read.
+    #[cfg(tally_refit_probe)]
+    formed: BTreeMap<u64, Digest>,
+    #[cfg(tally_refit_probe)]
+    formed_before: BTreeMap<u64, Digest>,
+    #[cfg(tally_refit_probe)]
+    per_second: BTreeMap<u64, u64>,
+    /// The seconds a digest of sync receptions alone would read again.
+    #[cfg(tally_refit_probe)]
+    reread_sync: std::collections::BTreeSet<u64>,
 }
 
 impl<'r> Raw<'r> {
@@ -438,6 +449,14 @@ impl<'r> Raw<'r> {
             runs: BTreeMap::new(),
             #[cfg(tally_refit_probe)]
             builds: 0,
+            #[cfg(tally_refit_probe)]
+            formed: BTreeMap::new(),
+            #[cfg(tally_refit_probe)]
+            formed_before: BTreeMap::new(),
+            #[cfg(tally_refit_probe)]
+            per_second: BTreeMap::new(),
+            #[cfg(tally_refit_probe)]
+            reread_sync: std::collections::BTreeSet::new(),
         }
     }
 
@@ -485,6 +504,46 @@ impl<'r> Raw<'r> {
                 let ns = probe::since(P::formation_ns, started);
                 if self.reread.contains(&second) {
                     probe::add(P::oracle_formation_ns, ns);
+                }
+                // The formed points' digest, by their own words (window clock indices move between
+                // refits; the counts do not), summed so their order does not matter.
+                let mut formed: Digest = self.seconds[&second].events as Digest;
+                for list in self.seconds[&second].pairs.values() {
+                    for p in list {
+                        let words = [
+                            p.la as u64,
+                            p.lb as u64,
+                            p.range_a.to_bits(),
+                            p.range_b.to_bits(),
+                            u64::from(p.hearers) << 32 | u64::from(p.address),
+                        ];
+                        formed = formed.wrapping_add(
+                            u128::from(lane(0x5eed, &words)) << 64
+                                | u128::from(lane(0xfeed, &words)),
+                        );
+                    }
+                }
+                self.formed.insert(second, formed);
+                if self.reread_sync.contains(&second) {
+                    probe::add(P::oracle_formation_sync_ns, ns);
+                }
+                if self.reread.contains(&second) && !self.reread_sync.contains(&second) {
+                    probe::add(P::status_only_formed, 1);
+                    if self.formed_before.get(&second) != Some(&formed) {
+                        probe::add(P::status_only_points_changed, 1);
+                    }
+                }
+                if self.reread.contains(&second) {
+                    let rx = self.per_second.get(&second).copied().unwrap_or(0);
+                    probe::add(P::rr_formed_seconds, 1);
+                    probe::add(P::rr_formed_rx, rx);
+                    if self.formed_before.get(&second) == Some(&formed) {
+                        probe::add(P::rr_formed_identical, 1);
+                        probe::add(P::rr_formed_identical_rx, rx);
+                    } else {
+                        probe::add(P::oracle_formation_changed_ns, ns);
+                        probe::add(P::rx_reread_changed, rx);
+                    }
                 }
             }
         }
@@ -741,6 +800,19 @@ pub(super) struct BlockCache {
     /// The per-pair oracle's: each held block's digest of its pair's pooled points.
     #[cfg(tally_refit_probe)]
     pair_digests: BTreeMap<u64, BTreeMap<(ClockKey, ClockKey), Digest>>,
+    /// The re-read probe's: each second's reception identities at the last update (sorted, wall
+    /// clock left out), where each identity was, and each second's formed points' digest.
+    #[cfg(tally_refit_probe)]
+    ids: BTreeMap<u64, Vec<u64>>,
+    #[cfg(tally_refit_probe)]
+    where_was: std::collections::HashMap<u64, u64>,
+    #[cfg(tally_refit_probe)]
+    status_was: std::collections::HashSet<u64>,
+    #[cfg(tally_refit_probe)]
+    formed: BTreeMap<u64, Digest>,
+    /// Each second's digest of its sync receptions alone at the last update.
+    #[cfg(tally_refit_probe)]
+    previous_sync: BTreeMap<u64, Digest>,
 }
 
 impl Default for BlockCache {
@@ -761,6 +833,16 @@ impl Default for BlockCache {
             edge: None,
             #[cfg(tally_refit_probe)]
             pair_digests: BTreeMap::new(),
+            #[cfg(tally_refit_probe)]
+            ids: BTreeMap::new(),
+            #[cfg(tally_refit_probe)]
+            where_was: std::collections::HashMap::new(),
+            #[cfg(tally_refit_probe)]
+            status_was: std::collections::HashSet::new(),
+            #[cfg(tally_refit_probe)]
+            formed: BTreeMap::new(),
+            #[cfg(tally_refit_probe)]
+            previous_sync: BTreeMap::new(),
         }
     }
 }
@@ -968,6 +1050,9 @@ impl BlockCache {
         {
             probe::add(P::blocks_reused, reused as u64);
             self.edge = Some(end);
+            self.formed.append(&mut raw.formed);
+            let low = first.saturating_sub(READ_BACK_MS / 1000);
+            self.formed.retain(|second, _| *second >= low);
         }
         (built, reused)
     }
@@ -998,6 +1083,67 @@ impl BlockCache {
                 .any(|c| *c + sync::LOOK_BACK_S >= second && *c <= second + READ_AFTER_S)
         };
         raw.reread = per_second.keys().copied().filter(|s| again(*s)).collect();
+        self.classify(raw, digests, &changed, &per_second);
+        // The same rule over a digest of each second's sync receptions alone.
+        let mut sync_digests: BTreeMap<u64, Digest> = BTreeMap::new();
+        for at in 0..raw.reader.rxs.len() {
+            let (message, wall_ms, linear, epoch) = {
+                let rx = &raw.reader.rxs[at];
+                (rx.message, rx.wall_ms, rx.linear, rx.epoch)
+            };
+            if raw.reader.is_status(message) {
+                continue;
+            }
+            let hash = raw.reader.hash(message);
+            let hashed =
+                |at: usize| u64::from_le_bytes(hash[at..at + 8].try_into().unwrap_or([0; 8]));
+            let key = raw.reader.rxs[at].receiver.as_bytes();
+            let word = |at: usize| u64::from_le_bytes(key[at..at + 8].try_into().unwrap_or([0; 8]));
+            let words = [
+                word(0),
+                word(8),
+                u64::from(epoch),
+                linear as u64,
+                wall_ms,
+                hashed(0),
+                hashed(8),
+            ];
+            let one =
+                u128::from(lane(self.key[0], &words)) << 64 | u128::from(lane(self.key[1], &words));
+            let entry = sync_digests.entry(wall_ms / 1000).or_insert(0);
+            *entry = entry.wrapping_add(one);
+        }
+        let changed_sync: Vec<u64> = sync_digests
+            .iter()
+            .filter(|(second, digest)| self.previous_sync.get(second) != Some(digest))
+            .map(|(second, _)| *second)
+            .chain(
+                self.previous_sync
+                    .keys()
+                    .filter(|second| !sync_digests.contains_key(second))
+                    .copied(),
+            )
+            .collect();
+        raw.reread_sync = per_second
+            .keys()
+            .copied()
+            .filter(|second| {
+                changed_sync
+                    .iter()
+                    .any(|c| *c + sync::LOOK_BACK_S >= *second && *c <= *second + READ_AFTER_S)
+            })
+            .collect();
+        probe::add(
+            P::receptions_reread_sync,
+            per_second
+                .iter()
+                .filter(|(second, _)| raw.reread_sync.contains(second))
+                .map(|(_, count)| count)
+                .sum(),
+        );
+        self.previous_sync = sync_digests;
+        raw.per_second = per_second.clone();
+        raw.formed_before = self.formed.clone();
         let total: u64 = per_second.values().sum();
         let again_rx: u64 = per_second
             .iter()
@@ -1009,6 +1155,214 @@ impl BlockCache {
         probe::add(P::seconds_read, per_second.len() as u64);
         probe::add(P::seconds_reread, raw.reread.len() as u64);
         self.previous = digests.clone();
+    }
+
+    /// The re-read probe's classes (RFC-0198 slice 1's second follow-up). A changed second is
+    /// `new` (not read last time), `dropped` (read last time, not now), `moved` (a reception of it
+    /// was in another second last time, or is in another now), `late` (receptions added, none
+    /// removed), `removed`, `both`, or `wall` (the same receptions, a wall clock changed). A
+    /// re-read second's cause is its own class when it changed, else that of the changed second
+    /// nearest it (the later on a tie).
+    #[cfg(tally_refit_probe)]
+    fn classify(
+        &mut self,
+        raw: &mut Raw<'_>,
+        digests: &BTreeMap<u64, Digest>,
+        changed: &[u64],
+        per_second: &BTreeMap<u64, u64>,
+    ) {
+        let mut ids: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        let mut receivers: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        let mut status: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for at in 0..raw.reader.rxs.len() {
+            let rx = &raw.reader.rxs[at];
+            let (message, wall_ms) = (rx.message, rx.wall_ms);
+            let key = rx.receiver.as_bytes();
+            let word = |at: usize| u64::from_le_bytes(key[at..at + 8].try_into().unwrap_or([0; 8]));
+            let hash = raw.reader.hash(rx.message);
+            let hashed =
+                |at: usize| u64::from_le_bytes(hash[at..at + 8].try_into().unwrap_or([0; 8]));
+            let words = [
+                word(0),
+                word(8),
+                word(16),
+                word(24),
+                u64::from(rx.epoch),
+                rx.linear as u64,
+                hashed(0),
+                hashed(8),
+                hashed(16),
+            ];
+            let id = lane(self.key[0], &words);
+            ids.entry(wall_ms / 1000).or_default().push(id);
+            receivers.insert(id, word(0));
+            if raw.reader.is_status(message) {
+                status.insert(id);
+            }
+        }
+        for id in self.status_was.iter() {
+            status.insert(*id);
+        }
+        for list in ids.values_mut() {
+            list.sort_unstable();
+        }
+        let mut where_now: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+        for (second, list) in &ids {
+            for id in list {
+                where_now.insert(*id, *second);
+            }
+        }
+        let mut class: BTreeMap<u64, usize> = BTreeMap::new();
+        const NEW: usize = 0;
+        const DROPPED: usize = 1;
+        const MOVED: usize = 2;
+        const LATE_SYNC: usize = 3;
+        const LATE_STATUS: usize = 4;
+        const REMOVED_SYNC: usize = 5;
+        const REMOVED_STATUS: usize = 6;
+        const BOTH: usize = 7;
+        const WALL: usize = 8;
+        let chg = [
+            P::chg_new,
+            P::chg_dropped,
+            P::chg_moved,
+            P::chg_late_sync,
+            P::chg_late_status,
+            P::chg_removed_sync,
+            P::chg_removed_status,
+            P::chg_both,
+            P::chg_wall,
+        ];
+        let rr_sec = [
+            P::rr_sec_new,
+            P::rr_sec_dropped,
+            P::rr_sec_moved,
+            P::rr_sec_late_sync,
+            P::rr_sec_late_status,
+            P::rr_sec_removed_sync,
+            P::rr_sec_removed_status,
+            P::rr_sec_both,
+            P::rr_sec_wall,
+        ];
+        let rr_rx = [
+            P::rr_rx_new,
+            P::rr_rx_dropped,
+            P::rr_rx_moved,
+            P::rr_rx_late_sync,
+            P::rr_rx_late_status,
+            P::rr_rx_removed_sync,
+            P::rr_rx_removed_status,
+            P::rr_rx_both,
+            P::rr_rx_wall,
+        ];
+        for second in changed {
+            let before = self.ids.get(second);
+            let now = ids.get(second);
+            let which = match (before, now) {
+                (None, _) if !digests.contains_key(second) => DROPPED,
+                (None, _) => NEW,
+                (Some(_), None) => DROPPED,
+                (Some(before), Some(now)) => {
+                    let added: Vec<u64> = now
+                        .iter()
+                        .filter(|id| before.binary_search(id).is_err())
+                        .copied()
+                        .collect();
+                    let removed: Vec<u64> = before
+                        .iter()
+                        .filter(|id| now.binary_search(id).is_err())
+                        .copied()
+                        .collect();
+                    let added_status = added.iter().filter(|id| status.contains(id)).count();
+                    let removed_status = removed.iter().filter(|id| status.contains(id)).count();
+                    probe::add(P::rx_added_status, added_status as u64);
+                    probe::add(P::rx_added_sync, (added.len() - added_status) as u64);
+                    probe::add(P::rx_removed_status, removed_status as u64);
+                    probe::add(P::rx_removed_sync, (removed.len() - removed_status) as u64);
+                    let moved = added
+                        .iter()
+                        .filter(|id| self.where_was.get(id).is_some_and(|s| s != second))
+                        .count()
+                        + removed
+                            .iter()
+                            .filter(|id| where_now.get(id).is_some_and(|s| s != second))
+                            .count();
+                    probe::add(P::rx_moved, moved as u64);
+                    if !added.is_empty() && moved == 0 {
+                        let distinct: std::collections::HashSet<u64> = added
+                            .iter()
+                            .filter_map(|id| receivers.get(id))
+                            .copied()
+                            .collect();
+                        probe::add(P::late_receivers, distinct.len() as u64);
+                        probe::add(P::late_seconds, 1);
+                        let age = self.edge.unwrap_or(*second).saturating_sub(*second);
+                        probe::add(
+                            match age {
+                                0..2 => P::late_age_0_2,
+                                2..4 => P::late_age_2_4,
+                                4..8 => P::late_age_4_8,
+                                8..16 => P::late_age_8_16,
+                                16..20 => P::late_age_16_20,
+                                _ => P::late_age_20_up,
+                            },
+                            1,
+                        );
+                    }
+                    if !removed.is_empty() && moved == 0 {
+                        let age = self.edge.unwrap_or(*second).saturating_sub(*second);
+                        probe::add(
+                            match age {
+                                0..2 => P::removed_age_0_2,
+                                2..4 => P::removed_age_2_4,
+                                4..8 => P::removed_age_4_8,
+                                8..16 => P::removed_age_8_16,
+                                16..20 => P::removed_age_16_20,
+                                _ => P::removed_age_20_up,
+                            },
+                            1,
+                        );
+                    }
+                    if moved > 0 {
+                        MOVED
+                    } else if added.is_empty() && removed.is_empty() {
+                        WALL
+                    } else if removed.is_empty() && added_status == added.len() {
+                        LATE_STATUS
+                    } else if removed.is_empty() {
+                        LATE_SYNC
+                    } else if added.is_empty() && removed_status == removed.len() {
+                        REMOVED_STATUS
+                    } else if added.is_empty() {
+                        REMOVED_SYNC
+                    } else {
+                        BOTH
+                    }
+                }
+            };
+            probe::add(chg[which], 1);
+            class.insert(*second, which);
+        }
+        for (second, count) in per_second {
+            if !raw.reread.contains(second) {
+                continue;
+            }
+            let which = class.get(second).copied().or_else(|| {
+                (1..=READ_AFTER_S.max(sync::LOOK_BACK_S)).find_map(|d| {
+                    class
+                        .get(&(second + d))
+                        .or_else(|| second.checked_sub(d).and_then(|s| class.get(&s)))
+                        .copied()
+                })
+            });
+            if let Some(which) = which {
+                probe::add(rr_sec[which], 1);
+                probe::add(rr_rx[which], *count);
+            }
+        }
+        self.where_was = where_now;
+        self.ids = ids;
+        self.status_was = status;
     }
 
     /// The second's blocks.

@@ -702,6 +702,13 @@ impl<'r> Reader<'r> {
         self.messages.hash(message)
     }
 
+    /// The re-read probe's: whether `message` is a status message (a NACp and no position).
+    #[cfg(tally_refit_probe)]
+    pub(crate) fn is_status(&mut self, message: u32) -> bool {
+        let parsed = self.messages.parsed(message);
+        parsed.nacp.is_some() && parsed.position.is_none()
+    }
+
     /// The wall-clock span a block of second `second` reads: from `LOOK_BACK_S` before it to
     /// `SPAN_AFTER_S` after, milliseconds.
     fn read_span(second: u64) -> (u64, u64) {
