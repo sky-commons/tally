@@ -1815,6 +1815,9 @@ fn a_refits_cost_follows_its_points() -> Result {
     };
     let measured_from = first.at_ms + TRAILING_WINDOW_MS + REFIT_EVERY_MS;
     let (mut gather_ns, mut read_ns, mut fit_ns) = (0u128, 0u128, 0u128);
+    // The probe's counters at the first measured refit, so warm-up refits are left out.
+    #[cfg(tally_refit_probe)]
+    let mut probe_base: Option<Vec<(&str, u64)>> = None;
     let (mut refits, mut points) = (0usize, 0usize);
     // Each measured refit's points and whole cost, nanoseconds.
     let mut samples: Vec<(f64, f64)> = Vec::new();
@@ -1831,6 +1834,10 @@ fn a_refits_cost_follows_its_points() -> Result {
                 span_ms: TRAILING_WINDOW_MS as u32,
                 ..Trailing::fitted_at(now)
             };
+            #[cfg(tally_refit_probe)]
+            if now >= measured_from && probe_base.is_none() {
+                probe_base = Some(crate::probe::snapshot());
+            }
             for area in sites.areas().map(|(area, _)| *area).collect::<Vec<_>>() {
                 let (cache, warm) = caches.entry(area).or_default();
                 let started = Instant::now();
@@ -1838,9 +1845,39 @@ fn a_refits_cost_follows_its_points() -> Result {
                     continue;
                 };
                 let gathered = started.elapsed().as_nanos();
+                #[cfg(tally_refit_probe)]
+                if now >= measured_from {
+                    crate::probe::add(
+                        crate::probe::P::gather_ns,
+                        u64::try_from(gathered).unwrap_or(u64::MAX),
+                    );
+                }
                 let Ok(fitted) = pair::fit(&inputs, warm.as_ref(), cache) else {
                     continue;
                 };
+                // The probe's cold shadow, as the relay runs it (`tally_mlat::fix`).
+                #[cfg(tally_refit_probe)]
+                if now >= measured_from {
+                    let hashed = format!("{area:?}")
+                        .bytes()
+                        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+                            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+                        });
+                    if crate::probe::shadow_due(hashed, now) {
+                        let started = Instant::now();
+                        let cold = crate::probe::shadowing(|| {
+                            pair::fit(&inputs, warm.as_ref(), &mut PairCache::default())
+                        });
+                        crate::probe::add_shadow(
+                            crate::probe::P::shadow_ns,
+                            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        );
+                        crate::probe::add_shadow(crate::probe::P::shadow_runs, 1);
+                        if cold.map(|cold| cold.model) != Ok(fitted.model.clone()) {
+                            crate::probe::add_shadow(crate::probe::P::shadow_mismatches, 1);
+                        }
+                    }
+                }
                 if now >= measured_from {
                     gather_ns += gathered;
                     read_ns += u128::from(fitted.stats.read_ns);
@@ -1887,6 +1924,18 @@ fn a_refits_cost_follows_its_points() -> Result {
         slope,
         intercept / 1e6,
     );
+    #[cfg(tally_refit_probe)]
+    {
+        let base = probe_base.unwrap_or_default();
+        let measured: Vec<(&str, u64)> = crate::probe::snapshot()
+            .into_iter()
+            .map(|(name, value)| {
+                let before = base.iter().find(|(b, _)| *b == name).map_or(0, |(_, v)| *v);
+                (name, value - before)
+            })
+            .collect();
+        eprintln!("PROBE {measured:?}");
+    }
     assert!(refits > 0, "no refit measured");
     Ok(())
 }

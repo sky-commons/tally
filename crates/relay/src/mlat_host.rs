@@ -2103,6 +2103,11 @@ impl Host {
         let stepped: Option<Step> = lock(&self.shared.engine)
             .as_mut()
             .map(|engine| engine.step(step, &self.signer));
+        #[cfg(tally_refit_probe)]
+        if let Some(engine) = lock(&self.shared.engine).as_ref() {
+            tally_mlat_solver::probe::set_memory(engine.bytes_parts());
+            tally_mlat_solver::probe::dump_if_due();
+        }
         let ran_ms = self.shared.clock.ran_ms(started);
         drop(reserved);
         self.settle_arrived();

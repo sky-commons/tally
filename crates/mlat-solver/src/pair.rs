@@ -309,7 +309,13 @@ impl Window {
             blocks,
         } = cache;
         let network = PairCache::network_of(network, blocks, inputs.area, &inputs.scope);
+        #[cfg(tally_refit_probe)]
+        let started = std::time::Instant::now();
         let reader = sync::Reader::new(inputs, read);
+        #[cfg(tally_refit_probe)]
+        crate::probe::since(crate::probe::P::reader_ns, started);
+        #[cfg(tally_refit_probe)]
+        let started = std::time::Instant::now();
         let first_ms = inputs.trailing.first_ms();
         let (first, end) = (first_ms / 1000, inputs.trailing.edge_ms / 1000);
         // The window's clocks: those heard in its own seconds, each with its lowest count there
@@ -371,7 +377,11 @@ impl Window {
             })
             .collect();
         let mut raw = Raw::new(reader, window_of, above);
+        #[cfg(tally_refit_probe)]
+        crate::probe::since(crate::probe::P::clocks_ns, started);
         let (built, reused) = blocks.update(&mut raw, &clocks, (first, end));
+        #[cfg(tally_refit_probe)]
+        let started = std::time::Instant::now();
         let mut events = 0;
         let mut found: FoundBlocks = BTreeMap::new();
         for second in first..end {
@@ -395,6 +405,8 @@ impl Window {
                 .sum::<usize>()
                 >= sync::SPAN_RECEPTIONS_LEAST
         });
+        #[cfg(tally_refit_probe)]
+        crate::probe::since(crate::probe::P::blocks_gather_ns, started);
         let mut keys = Vec::with_capacity(found.len());
         let mut blocks_of = Vec::with_capacity(found.len());
         let mut slots = HashMap::with_capacity(found.len());
@@ -1510,6 +1522,18 @@ pub struct PairCache {
 }
 
 impl PairCache {
+    /// The probe's split of `bytes`: the read's memos, the network with its scope, the blocks.
+    #[cfg(tally_refit_probe)]
+    pub fn bytes_parts(&self) -> [usize; 3] {
+        [
+            self.read.bytes(),
+            self.network.as_ref().map_or(0, |(_, scope, network)| {
+                tally_wire::footprint::vec::<Site>(scope.capacity()) + network.bytes()
+            }),
+            self.blocks.bytes(),
+        ]
+    }
+
     /// Bytes it holds, as allocated: the read's memos, the network with the scope it is of, and
     /// the blocks.
     pub fn bytes(&self) -> usize {
@@ -1581,8 +1605,20 @@ pub fn fit(
         }
     }
     let all: Vec<u32> = (0..window.keys.len() as u32).collect();
+    #[cfg(tally_refit_probe)]
+    let (settling, nested) = (std::time::Instant::now(), crate::probe::nested());
     let (outcomes, from) = settle(&window, &mut raw, &all);
     raw.finish();
+    // Settling less the cut blocks it rebuilt, which their phases count.
+    #[cfg(tally_refit_probe)]
+    crate::probe::add(
+        crate::probe::P::settle_ns,
+        u64::try_from(settling.elapsed().as_nanos())
+            .unwrap_or(u64::MAX)
+            .saturating_sub(crate::probe::nested() - nested),
+    );
+    #[cfg(tally_refit_probe)]
+    let passes_started = std::time::Instant::now();
     let valid: Vec<(u32, &PairSums)> = outcomes
         .iter()
         .filter_map(|(at, outcome)| match outcome {
@@ -1740,6 +1776,12 @@ pub fn fit(
                     (&rate_var, &common_var),
                     kappa,
                 );
+                #[cfg(tally_refit_probe)]
+                {
+                    crate::probe::since(crate::probe::P::passes_ns, passes_started);
+                    crate::probe::add(crate::probe::P::refits, 1);
+                    crate::probe::dump_if_due();
+                }
                 return Ok(Fitted { model, stats });
             }
             again[1] += 1;
