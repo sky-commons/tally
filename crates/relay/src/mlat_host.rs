@@ -668,18 +668,19 @@ pub const ENGINE_EDGES: usize =
 /// area's pair blocks and network, `tally_mlat_solver::PairCache`, and the read's memos the areas
 /// share, `pair::Reads`): measured in the world relay's load (`tally-load` at the seat test's plan,
 /// 2,000 feeders on the world relay's 16 cores, a refit-probe build's `Engine::bytes` by part read
-/// every second, three runs at 258 to 283 seats on 2026-11-02: 0.639 to 0.672 MB a seat at the
-/// most, the pair blocks 0.60 to 0.64 of it, the shared read's memos 0.03), with a fifth more.
-/// An area's memos grow with its members, its own receivers and every receiver they keep
-/// (`Sites::members`), and in that load an area has some fifteen times as many members as seats
-/// of its own, so the line is a seat's, not an area receiver's. Before (2026-10-30), 212,992 an
-/// area's receiver, measured on the reference simulation, whose areas' members are mostly their
-/// own: the load held 1.35 MB a seat (#37), each area's read memos a copy of every message its
-/// members heard, some twenty copies of each.
-pub const MEMOS_BYTES_PER_SEAT: usize = 800 << 10;
+/// every second, 2026-11-02): 0.747 MB a seat at the most at the 363 seats planned, the pair blocks
+/// 0.718 of it and the shared read's memos 0.022 (0.64 to 0.67 MB in four runs at 258 to 283
+/// seats: a seat keeps more pairs where the seats are denser), with a fifth more. An area's memos
+/// grow with its members, its own receivers and every receiver they keep (`Sites::members`), and
+/// in that load an area has some fifteen times as many members as seats of its own, so the line
+/// is a seat's, not an area receiver's. Before (2026-10-30), 212,992 an area's receiver, measured
+/// on the reference simulation, whose areas' members are mostly their own: the load held 1.35 MB
+/// a seat (#37), each area's read memos a copy of every message its members heard, some twenty
+/// copies of each.
+pub const MEMOS_BYTES_PER_SEAT: usize = 896 << 10;
 /// What the engine's own models take for each seat taking part, at most
 /// (`Engine::own_models_bytes`: each owned area's model at every edge it holds, [`ENGINE_EDGES`]):
-/// measured in the same runs as [`MEMOS_BYTES_PER_SEAT`] (0.230 to 0.237 MB a seat at the most),
+/// measured in the same runs as [`MEMOS_BYTES_PER_SEAT`] (0.230 to 0.240 MB a seat at the most),
 /// with a fifth more. An area's model holds its members' clocks and the pairs its receivers keep,
 /// so in that load it holds more for each seat than `models::MODEL_BYTES_PER_RECEIVER` (measured
 /// for each receiver of an area on the reference simulation) at every edge, which was planned
