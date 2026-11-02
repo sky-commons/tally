@@ -14,11 +14,13 @@ MEMORY=${MEMORY:-42949672960}
 log() { echo "$(date -u +%FT%TZ) $*" | tee -a "$OUT/slice1.log"; }
 quiet() { local q=0; while [ $q -lt 3 ]; do
     l=$(cut -d' ' -f1 /proc/loadavg); if awk -v l="$l" 'BEGIN{exit !(l<3)}'; then q=$((q+1)); else q=0; fi; sleep 60; done; }
-for r in $(seq 1 "${REPEATS:-3}"); do
+for r in $(seq "${FIRST:-1}" "${REPEATS:-3}"); do
   [ "${QUIET:-1}" = 1 ] && quiet
+  # Never beside another tally-load (another run's relay would share cores 0-15).
+  while pgrep -x tally-load > /dev/null; do sleep 30; done
   D=$OUT/relay-r$r; rm -rf "$D"; mkdir -p "$D/state"
   log "relay run $r (load $(cut -d' ' -f1-3 /proc/loadavg))"
-  python3 "$SCRIPTS/sample_probe.py" "$D/probe.json" 130 230 "$D/sample.json" > "$D/sample.out" 2>&1 &
+  python3 "$SCRIPTS/sample_probe.py" "$D/probe.json" 130 230 "$D/sample.json" "$D/state" > "$D/sample.out" 2>&1 &
   S=$!
   TALLY_REFIT_PROBE=$D/probe.json TALLY_RELAY=$RELAY "$TL" --relay-bin "$RELAY" --relay-mlat --relay-cores 16 --feeders 2000 \
     --ramp 60 --warmup 60 --duration 120 --state-dir "$D/state" \
