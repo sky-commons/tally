@@ -766,6 +766,46 @@ and fractions are what count; absolute times are loaded-host.
     shipped and 1.96 times its sensitivity point.
 
 
+**Per-pair invalidation, measured as an oracle (2026-11-02): no-go.** This was slice 1's
+follow-up, approved by the founder, and run under load.
+
+*A pair's inputs.* A block of pair `(a, b)` at second `s` is a deterministic function of its
+pooled points and the two timebases (`build`). The pooled points are the pair's points of `s` and
+the four seconds before it. Each point carries both counts, both ranges and the event's hearer
+count `h` (so its `w0`). Every other dependency reaches the block only through those points:
+- the events both clocks heard in `[s - 2, s + 3)`, look-back included;
+- the CPR reference and NACp that place an event's prior and admit it;
+- heard-twice;
+- deduplication moving a reception between seconds;
+- pooling into blocks `s + 1` to `s + 4`.
+
+So the oracle digests each block's pooled points, and rebuilds the block only when that digest
+changed. Reads and formation stay charged per changed second, because the points must be formed
+before their digest can be taken.
+
+*Five relay runs.*
+- Setup: tally-load at the world plan, the relay pinned to cores 0 to 15, the probe's quadrupled
+  `Arrived` store.
+- Acceptance: `arrived_over` and `unfitted` were 0 in every run.
+- Contention: every run shared the host with another agent's tally-load runs (one to seven other
+  relays on the same cores). So the same-run ratio is what counts.
+
+*Results.*
+- The ratios were 0.867, 0.861, 0.882, 0.862 and 0.875: a median of 0.867, against the go
+  threshold of 0.6. Slice 1's own oracle, measured in the same runs, read 0.927 to 0.941.
+- About 24% of pair blocks were rebuilt and 76% reused.
+- The digest cost 0.31 to 0.42 ms a refit, about 1% of the refit.
+- The changed pairs' builds cost 1.2 to 1.5 ms a refit.
+- Reads and formation of the changed seconds cost 21 to 26 ms a refit: 80% of the oracle.
+- The digest never kept a block that changed: 0 misses in 26.8 million pair blocks. About 0.1% of
+  the time it changed for a block that came out the same.
+- 430 cold shadows, 0 mismatches.
+
+*The lead.* Per-pair invalidation removes nearly all build work but not the reads and formation.
+Those are driven by 89% to 92% of receptions sitting in a second whose read span changed. What
+changes those seconds every refit, while three quarters of their pairs' points stay the same, is
+not established. It is the question to answer before any further design.
+
 ## Appendix D: what an exact-integer-sums RFC must specify
 
 This is recorded for slice 6, which this RFC does not propose. An RFC that proposes exact integer

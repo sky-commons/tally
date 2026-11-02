@@ -536,6 +536,38 @@ impl<'r> Raw<'r> {
         build(own, &pooled, timebases)
     }
 
+    /// The per-pair oracle's digest of block `own` of `pair`: every point it pools (the pair's points
+    /// of `own` and the `LINE_BLOCKS - 1` seconds before, each with its second), its counts,
+    /// ranges, hearers and address. A block is a function of exactly these and the pair's two
+    /// timebases (`build`), so an unchanged digest is an unchanged block. Everything a block
+    /// depends on beyond its own second (the look-back, the CPR reference and NACp that place its
+    /// events' priors, heard-twice, a reception moved between seconds, each event's hearer count)
+    /// reaches it only through these points.
+    #[cfg(tally_refit_probe)]
+    fn pair_digest(&mut self, pair: (u32, u32), own: u64, key: [u64; 2]) -> Digest {
+        let mut digest: Digest = 0;
+        for second in own.saturating_sub(LINE_BLOCKS - 1)..=own {
+            let Some(list) = self.second(second).pairs.get(&pair) else {
+                continue;
+            };
+            for p in list {
+                let words = [
+                    second,
+                    p.la as u64,
+                    p.lb as u64,
+                    p.range_a.to_bits(),
+                    p.range_b.to_bits(),
+                    u64::from(p.hearers) << 32 | u64::from(p.address),
+                ];
+                let one = u128::from(lane(key[0], &words)) << 64 | u128::from(lane(key[1], &words));
+                digest = digest
+                    .wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b)
+                    .wrapping_add(one);
+            }
+        }
+        digest
+    }
+
     /// The oracle's pooling (slice 3's ceiling, RFC-0198 §5): each pooled second's points of the
     /// pair as a run in the exact key's order (made once a refit, charged only for a second slice 3
     /// would read again), merged by that key, `x` recomputed in the block's frame, then an insertion
@@ -706,6 +738,9 @@ pub(super) struct BlockCache {
     previous: BTreeMap<u64, Digest>,
     #[cfg(tally_refit_probe)]
     edge: Option<u64>,
+    /// The per-pair oracle's: each held block's digest of its pair's pooled points.
+    #[cfg(tally_refit_probe)]
+    pair_digests: BTreeMap<u64, BTreeMap<(ClockKey, ClockKey), Digest>>,
 }
 
 impl Default for BlockCache {
@@ -724,6 +759,8 @@ impl Default for BlockCache {
             previous: BTreeMap::new(),
             #[cfg(tally_refit_probe)]
             edge: None,
+            #[cfg(tally_refit_probe)]
+            pair_digests: BTreeMap::new(),
         }
     }
 }
@@ -820,6 +857,9 @@ impl BlockCache {
         let of = |second: u64| digests.get(&second).copied().unwrap_or(0);
         self.seconds
             .retain(|second, _| (first..end).contains(second));
+        #[cfg(tally_refit_probe)]
+        self.pair_digests
+            .retain(|second, _| (first..end).contains(second));
         let (mut built, mut reused) = (0, 0);
         for second in first..end {
             // What it reads: its pooled seconds and theirs, from `READ_BACK_MS` before it to
@@ -852,14 +892,60 @@ impl BlockCache {
             );
             let events = raw.events(second);
             let mut pairs = BTreeMap::new();
+            #[cfg(tally_refit_probe)]
+            let mut digests_now: BTreeMap<(ClockKey, ClockKey), Digest> = BTreeMap::new();
             for (a, b) in raw.pairs(second) {
                 let (ca, cb) = (&clocks[a as usize], &clocks[b as usize]);
-                if let Some(block) =
-                    raw.block((a, b), second, (ca.timebase, cb.timebase), (None, None))
+                #[cfg(tally_refit_probe)]
+                let (started, formed, pooled) = (
+                    Instant::now(),
+                    probe::local(P::formation_ns),
+                    probe::local(P::oracle_runsort_ns) + probe::local(P::oracle_merge_ns),
+                );
+                let block = raw.block((a, b), second, (ca.timebase, cb.timebase), (None, None));
+                #[cfg(tally_refit_probe)]
                 {
+                    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    let build_ns = elapsed
+                        .saturating_sub(probe::local(P::formation_ns) - formed)
+                        .saturating_sub(
+                            probe::local(P::oracle_runsort_ns) + probe::local(P::oracle_merge_ns)
+                                - pooled,
+                        );
+                    let hashing = Instant::now();
+                    let digest = raw.pair_digest((a, b), second, self.key);
+                    probe::since(P::perpair_digest_ns, hashing);
+                    let key = (ca.key, cb.key);
+                    let was = self
+                        .pair_digests
+                        .get(&second)
+                        .and_then(|held| held.get(&key))
+                        .copied();
+                    let old_block = old.as_ref().and_then(|old| old.get(&key));
+                    let same = match (old_block, &block) {
+                        (Some(was), Some(now)) => same_block(was, now),
+                        _ => false,
+                    };
+                    if was == Some(digest) {
+                        probe::add(P::perpair_reused, 1);
+                        if old_block.is_some() && block.is_some() && !same {
+                            probe::add(P::perpair_digest_misses, 1);
+                        }
+                    } else {
+                        probe::add(P::perpair_rebuilt, 1);
+                        probe::add(P::perpair_build_ns, build_ns);
+                        if same {
+                            probe::add(P::perpair_digest_false, 1);
+                        }
+                    }
+                    digests_now.insert(key, digest);
+                }
+                if let Some(block) = block {
                     pairs.insert((ca.key, cb.key), Arc::new(block));
                 }
             }
+            #[cfg(tally_refit_probe)]
+            self.pair_digests.insert(second, digests_now);
             #[cfg(tally_refit_probe)]
             if let Some(old) = &old {
                 probe::add(P::pair_blocks_rebuilt, pairs.len() as u64);

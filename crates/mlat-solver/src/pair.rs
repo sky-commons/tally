@@ -1653,7 +1653,13 @@ fn fit_reading(
     let (settling, nested) = (std::time::Instant::now(), crate::probe::nested());
     let (outcomes, from) = settle(&window, &mut raw, &all);
     drop(raw);
-    // Settling less the cut blocks it rebuilt, which their phases count.
+    // Settling less the cut blocks it rebuilt, which their phases count; those builds, apart, are
+    // what the per-pair oracle still pays.
+    #[cfg(tally_refit_probe)]
+    crate::probe::add(
+        crate::probe::P::cut_build_ns,
+        crate::probe::nested() - nested,
+    );
     #[cfg(tally_refit_probe)]
     crate::probe::add(
         crate::probe::P::settle_ns,
