@@ -10,3 +10,9 @@ build:lint --@rules_rust//rust/settings:clippy_flag=-Dwarnings
 build:lint --build_manual_tests
 # The workspace's clippy.toml (its disallowed methods), as Cargo's clippy reads it.
 build:lint --@rules_rust//rust/settings:clippy.toml=//:clippy.toml
+
+# RFC-0198 slice 1 (#40): the refit probe and oracle, compiled in only here, never in a release
+# (`crates/mlat-solver/src/probe.rs`). Optimised, as every measurement of the relay is.
+#   bazel build --config=refit-probe //crates/load:tally-load //crates/relay:tally-relay
+build:refit-probe -c opt
+build:refit-probe --@rules_rust//rust/settings:extra_rustc_flag=--cfg=tally_refit_probe

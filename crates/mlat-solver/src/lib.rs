@@ -539,8 +539,9 @@
 //! start; from either start it passes its verifier, with the same pairs
 //! (`a_warm_refit_publishes_what_a_cold_refit_publishes`).
 //!
-//! **Jumps.** A pair's jump is the largest of its blocks' steps in the window's seconds, taken in
-//! ascending order of second, the earlier block's on ties. A block's
+//! **Jumps.** A pair's jump is the largest of its blocks' steps in the window's seconds, taken
+//! block by block in ascending second and each block's steps in ascending second, the first kept
+//! on a tie. A block's
 //! step is, in its pooled points' order, the change between the medians of the `sync::JUMP_SIDE`
 //! (5) residuals about its line before and after a point, scored against the residuals'
 //! consecutive scatter (`1.4826 * median |r_{i+1} - r_i| / sqrt 2`, at least 10 ns, times the
@@ -714,6 +715,9 @@ pub mod linalg;
 pub mod modes;
 pub mod obs;
 pub mod pair;
+/// RFC-0198 slice 1's refit probe: only with `--cfg tally_refit_probe`, never in a release.
+#[cfg(tally_refit_probe)]
+pub mod probe;
 pub mod publish;
 pub mod scope;
 pub mod sim;

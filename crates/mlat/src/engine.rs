@@ -412,6 +412,58 @@ impl Engine {
             })
     }
 
+    /// The probe's split of `bytes` (RFC-0198 slice 1, #37), by part, the areas' memos split into
+    /// the read's, the networks and the blocks, and the seats taking part.
+    #[cfg(tally_refit_probe)]
+    pub fn bytes_parts(&self) -> Vec<(String, u64)> {
+        let memos = self.caches.values().fold([0usize; 3], |sum, area| {
+            let parts = area.cache.bytes_parts();
+            [sum[0] + parts[0], sum[1] + parts[1], sum[2] + parts[2]]
+        });
+        let parts: [(&str, usize); 13] = [
+            ("arrived", self.arrived.bytes()),
+            (
+                "shards",
+                self.shards.iter().map(Shard::bytes).sum::<usize>()
+                    + self.shards.capacity() * size_of::<Shard>(),
+            ),
+            ("models_table", self.models.bytes()),
+            (
+                "models_own",
+                self.models
+                    .values()
+                    .filter(|held| held.own)
+                    .map(|held| held.bytes())
+                    .sum::<usize>(),
+            ),
+            ("caches_table", self.caches.bytes()),
+            ("memos_read", memos[0]),
+            ("memos_network", memos[1]),
+            ("memos_blocks", memos[2]),
+            (
+                "solved",
+                self.solved.bytes() + self.solved.values().map(Solved::bytes).sum::<usize>(),
+            ),
+            ("slots", self.slots.bytes(fix::Work::bytes)),
+            ("sited", self.sited.capacity() * size_of::<Sited>()),
+            (
+                "indexed",
+                self.indexed.as_ref().map_or(0, |(built_from, sites)| {
+                    built_from.capacity() * size_of::<tally_mlat_solver::Site>()
+                        + tally_wire::footprint::arc::<Sites>()
+                        + sites.bytes()
+                }),
+            ),
+            ("total", self.bytes()),
+        ];
+        let mut out: Vec<(String, u64)> = parts
+            .iter()
+            .map(|(name, bytes)| ((*name).to_owned(), *bytes as u64))
+            .collect();
+        out.push(("seats".to_owned(), self.taking_part() as u64));
+        out
+    }
+
     /// Lets go of the raw a step at `at` would let go of before it solves (`Arrived::forget_older`),
     /// solving nothing: what its host does at each step it collapses (`tally-relay`'s
     /// `mlat_host`, Behind), so the steps taken at once hold what the steps would.
