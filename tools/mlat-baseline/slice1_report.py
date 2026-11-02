@@ -21,6 +21,8 @@ if "a" in d:
         "fit_ms_steps": mb["steps_total"]["fit_ms"] - ma["steps_total"]["fit_ms"],
         "relay_cores": (d["b"]["relay_ticks"] - d["a"]["relay_ticks"]) / d["ticks_per_sec"] / window,
         "busy_cores_all": (d["b"]["busy"] - d["a"]["busy"]) / d["ticks_per_sec"] / window,
+        "harness_cores": (d["b"].get("harness_ticks", 0) - d["a"].get("harness_ticks", 0)) / d["ticks_per_sec"] / window,
+        "load_b": d["b"]["load"],
         "seats_mean": seats, "seats_min": min(d["seats"] or [0]), "load_a": d["a"]["load"],
         "memory": d["b"]["probe"].get("memory"),
     }
@@ -58,5 +60,7 @@ out = {
 if seats:
     out["baseline_ms_a_seat_second"] = round(base / 1e6 / window / seats, 3)
     out["oracle_ms_a_seat_second"] = round(oracle / 1e6 / window / seats, 3)
+if accept:
+    accept["other_users_cores"] = round(accept["busy_cores_all"] - accept["relay_cores"] - accept["harness_cores"], 2)
 out["accept"] = accept
 print(json.dumps(out, indent=1))

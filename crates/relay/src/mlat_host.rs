@@ -690,10 +690,15 @@ pub const WARM_MODELS_BYTES_PER_SEAT: usize =
 /// ceiling and the open raw (`Open`) at the 1,800 a second a receiver may send, which together held
 /// three times what the engine keeps.
 pub fn arrived_bytes_per_seat() -> usize {
-    Rates::MEASURED.cost()
+    let planned = Rates::MEASURED.cost()
         + SOLVED_BYTES_PER_SEAT
         + WARM_MODELS_BYTES_PER_SEAT
-        + PENDING_BYTES_PER_SEAT
+        + PENDING_BYTES_PER_SEAT;
+    // RFC-0198 slice 1 (#40), the refit probe's build only: four times the store, so #37's
+    // overruns (a seat holds about twice its plan) never refuse raw while a refit is measured.
+    #[cfg(tally_refit_probe)]
+    let planned = planned * 4;
+    planned
 }
 
 /// A seat's share of a step's working set (its refits' inputs and pair fits, and its solutions),

@@ -724,6 +724,48 @@ dump and the refit timers are kept as patches, so the production code stays unch
   - The memos' possible double count is noted (§4).
   - The seat-planning script is committed as `tools/mlat-baseline/plan-seats.sh`.
 
+**Slice 1's result (#40, 2026-11-02): no-go for slice 3.** Measured on anvil under the load of
+other work, as the founder directed, with the probe and oracle of `--config=refit-probe`. Ratios
+and fractions are what count; absolute times are loaded-host.
+
+- *The oracle on the relay.* Five runs of tally-load at the world relay's plan, 2,000 feeders, the
+  relay pinned to 16 cores. The probe build quadruples the `Arrived` store so that #37's overruns
+  refuse no raw. Every run had `arrived_over` 0 and `unfitted` 0.
+  - The oracle's refit against the same run's baseline: 0.927, 0.924, 0.920, 0.926, 0.923.
+    The median is 0.924 (0.905 to 0.912 without the shadow), against a go threshold of 0.6.
+  - Baseline refit: 5.5 to 5.8 ms a seat-second at 263 to 283 seats.
+- *Why.* On the relay, 89% to 90% of each window's receptions sit in a second whose read span
+  changed since the last refit:
+  - 51,000 late rebuilds against 10,900 first and 10,900 read-after, with about 9,000 blocks
+    reused;
+  - so held reads and formation save about a tenth;
+  - the merge saves the copy and the sort but not the per-point work.
+- *What the conservative digest costs.* 86% of the pair blocks rebuilt came out bit-identical. A
+  second's digest changes far more often than any one pair's block does. That is a finding for a
+  redesign of invalidation, not something slice 3 as specified can use.
+- *Checks.* 0 order mismatches between the merge and version 8's sort in about 2 million checked
+  builds. 0 shadow mismatches in 451 cold shadows. A cold shadow cost 0.92 to 1.0 times a warm
+  refit on the relay, so 1.49 times was the solver test's figure.
+- *The solver test*, on a quiet host: a ratio of 0.715, the reads re-read at 0.38. It too is
+  above 0.6.
+- *Memory (#37).* `Engine::bytes` holds 2.2 to 2.3 MB a seat against the 1.61 MB its store plans:
+  - the read's memos, 0.69 to 0.76 MB;
+  - the blocks, 0.61 to 0.63 MB;
+  - the arrived raw, 0.58 to 0.67 MB;
+  - its own models, 0.22 to 0.24 MB.
+
+  The memos are 1.3 to 1.4 MB a seat against `AREA_CACHE_BYTES_PER_RECEIVER`'s 0.21. They are
+  counted once there; the solver test's 1.68 MB a receiver is a different measure.
+- *The mlat-server baseline, three repeats.*
+  - As shipped: 1.77 ms a receiver-second at 250 receivers. Its core is full by 500.
+  - With the bad-sync drop patched out (the sensitivity point): 2.28 ms.
+  - The scene's sync could not be brought under 10% of receivers in bad-sync. With every
+    aircraft's pressure-altitude offset and position bias removed, 168 of 250 were still in
+    timeout. The cause is not established.
+  - Tally's rerun at 250, on a quiet host: 4.47 ms a seat-second, 2.53 times mlat-server as
+    shipped and 1.96 times its sensitivity point.
+
+
 ## Appendix D: what an exact-integer-sums RFC must specify
 
 This is recorded for slice 6, which this RFC does not propose. An RFC that proposes exact integer

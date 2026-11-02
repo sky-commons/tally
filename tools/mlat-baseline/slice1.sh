@@ -15,7 +15,7 @@ log() { echo "$(date -u +%FT%TZ) $*" | tee -a "$OUT/slice1.log"; }
 quiet() { local q=0; while [ $q -lt 3 ]; do
     l=$(cut -d' ' -f1 /proc/loadavg); if awk -v l="$l" 'BEGIN{exit !(l<3)}'; then q=$((q+1)); else q=0; fi; sleep 60; done; }
 for r in $(seq 1 "${REPEATS:-3}"); do
-  quiet
+  [ "${QUIET:-1}" = 1 ] && quiet
   D=$OUT/relay-r$r; rm -rf "$D"; mkdir -p "$D/state"
   log "relay run $r (load $(cut -d' ' -f1-3 /proc/loadavg))"
   python3 "$SCRIPTS/sample_probe.py" "$D/probe.json" 130 230 "$D/sample.json" > "$D/sample.out" 2>&1 &
@@ -26,5 +26,5 @@ for r in $(seq 1 "${REPEATS:-3}"); do
     --relay-arg --max-connections-per-address --relay-arg 1024 > "$D/load.log" 2>&1
   wait $S
   log "relay run $r: $(python3 "$SCRIPTS/slice1_report.py" "$D/sample.json" | tr '\n' ' ')"
-  sleep 120
+  sleep "${GAP_S:-120}"
 done

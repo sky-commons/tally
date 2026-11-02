@@ -30,6 +30,19 @@ def get(path):
     except Exception:
         return None
 
+def harness():
+    total = 0
+    for p in os.listdir("/proc"):
+        if p.isdigit():
+            try:
+                cmd = open(f"/proc/{p}/cmdline", "rb").read().split(b"\0")
+                if cmd and cmd[0].endswith(b"tally-load"):
+                    f = open(f"/proc/{p}/stat").read().rsplit(")", 1)[1].split()
+                    total += int(f[11]) + int(f[12])
+            except OSError:
+                continue
+    return total
+
 def sample():
     f = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
     v = list(map(int, open("/proc/stat").readline().split()[1:]))
@@ -37,7 +50,7 @@ def sample():
         p = json.load(open(probe))
     except (OSError, ValueError):
         p = None
-    return {"at": time.time(), "relay_ticks": int(f[11]) + int(f[12]), "busy": sum(v) - v[3] - v[4],
+    return {"at": time.time(), "relay_ticks": int(f[11]) + int(f[12]), "harness_ticks": harness(), "busy": sum(v) - v[3] - v[4],
             "mlat": get("mlat"), "memory": get("memory"), "probe": p,
             "load": open("/proc/loadavg").read().split()[:3]}
 
