@@ -60,6 +60,16 @@ counters!(
     shadow_runs,
     shadow_mismatches,
     shadow_failed,
+    // The per-pair oracle (RFC-0198 slice 1's follow-up): a block rebuilt only when its pair's
+    // pooled points changed. Its digest's cost, its builds' cost (each build alone, its formation
+    // and the slice 1 oracle's pooling taken out), the cut blocks settling rebuilds, and counts.
+    perpair_digest_ns,
+    perpair_build_ns,
+    cut_build_ns,
+    perpair_rebuilt,
+    perpair_reused,
+    perpair_digest_misses,
+    perpair_digest_false,
 );
 
 static COUNTS: [AtomicU64; NAMES.len()] = [const { AtomicU64::new(0) }; NAMES.len()];
@@ -70,6 +80,14 @@ thread_local! {
     /// This thread's nanoseconds in block builds (their phases and the oracle's pooling): what a
     /// timer around settling, which rebuilds cut blocks, takes out of its own.
     static NESTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// This thread's own share of every counter, for a timer that takes nested work out.
+    static LOCAL: [std::cell::Cell<u64>; NAMES.len()] =
+        const { [const { std::cell::Cell::new(0) }; NAMES.len()] };
+}
+
+/// This thread's own total of `counter` so far.
+pub fn local(counter: P) -> u64 {
+    LOCAL.with(|local| local[counter as usize].get())
 }
 
 /// This thread's nanoseconds in block builds so far (`NESTED`).
@@ -107,6 +125,10 @@ pub fn add(counter: P, value: u64) {
     ) {
         NESTED.with(|nested| nested.set(nested.get().saturating_add(value)));
     }
+    LOCAL.with(|local| {
+        let cell = &local[counter as usize];
+        cell.set(cell.get().saturating_add(value));
+    });
     COUNTS[counter as usize].fetch_add(value, Relaxed);
 }
 
