@@ -98,7 +98,7 @@ if "rr_sec_new" in delta:
         "cause_by_seconds": {c: round(delta[f"rr_sec_{c}"] / max(1, sec_total), 4) for c in causes},
         "cause_by_receptions": {c: round(delta[f"rr_rx_{c}"] / max(1, rx_total), 4) for c in causes},
         "changed_seconds": {c: delta[f"chg_{c}"] for c in causes},
-        "receptions_added": {"sync": delta["rx_added_sync"], "status": delta["rx_added_status"]}, "receptions_removed": {"sync": delta["rx_removed_sync"], "status": delta["rx_removed_status"]}, "receptions_moved": delta["rx_moved"],
+        "receptions_added": {"sync": delta["rx_added_sync"], "status": delta["rx_added_status"]}, "receptions_removed": {"sync": delta["rx_removed_sync"], "status": delta["rx_removed_status"]}, "sync_solo": {"added": delta.get("rx_added_sync_solo"), "removed": delta.get("rx_removed_sync_solo")}, "receptions_moved": delta["rx_moved"],
         "late_seconds": delta["late_seconds"],
         "late_receivers_a_second": round(delta["late_receivers"] / max(1, delta["late_seconds"]), 2),
         "late_age_behind_last_edge_s": {k: delta[f"late_age_{k}"] for k in ("0_2", "2_4", "4_8", "8_16", "16_20", "20_up")},

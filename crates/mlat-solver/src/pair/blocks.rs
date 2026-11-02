@@ -780,9 +780,11 @@ fn same_block(a: &PairBlock, b: &PairBlock) -> bool {
         && a.units.iter().zip(&b.units).all(|(x, y)| units(x, y))
 }
 
-/// What a block of a second read: a digest of every reception of the inputs in the seconds it is a
-/// function of, by a key of this holder's (`BlockCache::key`), so a block built again from the same
-/// receptions is never built, and one whose receptions changed always is.
+/// What a block of a second read: a digest of every reception its events can read, each given
+/// for the seconds of the events that can read it (`Reader::read_by_events`), over the seconds it
+/// is a function of, each with whether the window holds its clock, by a key of this holder's
+/// (`BlockCache::key`), so a block built again from the same is never built, and one whose inputs
+/// changed always is.
 type Digest = u128;
 
 /// The blocks of an area held between its refits (crate docs, § The pairwise path, blocks): each
@@ -808,6 +810,9 @@ pub(super) struct BlockCache {
     where_was: std::collections::HashMap<u64, u64>,
     #[cfg(tally_refit_probe)]
     status_was: std::collections::HashSet<u64>,
+    /// The sync receptions at the last update whose message one receiver alone heard.
+    #[cfg(tally_refit_probe)]
+    solo_was: std::collections::HashSet<u64>,
     #[cfg(tally_refit_probe)]
     formed: BTreeMap<u64, Digest>,
     /// Each second's digest of its sync receptions alone at the last update.
@@ -839,6 +844,8 @@ impl Default for BlockCache {
             where_was: std::collections::HashMap::new(),
             #[cfg(tally_refit_probe)]
             status_was: std::collections::HashSet::new(),
+            #[cfg(tally_refit_probe)]
+            solo_was: std::collections::HashSet::new(),
             #[cfg(tally_refit_probe)]
             formed: BTreeMap::new(),
             #[cfg(tally_refit_probe)]
@@ -889,9 +896,20 @@ impl BlockCache {
                 .sum::<usize>()
     }
 
-    /// Each second's digest of the receptions `reader` read, from `first` on.
-    fn digests(&self, reader: &Reader<'_>) -> BTreeMap<u64, Digest> {
+    /// Each second's digest of the receptions of `raw`'s read its events can read, each with
+    /// whether the window holds its clock (`Reader::read_by_events`: a position for its own
+    /// second, a NACp for each second near it holding a position of its aircraft). Its block's
+    /// points are a function of these alone: of the read's other receptions, a NACp reception no
+    /// event reads (an aircraft's operational status nowhere near a position of it, which a window
+    /// holds while any event of its aircraft is in the window and so comes and goes with what is
+    /// at the window's far end, RFC-0198 Appendix C) is no input of them; and a point's clock is
+    /// one of the window's, which its other seconds decide, or none. A NACp is given for the
+    /// seconds of the events that can read it, not its own, so a position heard in a newer second
+    /// changes no older second's digest.
+    fn digests(&self, raw: &Raw<'_>) -> BTreeMap<u64, Digest> {
+        let reader = &raw.reader;
         let mut out: BTreeMap<u64, Digest> = BTreeMap::new();
+        let read = reader.read_by_events();
         for rx in &reader.rxs {
             let key = rx.receiver.as_bytes();
             let word = |at: usize| u64::from_le_bytes(key[at..at + 8].try_into().unwrap_or([0; 8]));
@@ -909,11 +927,14 @@ impl BlockCache {
                 hashed(0),
                 hashed(8),
                 hashed(16),
+                u64::from(raw.window_of[rx.clock] != u32::MAX),
             ];
             let digest =
                 u128::from(lane(self.key[0], &words)) << 64 | u128::from(lane(self.key[1], &words));
-            let entry = out.entry(rx.wall_ms / 1000).or_insert(0);
-            *entry = entry.wrapping_add(digest);
+            read(rx, &mut |second| {
+                let entry = out.entry(second).or_insert(0);
+                *entry = entry.wrapping_add(digest);
+            });
         }
         out
     }
@@ -930,7 +951,7 @@ impl BlockCache {
     ) -> (usize, usize) {
         #[cfg(tally_refit_probe)]
         let started = Instant::now();
-        let digests = self.digests(&raw.reader);
+        let digests = self.digests(raw);
         #[cfg(tally_refit_probe)]
         {
             probe::since(P::digests_ns, started);
@@ -1174,6 +1195,20 @@ impl BlockCache {
         let mut ids: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
         let mut receivers: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
         let mut status: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // Each message's distinct receivers in this read (`rxs` runs by receiver), and the sync
+        // receptions whose message one receiver alone heard: a message heard twice by one member
+        // is an event of `Arrived::collect`'s, its receptions in the window while both are.
+        let mut receivers_of: std::collections::HashMap<u32, (u64, u32)> =
+            std::collections::HashMap::new();
+        for rx in &raw.reader.rxs {
+            let key = rx.receiver.as_bytes();
+            let word = u64::from_le_bytes(key[0..8].try_into().unwrap_or([0; 8]));
+            let entry = receivers_of.entry(rx.message).or_insert((word, 0));
+            if entry.1 == 0 || entry.0 != word {
+                *entry = (word, entry.1 + 1);
+            }
+        }
+        let mut solo: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for at in 0..raw.reader.rxs.len() {
             let rx = &raw.reader.rxs[at];
             let (message, wall_ms) = (rx.message, rx.wall_ms);
@@ -1198,6 +1233,11 @@ impl BlockCache {
             receivers.insert(id, word(0));
             if raw.reader.is_status(message) {
                 status.insert(id);
+            } else if receivers_of
+                .get(&message)
+                .is_some_and(|(_, count)| *count == 1)
+            {
+                solo.insert(id);
             }
         }
         for id in self.status_was.iter() {
@@ -1279,6 +1319,17 @@ impl BlockCache {
                     probe::add(P::rx_added_sync, (added.len() - added_status) as u64);
                     probe::add(P::rx_removed_status, removed_status as u64);
                     probe::add(P::rx_removed_sync, (removed.len() - removed_status) as u64);
+                    probe::add(
+                        P::rx_added_sync_solo,
+                        added.iter().filter(|id| solo.contains(id)).count() as u64,
+                    );
+                    probe::add(
+                        P::rx_removed_sync_solo,
+                        removed
+                            .iter()
+                            .filter(|id| self.solo_was.contains(id))
+                            .count() as u64,
+                    );
                     let moved = added
                         .iter()
                         .filter(|id| self.where_was.get(id).is_some_and(|s| s != second))
@@ -1363,6 +1414,7 @@ impl BlockCache {
         self.where_was = where_now;
         self.ids = ids;
         self.status_was = status;
+        self.solo_was = solo;
     }
 
     /// The second's blocks.

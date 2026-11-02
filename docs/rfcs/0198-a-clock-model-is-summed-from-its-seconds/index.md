@@ -855,6 +855,56 @@ per-pair rebuilds and held reads together. A refit at about 0.44 of today's 5.04
 2.2 ms a seat-second; with the shadow check, `tally-relay check` planned about 554 world-relay
 seats at 2.25 ms in the fourth revision.
 
+### 2026-11-02: blocks kept by what their events read, the slice that replaces slice 3
+
+The re-read investigation above proposed digesting what a second's points depend on instead of
+every reception read. This slice does that, and only that: what is read, the blocks built and the
+published bytes stay the same; only when a held block is built again changes.
+
+*The rule.* A second's digest now holds every position reception in it, each with whether the
+window holds its clock, and every NACp reception given for each second within
+`sync::SPAN_AFTER_S` before to `sync::LOOK_BACK_S` after it that holds a position of its aircraft
+(`Reader::read_by_events`). An event in second `t` reads its NACp in `t`'s read span alone and
+holds a position of its aircraft in `t`, so every NACp it can read is in `t`'s digest; an
+operational status nowhere near a position of its aircraft is in none. A NACp is given for the
+event's second rather than its own: given for its own, a position heard in a newer second changed
+older seconds' digests, which built about 3.8 more blocks a refit than positions alone. The
+window flag covers a clock whose window membership is decided by receptions outside a block's
+span, which the old digest did not.
+
+*Correctness.* `held_blocks_publish_what_blocks_built_again_publish_through_status_churn`
+(`pair_tests`) refits three areas of a 40 s scene every 2 s, the status of a tenth of its aircraft
+changed to another NACp (6 to 10) and another tenth's left out, drawn anew each refit, and holds
+the held blocks' model bytes equal to a refit from no blocks with the same warm model: 54 refits
+compared, 75 seconds held, 28 refits whose bytes the churn changed. With NACp left out of the
+digest it fails. The goldens and determinism tests pass unchanged. In the relay runs below the cold
+shadow (one area-edge in 64) compared 323 refits, 0 mismatches.
+
+*What it buys.* On the relay (probe build, 5 runs) the blocks built fall from about 11.5 to 6.2 a
+refit and the re-read fraction from 0.90 to 0.48 to 0.52, near the floor of positions alone (6.0
+built a refit). The refit's cost does not fall. Measured as `cores.rs` states the cost (unprobed,
+`tools/mlat-baseline/cost.sh`, main and this slice alternately, five each), the two clean pairs
+read 0.972 and 0.961 of main's refit ms a seat-second (4.50 against 4.63, 4.44 against 4.62); the
+other three were disturbed by other load on the host (seats cut to 50 to 250). In the probe's
+phases (one run each) the blocks' build fell by about 1.7 ms a refit, formation only from 10.8 to
+9.5 ms, and the digest rose from 0.65 to 2.77 ms; reading (5.5 ms) and gathering (4.1 ms) are
+untouched. A block built again still forms its five pooled seconds, and the blocks still built
+(the window's first two, where the window's start drops a message's other member's reception,
+and the last four, where batches arrive up to `MLAT_BATCHING` late) between them form nearly
+every second. The oracle's 0.439 assumed held reads and held formation beside this rule; the rule
+alone is about 0.97.
+
+*The sync receptions that join and leave old seconds.* They do not, mid-window: the 3.7
+receivers a changed second counted every reception added, status ones included. Sync receptions
+change only at the window's ends: at its edge, batches arriving late; at its start, a message two
+members heard losing one reception as the window passes it (`Arrived::collect` keeps an event
+heard by two members within the window). The second is the window rule's, a change of the inputs,
+so out of this slice's scope.
+
+*What it leaves.* The refit's cost is reading, gathering and forming the window, every refit. A
+slice that holds formed seconds (each a function of its own read span) and an incremental read
+would be the next; this rule is what both would be kept by.
+
 ## Appendix D: what an exact-integer-sums RFC must specify
 
 This is recorded for slice 6, which this RFC does not propose. An RFC that proposes exact integer

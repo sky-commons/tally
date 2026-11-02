@@ -564,6 +564,12 @@ type Position = (usize, i64, u32, bool, u64);
 /// A NACp reception: its clock, linear count, value and wall clock.
 type Nacp = (usize, i64, u8, u64);
 
+/// What a message is to a block's events (`Reader::parts`): a position of an aircraft, a NACp of
+/// the aircraft at its address (an operational status, its part the address itself, below 2^24),
+/// or nothing they read.
+const POSITION: u32 = u32::MAX - 1;
+const NEITHER: u32 = u32::MAX;
+
 /// The inputs as the pairwise blocks read them: each reception linearized once, and each message,
 /// second and address indexed, so a block reads only the seconds it is a function of.
 pub(crate) struct Reader<'r> {
@@ -585,6 +591,9 @@ pub(crate) struct Reader<'r> {
     positions: BTreeMap<u32, Vec<Position>>,
     /// Each address's NACp receptions, sorted by clock, count and value.
     nacp: BTreeMap<u32, Vec<Nacp>>,
+    /// Each message's part in the events (`POSITION`, `NEITHER` or a NACp's address), by its
+    /// place in `Inputs::messages`.
+    parts: Vec<u32>,
     /// Each (address, second)'s CPR reference, once found.
     references: BTreeMap<(u32, u64), Option<modes::LatLon>>,
 }
@@ -637,6 +646,7 @@ impl<'r> Reader<'r> {
         let mut by_second: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
         let mut positions: BTreeMap<u32, Vec<Position>> = BTreeMap::new();
         let mut nacp: BTreeMap<u32, Vec<Nacp>> = BTreeMap::new();
+        let mut parts = vec![NEITHER; count];
         for message in &distinct {
             let receptions = &by_message[starts[*message as usize]..starts[*message as usize + 1]];
             let mut last = None;
@@ -652,6 +662,11 @@ impl<'r> Reader<'r> {
                 continue;
             };
             let (value, position) = (parsed.nacp, parsed.position);
+            parts[*message as usize] = match (position, value) {
+                (Some(_), _) => POSITION,
+                (None, Some(_)) => address,
+                (None, None) => NEITHER,
+            };
             for (wall, index) in receptions {
                 let rx = &rxs[*index as usize];
                 if let Some(value) = value {
@@ -693,6 +708,7 @@ impl<'r> Reader<'r> {
             by_second,
             positions,
             nacp,
+            parts,
             references: BTreeMap::new(),
         }
     }
@@ -700,6 +716,42 @@ impl<'r> Reader<'r> {
     /// The hash of message `message`.
     pub(crate) fn hash(&self, message: u32) -> [u8; 32] {
         self.messages.hash(message)
+    }
+
+    /// Calls `at` with each second whose block's events can read reception `rx` (crate docs, §
+    /// The pairwise path, blocks), by the second they read it for: a reception of a position
+    /// message (an event's own, the look-back's, the CPR reference's) for its own second; a NACp
+    /// reception of an address for each second within `SPAN_AFTER_S` before it to `LOOK_BACK_S`
+    /// after it that holds a position reception of that address; any other, for none. An event
+    /// of an address in second `t` holds a position reception of it in `t` (its message), and
+    /// reads its NACp in `t`'s read span alone (`nacp_at`), `LOOK_BACK_S` before `t` to
+    /// `SPAN_AFTER_S` after: so every NACp reception it can read is given for `t` itself, and a
+    /// position heard in another second never changes what is given for `t`.
+    pub(crate) fn read_by_events(&self) -> impl Fn(&Rx, &mut dyn FnMut(u64)) + '_ {
+        // Each address's seconds holding a position reception of it, ascending.
+        let mut near: Vec<(u32, u64)> = Vec::new();
+        let mut seconds: Vec<u64> = Vec::new();
+        for (address, list) in &self.positions {
+            seconds.clear();
+            seconds.extend(list.iter().map(|(_, _, _, _, wall)| wall / 1000));
+            seconds.sort_unstable();
+            seconds.dedup();
+            near.extend(seconds.iter().map(|second| (*address, *second)));
+        }
+        move |rx: &Rx, at: &mut dyn FnMut(u64)| match self.parts[rx.message as usize] {
+            POSITION => at(rx.wall_ms / 1000),
+            NEITHER => {}
+            address => {
+                let second = rx.wall_ms / 1000;
+                let low = (address, second.saturating_sub(SPAN_AFTER_S));
+                for (_, event) in near[near.partition_point(|held| *held < low)..]
+                    .iter()
+                    .take_while(|(of, event)| *of == address && *event <= second + LOOK_BACK_S)
+                {
+                    at(*event);
+                }
+            }
+        }
     }
 
     /// The re-read probe's: whether `message` is a status message (a NACp and no position).

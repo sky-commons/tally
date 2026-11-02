@@ -105,6 +105,9 @@ counters!(
     rx_added_status,
     rx_removed_sync,
     rx_removed_status,
+    // Of the sync receptions added and removed, those whose message one receiver alone heard.
+    rx_added_sync_solo,
+    rx_removed_sync_solo,
     rx_moved,
     late_receivers,
     late_seconds,

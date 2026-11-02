@@ -721,12 +721,13 @@ pub fn arrived_bytes_per_seat() -> usize {
 /// what the engine held before it, less what it leaves held, for each receiver taking part, the
 /// most measured by the counting allocator over the reference simulation and a dense one whose
 /// every receiver keeps its full 40 neighbours (`tests/tables_bytes.rs`, `step_bytes_per_seat`,
-/// 566,598 bytes on 2026-11-02 with the read's memos shared across areas, what a refit reads anew
-/// held until the step hands it to them, rounded up to the KiB; 565,702 on 2026-10-30 with the
-/// pair blocks of 2026-10-27; 212,816 before them, the reference scene alone then 131,981).
-/// Before, 192 KiB, an upper bound from the window steps it replaced (RFC-0181, "Sizing",
-/// 2026-10-08), which the dense scene's step exceeds.
-pub const STEP_BYTES_PER_SEAT: usize = 554 << 10;
+/// 589,825 bytes on 2026-11-02 with an area's blocks kept by what their events read, so a step
+/// leaves fewer built again, rounded up to the KiB; 566,598 earlier that day with the read's memos
+/// shared across areas, what a refit reads anew held until the step hands it to them; 565,702 on
+/// 2026-10-30 with the pair blocks of 2026-10-27; 212,816 before them, the reference scene alone
+/// then 131,981). Before, 192 KiB, an upper bound from the window steps it replaced (RFC-0181,
+/// "Sizing", 2026-10-08), which the dense scene's step exceeds.
+pub const STEP_BYTES_PER_SEAT: usize = 577 << 10;
 /// What one seat makes its own engine publish in positions over a step, at most, which is what of
 /// them may wait untaken (the network task takes them every tick): its fixes raw and tagged
 /// (`consistency::POSITIONS_BYTES_PER_SEAT_PER_SEC`). Charged to `Engine` as they are queued, by

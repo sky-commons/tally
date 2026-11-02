@@ -502,12 +502,16 @@
 //! those of its pooled residuals about its line past `sync::JUMP_THRESHOLD` (§ Jumps), the largest
 //! located in each second, the first in point order on ties. So a block is a function of the
 //! receptions of seconds `s -
-//! pair::READ_BACK_MS / 1000` to `s + sync::SPAN_AFTER_S` among the window's inputs alone: the
-//! same in every window whose inputs hold the same receptions of that span, which the newest
-//! seconds' blocks are not, since a window's inputs end at its edge (`Trailing::reads`). A holder
-//! may keep blocks between refits by a digest of the receptions they read,
-//! under a key of its own (the reference engine's `BlockCache`), and build one again only when they
-//! changed; whether a block was kept or built changes nothing it holds. A block whose pooled points
+//! pair::READ_BACK_MS / 1000` to `s + sync::SPAN_AFTER_S` among the window's inputs, and of which
+//! of their clocks the window holds, alone: the same in every window whose inputs hold the same
+//! receptions of that span, which the newest seconds' blocks are not, since a window's inputs end
+//! at its edge (`Trailing::reads`). Of those receptions its events read every position, and of an
+//! aircraft's NACp only those within `sync::SPAN_AFTER_S` before to `sync::LOOK_BACK_S` after a
+//! second holding a position of it (an event reads its NACp in its own read span, and its own
+//! second holds its message); an operational status heard nowhere near a position of its aircraft
+//! is read by no block, and one that is, only by the events of those seconds. A holder may keep blocks between refits by a digest of the receptions they
+//! read, under a key of its own (the reference engine's `BlockCache`), and build one again only
+//! when they changed; whether a block was kept or built changes nothing it holds. A block whose pooled points
 //! reach before either clock's kept segment start is built again from the kept points alone, and
 //! one whose own points all lie before it is dropped.
 //!

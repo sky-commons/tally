@@ -1344,6 +1344,156 @@ fn a_warm_refit_publishes_what_a_cold_refit_publishes() -> Result {
     Ok(())
 }
 
+/// Status churn: `inputs` with the operational status messages of a few of its aircraft (a tenth,
+/// at least one) changed to another NACp, and the receptions of a few others' (as many) left out,
+/// drawn from `rng`. The NACp drawn is 6 to 10, so an event's prior is sometimes too loose to be
+/// one (`sync::MAX_PRIOR_SIGMA_M`) and sometimes tighter than its aircraft's own.
+fn status_churned(inputs: &Inputs, rng: &mut Rng) -> Inputs {
+    // A DF17 operational status (type code 31): its NACp is the low nibble of the ME field's
+    // sixth byte (`sim`).
+    let status = |data: &[u8]| data.len() == 14 && data[0] >> 3 == 17 && data[4] >> 3 == 31;
+    let address = |data: &[u8]| u32::from_be_bytes([0, data[1], data[2], data[3]]);
+    let mut aircraft: Vec<u32> = inputs
+        .messages
+        .iter()
+        .filter(|message| status(&message.data))
+        .map(|message| address(&message.data))
+        .collect();
+    aircraft.sort_unstable();
+    aircraft.dedup();
+    let few = (aircraft.len() / 10).max(1);
+    let mut drawn = shuffled(&aircraft, rng);
+    let changed: BTreeSet<u32> = drawn.drain(..few.min(drawn.len())).collect();
+    let silent: BTreeSet<u32> = drawn.drain(..few.min(drawn.len())).collect();
+    let mut out = inputs.clone();
+    let mut moved: BTreeMap<u32, u32> = BTreeMap::new();
+    for (at, message) in inputs.messages.iter().enumerate() {
+        if !status(&message.data) || !changed.contains(&address(&message.data)) {
+            continue;
+        }
+        let was = message.data[9] & 0x0f;
+        let nacp = loop {
+            let nacp = 6 + (rng.uniform() * 5.0).min(4.0) as u8;
+            if nacp != was {
+                break nacp;
+            }
+        };
+        let mut body = message.data[..11].to_vec();
+        body[9] = (body[9] & 0xf0) | nacp;
+        let data = crate::modes::with_parity(&body, 0);
+        moved.insert(at as u32, out.messages.len() as u32);
+        out.messages.push(crate::scope::SyncMessage {
+            hash: crate::obs::message_hash(&data),
+            data: data.into(),
+        });
+    }
+    out.sync = inputs
+        .sync
+        .iter()
+        .filter(|reception| {
+            let data = &inputs.messages[reception.message as usize].data;
+            !(status(data) && silent.contains(&address(data)))
+        })
+        .map(|reception| crate::scope::SyncReception {
+            message: moved
+                .get(&reception.message)
+                .copied()
+                .unwrap_or(reception.message),
+            ..*reception
+        })
+        .collect();
+    out
+}
+
+/// A refit from the blocks an area holds publishes the bytes a refit of the same inputs from no
+/// blocks does, from the same warm model, refit after refit while operational status receptions
+/// come and go and NACp changes between them: as the window moves (an aircraft's status is in it
+/// while an event of the aircraft is), and drawn anew each refit (`status_churned`). Held blocks
+/// are kept by a digest of what their events read (`blocks::BlockCache`), not of every reception
+/// read, so this is what shows a status reception the digest leaves out is read by no block. The
+/// churn drawn changes some cold refit's bytes (NACp is read), and blocks are held through it.
+#[test]
+fn held_blocks_publish_what_blocks_built_again_publish_through_status_churn() -> Result {
+    let scenario = of(9000, 40.0);
+    let mut simulation = sim::run(&scenario);
+    let arrivals = sim::arrivals(&mut simulation, scenario.seed);
+    let sites = Sites::new(&simulation.sites());
+    let mut arrived = Arrived::new(Limits {
+        held_ms: HELD_MS,
+        ..Limits::UNBOUNDED
+    });
+    let (Some(first), Some(last)) = (arrivals.first(), arrivals.last()) else {
+        return Err("no arrivals".into());
+    };
+    // The three areas holding the most receivers.
+    let mut areas: Vec<(usize, Region)> = sites
+        .areas()
+        .map(|(area, keys)| (keys.len(), *area))
+        .collect();
+    areas.sort_unstable_by_key(|(members, area)| (std::cmp::Reverse(*members), *area));
+    let areas: Vec<Region> = areas.into_iter().take(3).map(|(_, area)| area).collect();
+    let mut held: BTreeMap<Region, (PairCache, Option<PairModel>)> = BTreeMap::new();
+    let mut rng = Rng::new(0x5_7a7);
+    let (mut compared, mut reused, mut nacp_read) = (0usize, 0usize, 0usize);
+    let mut next = 0;
+    let mut now = first.at_ms.next_multiple_of(STEP_MS);
+    while now <= last.at_ms {
+        while let Some(arrival) = arrivals.get(next).filter(|arrival| arrival.at_ms <= now) {
+            arrived.admit(arrival.batch, arrival.at_ms, &arrival.receptions);
+            next += 1;
+        }
+        arrived.seal(now);
+        if now.is_multiple_of(REFIT_EVERY_MS) {
+            let trailing = Trailing {
+                span_ms: TRAILING_WINDOW_MS as u32,
+                ..Trailing::fitted_at(now)
+            };
+            for area in &areas {
+                let Some(inputs) = arrived.area_inputs_over(*area, &sites, trailing) else {
+                    continue;
+                };
+                let churned = status_churned(&inputs, &mut rng);
+                let (cache, warm) = held.entry(*area).or_default();
+                let warm_model = warm.clone();
+                let from_held = pair::fit(&churned, warm_model.as_ref(), cache);
+                let from_none = pair::fit(&churned, warm_model.as_ref(), &mut PairCache::default());
+                match (&from_held, &from_none) {
+                    (Ok(a), Ok(b)) => {
+                        assert_eq!(
+                            publish::encode_pairs(&a.model).map_err(text)?,
+                            publish::encode_pairs(&b.model).map_err(text)?,
+                            "{area:?} at {now}: held blocks publish other bytes"
+                        );
+                        assert_eq!(a.stats.events, b.stats.events, "{area:?} at {now}");
+                        assert_eq!(a.stats.points, b.stats.points, "{area:?} at {now}");
+                        compared += 1;
+                        reused += a.stats.blocks_reused;
+                        let unchurned =
+                            pair::fit(&inputs, warm_model.as_ref(), &mut PairCache::default());
+                        if !unchurned.is_ok_and(|c| c.model == b.model) {
+                            nacp_read += 1;
+                        }
+                        *warm = Some(a.model.clone());
+                    }
+                    (Err(a), Err(b)) => assert_eq!(a, b, "{area:?} at {now}"),
+                    _ => {
+                        return Err(format!(
+                            "{area:?} at {now}: held {:?}, built again {:?}",
+                            from_held.as_ref().err(),
+                            from_none.as_ref().err()
+                        ));
+                    }
+                }
+            }
+        }
+        now += STEP_MS;
+    }
+    assert!(compared >= 20, "{compared} refits compared");
+    assert!(reused > 0, "no block was held");
+    assert!(nacp_read > 0, "the churn changed no refit");
+    Ok(())
+}
+
 /// A receiver whose clock is unknown or whose location is too coarse is in no model.
 #[test]
 fn a_receiver_with_an_unknown_clock_or_coarse_location_takes_no_part() -> Result {

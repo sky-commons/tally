@@ -1173,7 +1173,10 @@ blocks settle at (2026-10-31, 8.10 ms a seat-second against 4.80), 363 seats hos
 the cores. With the read's memos shared across an engine's areas and a seat's memos and own models
 planned at what the world relay's load measured (2026-11-02, #37: 896 KiB and 288 KiB a seat,
 where 212,992 bytes and 128 KiB had been planned from the reference simulation), still 363,
-bound by the cores (1,178 by the memory). The floors stand; the costs are what the cores must be given or the code made to cost less. No figure of it is copied here: this section held them in
+bound by the cores (1,178 by the memory). With an area's blocks kept by what their events read
+(2026-11-02, RFC-0198: a step's working set 577 KiB a seat against 554), still 363, bound by the
+cores (1,174 by the memory); the refit's cost measured again beside it did not fall (RFC-0198,
+Appendix C), so the costs stand. The floors stand; the costs are what the cores must be given or the code made to cost less. No figure of it is copied here: this section held them in
 a table, and by 2026-10-22 its memory before feeders and its rates no longer matched what the relay
 printed, with nothing to say so.
 
