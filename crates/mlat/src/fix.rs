@@ -62,7 +62,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use tally_mlat_solver::backoff::{Slot, Slots};
-use tally_mlat_solver::pair::{self, Models, PairCache, PairModel, Prepared};
+use tally_mlat_solver::pair::{self, Models, PairCache, PairModel, Prepared, Reads};
 use tally_mlat_solver::{
     Arrived, Considered, ObservationId, SPEC_VERSION, Sites, Transmission, TransmissionKey,
     Unpublished, modes, publish,
@@ -748,14 +748,16 @@ pub struct Refit {
 }
 
 /// Refits every area of `refits` at `edge_ms` over its trailing window of what has arrived
-/// (`Arrived::area_inputs`, `pair::fit`), on up to `threads` threads: the fitted ones, in
-/// `refits`' order.
+/// (`Arrived::area_inputs`, `pair::fit_sharing`), on up to `threads` threads, every read finding
+/// what it can in `reads`, the memos the areas share (what each found anew is left in its cache,
+/// for the caller to hand to them, `PairCache::hand_to`): the fitted ones, in `refits`' order.
 pub fn refit(
     arrived: &Arrived,
     sites: &Sites,
     edge_ms: u64,
     threads: usize,
     refits: &[Refit],
+    reads: &Reads,
     report: &mut Report,
 ) -> Vec<Arc<Held>> {
     let (fitted, part) = parallel(threads.max(1), refits, |refit, report: &mut Report| {
@@ -770,7 +772,7 @@ pub fn refit(
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let fitted = pair::fit(&inputs, warm, &mut cache);
+        let fitted = pair::fit_sharing(&inputs, warm, &mut cache, reads);
         drop(cache);
         report.fit_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         #[cfg(tally_refit_probe)]

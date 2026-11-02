@@ -50,7 +50,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tally_mlat_solver::arrived::{Limits, Rates};
-use tally_mlat_solver::pair::{Models, PairCache, PairModel};
+use tally_mlat_solver::pair::{Models, PairCache, PairModel, Reads};
 use tally_mlat_solver::{
     Admitted, Arrived, BatchId, ObservationId, Reception, Sites, Trailing, TransmissionKey,
 };
@@ -322,6 +322,12 @@ pub struct Engine {
     /// used at, forgotten once that is a trailing window old. One an area, kept apart from
     /// nothing a verdict rests on: the memos change no result.
     caches: Tree<Region, AreaCache>,
+    /// The read's memos every area's refit shares (`pair::Reads`): each message as read once,
+    /// however many areas count its receiver among their members, kept while a refit of the last
+    /// edge or the one before read it. Before (2026-11-02) each area kept its own in its `caches`
+    /// entry, some twenty copies of each message, and the memos held about six times their plan
+    /// (#37).
+    reads: Reads,
     /// The transmissions published, by key: how many receptions the last fix of each considered,
     /// so only a bigger set is solved again.
     solved: Tree<TransmissionKey, Solved>,
@@ -364,6 +370,7 @@ impl Engine {
             shards: (0..SHARDS).map(|_| Shard::default()).collect(),
             models: Tree::new(),
             caches: Tree::new(),
+            reads: Reads::default(),
             solved: Tree::new(),
             slots: Slots::default(),
             positions_sequence: 0,
@@ -389,18 +396,8 @@ impl Engine {
             + self.shards.iter().map(Shard::bytes).sum::<usize>()
             + self.shards.capacity() * size_of::<Shard>()
             + self.models.bytes()
-            + self
-                .models
-                .values()
-                .filter(|held| held.own)
-                .map(|held| held.bytes())
-                .sum::<usize>()
-            + self.caches.bytes()
-            + self
-                .caches
-                .values()
-                .map(|area| area.cache.bytes())
-                .sum::<usize>()
+            + self.own_models_bytes()
+            + self.memos_bytes()
             + self.solved.bytes()
             + self.solved.values().map(Solved::bytes).sum::<usize>()
             + self.slots.bytes(fix::Work::bytes)
@@ -482,13 +479,28 @@ impl Engine {
         self.models.len()
     }
 
-    /// Each owned area's memos (what its next refit starts from), with what they hold
-    /// (`PairCache::bytes`): what a host plans the warm areas by.
-    pub fn area_caches(&self) -> Vec<(Region, usize)> {
-        self.caches
-            .iter()
-            .map(|(area, cached)| (*area, cached.cache.bytes()))
-            .collect()
+    /// What its memos hold, as `Engine::bytes` counts them: each area's (`PairCache::bytes`:
+    /// what its next refit or check starts from), their table, and the read's memos the areas
+    /// share. What a host plans for each seat (`tally_relay::mlat_host::MEMOS_BYTES_PER_SEAT`).
+    pub fn memos_bytes(&self) -> usize {
+        self.caches.bytes()
+            + self
+                .caches
+                .values()
+                .map(|area| area.cache.bytes())
+                .sum::<usize>()
+            + self.reads.bytes()
+    }
+
+    /// What its own models hold, as `Engine::bytes` counts them: every edge of each owned area's
+    /// that any fix may still cite. What a host plans for each seat
+    /// (`tally_relay::mlat_host::OWN_MODELS_BYTES_PER_SEAT`).
+    pub fn own_models_bytes(&self) -> usize {
+        self.models
+            .values()
+            .filter(|held| held.own)
+            .map(|held| held.bytes())
+            .sum()
     }
 
     /// The model of `area` at `edge_ms` it holds, if any: its own, or one its host handed it.
@@ -681,12 +693,15 @@ impl Engine {
             cache: PairCache::default(),
         });
         area.used_ms = area.used_ms.max(edge_ms);
+        // The area's check reads with the memos the refits share, lent and taken back.
+        area.cache.swap_reads(&mut self.reads);
         let verdict = tally_mlat_solver::verify_pair_model_held(
             &sites,
             model,
             &self.arrived,
             &mut area.cache,
         );
+        area.cache.swap_reads(&mut self.reads);
         verdict.judged().then(|| verdict.passed())
     }
 
@@ -992,6 +1007,9 @@ impl Engine {
                 ),
             })
             .collect();
+        // What no refit of the last edge or of this one read (`pair::Reads`).
+        self.reads
+            .forget_before(edge_ms.saturating_sub(REFIT_EVERY_MS));
         if refits.is_empty() {
             return;
         }
@@ -1001,21 +1019,24 @@ impl Engine {
             edge_ms,
             self.settings.threads,
             &refits,
+            &self.reads,
             report,
         );
         for held in fitted {
             self.models.insert((held.area(), held.edge_ms()), held);
         }
         for refit in refits {
+            let mut cache = refit
+                .cache
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache.hand_to(&mut self.reads);
             self.caches.insert(
                 refit.area,
                 AreaCache {
                     fitted_ms: Some(edge_ms),
                     used_ms: edge_ms,
-                    cache: refit
-                        .cache
-                        .into_inner()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    cache,
                 },
             );
         }

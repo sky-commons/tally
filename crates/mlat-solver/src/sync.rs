@@ -5,9 +5,11 @@
 //! fit, jumps and noise share (crate docs, § The pairwise path). Every loop runs in a canonical
 //! order (`BTreeMap`, sorted vectors), so what is read does not depend on the order of the input.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tally_wire::PublicKey;
+use tally_wire::footprint;
 
 use crate::clock::{ClockKey, DAY_NS, Timebase};
 use crate::geo::{self, Geodetic};
@@ -96,24 +98,36 @@ fn site_table(sites: &[Site]) -> BTreeMap<PublicKey, SiteInfo> {
         .collect()
 }
 
-/// Each distinct message as read, by its hash, kept while some reads carry it: one not used by a
-/// read is let go once the unused outnumber the used (`finish`).
+/// Each distinct message as read, by its hash, shared by every area one holder fits
+/// (`pair::fit_sharing`): a message is read the same whatever area reads it, and a seat is a member
+/// of many areas (its own and every area one of whose receivers keeps it, `Sites::members`), so
+/// each area keeping its own (as before, 2026-11-02) held each message once for every area it was
+/// read in, some twenty times, the memos about six times their plan (#37). Reads only look an entry
+/// up (several areas at once, on the engine's threads): what a read finds missing or decodes anew
+/// it keeps aside in its area's `ReadCache` (`fresh`), taken in once the reads are done (`absorb`),
+/// in the areas' order. An entry is kept while a read of a trailing edge less than
+/// `tally_wire::budget::REFIT_EVERY_MS` older than the newest used it (`forget_before`), so every
+/// area's next refit finds what its last read. A memo changes no result: a read finds in it only
+/// what it would read anew.
 #[derive(Default)]
-pub(crate) struct ReadCache {
-    /// The read the entries were last used by.
-    generation: u64,
-    /// Each message's place in `parsed`, by its hash (`obs::ByDigest`: what the table grows to,
-    /// its deleted slots taken in turn, is the same on every run, so what an area's memos hold,
-    /// `mlat_host::AREA_CACHE_BYTES_PER_RECEIVER`, is measured, not drawn).
-    index: std::collections::HashMap<[u8; 32], u32, crate::obs::ByDigest>,
-    parsed: Vec<Parsed>,
-    /// Entries the read under way used.
-    used: usize,
+pub struct Reads {
+    /// Each message's entry, by its hash (`obs::ByDigest`: what the table grows to is the same on
+    /// every run, so what the memos hold is measured, not drawn).
+    entries: HashMap<[u8; 32], Entry, crate::obs::ByDigest>,
+    /// The table's buckets, so its bytes are what it allocates.
+    table: footprint::Table,
+}
+
+/// One message as read, and the newest trailing edge a read used it at.
+struct Entry {
+    parsed: Parsed,
+    /// Raised by the reads that find it (on several threads at once): only ever to a later edge.
+    seen_ms: AtomicU64,
 }
 
 /// One message's bytes as the fit reads them.
+#[derive(Clone, Copy)]
 struct Parsed {
-    seen: u64,
     address: Option<u32>,
     nacp: Option<u8>,
     /// Its airborne position, when it is a sync message (a DF17/18 position with a type code).
@@ -131,9 +145,8 @@ struct Decoded {
 }
 
 impl Parsed {
-    fn of(data: &[u8], seen: u64) -> Self {
+    fn of(data: &[u8]) -> Self {
         Self {
-            seen,
             address: modes::address(data),
             nacp: modes::nacp(data),
             position: modes::type_code(data).and_then(|_| modes::airborne_position(data)),
@@ -141,13 +154,27 @@ impl Parsed {
         }
     }
 
+    /// Its decode against `reference` as memoized, if it is: `Some(None)` when it has no position
+    /// to decode.
+    fn decoded(&self, reference: modes::LatLon) -> Option<Option<Decoded>> {
+        let Some(altitude) = self.position.map(|position| position.altitude) else {
+            return Some(None);
+        };
+        if altitude.is_none() {
+            return Some(None);
+        }
+        self.decoded
+            .filter(|held| held.reference == reference)
+            .map(Some)
+    }
+
     /// Its decode against `reference` (crate docs, § Sync events, 4): memoized by reference.
     fn decode(&mut self, reference: modes::LatLon) -> Option<Decoded> {
+        if let Some(held) = self.decoded(reference) {
+            return held;
+        }
         let position = self.position?;
         let altitude = position.altitude?;
-        if let Some(held) = self.decoded.filter(|held| held.reference == reference) {
-            return Some(held);
-        }
         let decoded = modes::cpr_local(
             (position.lat_cpr, position.lon_cpr),
             position.odd,
@@ -178,71 +205,120 @@ impl Parsed {
     }
 }
 
-impl ReadCache {
-    /// Bytes it holds, as allocated: each message's hash and place, and what was read of it.
-    pub(crate) fn bytes(&self) -> usize {
-        self.index.capacity() * (size_of::<[u8; 32]>() + size_of::<u32>() + 8)
-            + self.parsed.capacity() * size_of::<Parsed>()
+impl Reads {
+    /// Bytes it holds, as allocated.
+    pub fn bytes(&self) -> usize {
+        self.table.bytes::<[u8; 32], Entry>()
     }
 
-    /// Starts a read: entries not used by it may be let go at its end (`finish`).
-    fn begin(&mut self) {
-        self.generation += 1;
-        self.used = 0;
+    /// Entries held.
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 
-    /// The place of `message`'s entry, read now if it has none.
-    fn slot(&mut self, message: &SyncMessage) -> u32 {
-        let generation = self.generation;
-        let next = u32::try_from(self.parsed.len()).unwrap_or(u32::MAX);
-        let at = *self.index.entry(message.hash).or_insert(next);
-        if at == next {
-            self.parsed.push(Parsed::of(&message.data, generation));
-            self.used += 1;
-        } else if let Some(parsed) = self.parsed.get_mut(at as usize)
-            && parsed.seen != generation
-        {
-            parsed.seen = generation;
-            self.used += 1;
-        }
-        at
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
-    /// Ends a read: once the entries it did not use outnumber those it did, they are let go.
-    fn finish(&mut self) {
-        if self.parsed.len() <= 2 * self.used {
-            return;
-        }
-        let generation = self.generation;
-        let mut renumbered = vec![u32::MAX; self.parsed.len()];
-        let mut kept = 0u32;
-        for (at, parsed) in self.parsed.iter().enumerate() {
-            if parsed.seen == generation {
-                renumbered[at] = kept;
-                kept += 1;
+    /// Takes in what `cache`'s last read parsed or decoded anew, each seen at that read's edge;
+    /// `cache` keeps none of it.
+    pub(crate) fn absorb(&mut self, cache: &mut ReadCache) {
+        let edge_ms = cache.edge_ms;
+        for (hash, parsed) in std::mem::take(&mut cache.fresh) {
+            match self.entries.entry(hash) {
+                std::collections::hash_map::Entry::Occupied(mut held) => {
+                    let held = held.get_mut();
+                    held.parsed = parsed;
+                    *held.seen_ms.get_mut() = (*held.seen_ms.get_mut()).max(edge_ms);
+                }
+                std::collections::hash_map::Entry::Vacant(place) => {
+                    place.insert(Entry {
+                        parsed,
+                        seen_ms: AtomicU64::new(edge_ms),
+                    });
+                    self.table.inserted(self.entries.capacity());
+                }
             }
         }
-        self.parsed.retain(|parsed| parsed.seen == generation);
-        self.index.retain(|_, at| {
-            *at = renumbered[*at as usize];
-            *at != u32::MAX
-        });
+    }
+
+    /// Lets go of every entry no read at `edge_ms` or after used, and of the table's room past
+    /// four times what it then holds (`footprint::Table::kept`'s rule).
+    pub fn forget_before(&mut self, edge_ms: u64) {
+        self.entries
+            .retain(|_, entry| *entry.seen_ms.get_mut() >= edge_ms);
+        let len = self.entries.len();
+        if self.table.buckets() > 0 && footprint::capacity_of(self.table.buckets()) > 4 * len {
+            self.entries.shrink_to(2 * len);
+            self.table.shrunk::<[u8; 32], Entry>(len, 2 * len);
+        }
     }
 }
 
-/// The messages of one read (`Inputs::messages`), each resolved to its cache entry once.
+/// An area's part of the read's memos: what its last read parsed or decoded that the memos it read
+/// did not hold, until they take it in (`Reads::absorb`), and the memos it keeps of its own when it
+/// is fitted alone (`pair::fit`), not beside other areas (`pair::fit_sharing`).
+#[derive(Default)]
+pub(crate) struct ReadCache {
+    pub(crate) own: Reads,
+    fresh: Vec<([u8; 32], Parsed)>,
+    /// The trailing edge of the read `fresh` is of.
+    edge_ms: u64,
+}
+
+impl ReadCache {
+    /// Bytes it holds, as allocated: its own memos and what its last read found anew.
+    pub(crate) fn bytes(&self) -> usize {
+        self.own.bytes() + footprint::vec::<([u8; 32], Parsed)>(self.fresh.capacity())
+    }
+
+    /// Takes what its last read found anew into its own memos, and lets go of what no read of
+    /// the last refit's edge or since used.
+    pub(crate) fn settle(&mut self) {
+        let mut own = std::mem::take(&mut self.own);
+        own.absorb(self);
+        own.forget_before(
+            self.edge_ms
+                .saturating_sub(tally_wire::budget::REFIT_EVERY_MS),
+        );
+        self.own = own;
+    }
+}
+
+/// Where a read found a message: not looked for yet, in the memos it reads, or among those it
+/// read anew (`ReadCache::fresh`).
+#[derive(Clone, Copy)]
+enum Slot<'r> {
+    Unread,
+    Held(&'r Parsed),
+    Fresh(u32),
+}
+
+/// The messages of one read (`Inputs::messages`), each resolved to its memo once.
 struct Messages<'r> {
-    cache: &'r mut ReadCache,
+    reads: &'r Reads,
+    fresh: &'r mut Vec<([u8; 32], Parsed)>,
+    edge_ms: u64,
     of: &'r [SyncMessage],
-    slots: Vec<u32>,
+    slots: Vec<Slot<'r>>,
 }
 
 impl<'r> Messages<'r> {
-    fn new(cache: &'r mut ReadCache, of: &'r [SyncMessage]) -> Self {
+    /// The messages `of` of a read at trailing edge `edge_ms`, found in `reads` or read anew into
+    /// `fresh`.
+    fn new(
+        reads: &'r Reads,
+        fresh: &'r mut Vec<([u8; 32], Parsed)>,
+        edge_ms: u64,
+        of: &'r [SyncMessage],
+    ) -> Self {
+        fresh.clear();
         Self {
-            cache,
+            reads,
+            fresh,
+            edge_ms,
             of,
-            slots: vec![u32::MAX; of.len()],
+            slots: vec![Slot::Unread; of.len()],
         }
     }
 
@@ -254,12 +330,56 @@ impl<'r> Messages<'r> {
         self.of[message as usize].hash
     }
 
-    fn parsed(&mut self, message: u32) -> &mut Parsed {
-        let slot = &mut self.slots[message as usize];
-        if *slot == u32::MAX {
-            *slot = self.cache.slot(&self.of[message as usize]);
+    /// Where `message` is: found in the memos (its use there marked) or read now.
+    fn slot(&mut self, message: u32) -> Slot<'r> {
+        let slot = self.slots[message as usize];
+        if !matches!(slot, Slot::Unread) {
+            return slot;
         }
-        &mut self.cache.parsed[*slot as usize]
+        let of = &self.of[message as usize];
+        let slot = match self.reads.entries.get(&of.hash) {
+            Some(entry) => {
+                // Raised only once an edge, so the reads of one edge share the line unwritten.
+                if entry.seen_ms.load(Ordering::Relaxed) < self.edge_ms {
+                    entry.seen_ms.fetch_max(self.edge_ms, Ordering::Relaxed);
+                }
+                Slot::Held(&entry.parsed)
+            }
+            None => {
+                self.fresh.push((of.hash, Parsed::of(&of.data)));
+                Slot::Fresh(u32::try_from(self.fresh.len() - 1).unwrap_or(u32::MAX))
+            }
+        };
+        self.slots[message as usize] = slot;
+        slot
+    }
+
+    fn parsed(&mut self, message: u32) -> &Parsed {
+        match self.slot(message) {
+            Slot::Held(parsed) => parsed,
+            Slot::Fresh(at) => &self.fresh[at as usize].1,
+            Slot::Unread => unreachable!("resolved above"),
+        }
+    }
+
+    /// `message`'s decode against `reference` (`Parsed::decode`): one the memos do not hold is
+    /// made here, and kept with the read's fresh entries.
+    fn decode(&mut self, message: u32, reference: modes::LatLon) -> Option<Decoded> {
+        match self.slot(message) {
+            Slot::Fresh(at) => self.fresh[at as usize].1.decode(reference),
+            Slot::Held(parsed) => {
+                if let Some(held) = parsed.decoded(reference) {
+                    return held;
+                }
+                let mut parsed = *parsed;
+                let decoded = parsed.decode(reference);
+                self.fresh.push((self.of[message as usize].hash, parsed));
+                self.slots[message as usize] =
+                    Slot::Fresh(u32::try_from(self.fresh.len() - 1).unwrap_or(u32::MAX));
+                decoded
+            }
+            Slot::Unread => unreachable!("resolved above"),
+        }
     }
 }
 
@@ -470,12 +590,24 @@ pub(crate) struct Reader<'r> {
 }
 
 impl<'r> Reader<'r> {
-    /// The inputs read once: every reception linearized and indexed.
-    pub(crate) fn new(inputs: &'r Inputs, cache: &'r mut ReadCache) -> Self {
-        cache.begin();
+    /// The inputs read once: every reception linearized and indexed, each message found in
+    /// `reads` (the memos the area's read shares, `pair::fit_sharing`), or else in `cache`'s own,
+    /// or read anew into `cache`.
+    pub(crate) fn new(
+        inputs: &'r Inputs,
+        cache: &'r mut ReadCache,
+        reads: Option<&'r Reads>,
+    ) -> Self {
+        let ReadCache {
+            own,
+            fresh,
+            edge_ms,
+        } = cache;
+        *edge_ms = inputs.trailing.edge_ms;
+        let reads: &'r Reads = reads.unwrap_or(own);
         let sites = site_table(&inputs.scope);
         let (rxs, clocks) = linearize(&sites, inputs);
-        let mut messages = Messages::new(cache, &inputs.messages);
+        let mut messages = Messages::new(reads, fresh, inputs.trailing.edge_ms, &inputs.messages);
         let count = inputs.messages.len();
         let mut starts = vec![0usize; count + 1];
         for rx in &rxs {
@@ -563,11 +695,6 @@ impl<'r> Reader<'r> {
             nacp,
             references: BTreeMap::new(),
         }
-    }
-
-    /// Ends the read: the parse memos it did not use may be let go (`ReadCache::finish`).
-    pub(crate) fn finish(self) {
-        self.messages.cache.finish();
     }
 
     /// The hash of message `message`.
@@ -703,7 +830,7 @@ impl<'r> Reader<'r> {
             let Some(reference) = self.reference(address, second) else {
                 continue;
             };
-            let Some(decoded) = self.messages.parsed(message).decode(reference) else {
+            let Some(decoded) = self.messages.decode(message, reference) else {
                 continue;
             };
             if !decoded.near {
