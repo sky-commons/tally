@@ -806,6 +806,55 @@ Those are driven by 89% to 92% of receptions sitting in a second whose read span
 changes those seconds every refit, while three quarters of their pairs' points stay the same, is
 not established. It is the question to answer before any further design.
 
+**Why seconds are read again (2026-11-02).** This was slice 1's second follow-up, approved by the
+founder. It was measured on post-#43 main, in five relay runs at the world plan with no other relay
+on the host, under light load (1-minute load 4.9 to 8.8 at start, 6.9 to 14.7 at end).
+
+*The question.* Each changed second, and each second read again because its read span changed,
+was classified by the first input that differed from the last refit:
+- a new second at the window's edge;
+- a second dropped at its tail;
+- a reception moved between seconds;
+- receptions added or removed, split into sync (positions) and status (operational status,
+  NACp);
+- both added and removed;
+- the same receptions with a different wall clock.
+
+*Results,* by the receptions in re-read seconds, the median across runs:
+- status receptions only, added or removed: 58% (29% added, 29% removed);
+- both added and removed: 19%;
+- a new second at the edge: 10.5%;
+- sync receptions added: 6.3%;
+- sync receptions removed: 5.6%;
+- moved, dropped and wall-clock-only: 0.
+
+The added and removed receptions sit throughout the window, 0 to 20 s behind the edge, not only
+at its ends. 67% of the re-read seconds formed exactly the points they had formed before.
+
+*The cause.* An area's inputs keep every member reception of an operational status message whose
+aircraft has a kept event anywhere in the window (`Arrived::collect`). As the window slides and
+aircraft gain or lose their only kept events, their status receptions join and leave seconds
+throughout the window. The per-second digest hashes every reception read, so each such change
+re-reads the seconds around it. A second's points depend on a status reception only through the
+NACp it gives an event in that second's read span.
+
+The sync receptions that join and leave old seconds, about 3.7 receivers a changed second, are a
+smaller second cause, and are not isolated here.
+
+*A fix and its ceiling.* The fix would digest each second's sync receptions, plus the NACp each
+event's lookup finds, instead of every reception read. That is an invalidation rule only:
+neither the inputs nor any block changes. Measured as an oracle in the same runs (a digest of sync
+receptions alone, with per-pair builds and held reads):
+- the re-read fraction falls from 0.90 to 0.38;
+- the ratio against the same run's baseline falls to 0.436 to 0.441, a median of 0.439;
+- the seconds this digest skips never had their formed points change: 0 in about 280,000;
+- perfect knowledge of which seconds' points change would reach 0.385.
+
+That is below slice 1's 0.6. It would justify a redesigned slice 3: sync-and-NACp invalidation,
+per-pair rebuilds and held reads together. A refit at about 0.44 of today's 5.04 ms is about
+2.2 ms a seat-second; with the shadow check, `tally-relay check` planned about 554 world-relay
+seats at 2.25 ms in the fourth revision.
+
 ## Appendix D: what an exact-integer-sums RFC must specify
 
 This is recorded for slice 6, which this RFC does not propose. An RFC that proposes exact integer

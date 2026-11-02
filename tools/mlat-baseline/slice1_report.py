@@ -82,6 +82,47 @@ if perpair_parts is not None:
     }
     if seats:
         out["perpair"]["ms_a_seat_second"] = round(perpair / 1e6 / window / seats, 3)
+if "rr_sec_new" in delta:
+    causes = ["new", "dropped", "moved", "late_sync", "late_status", "removed_sync", "removed_status", "both", "wall"]
+    sec_total = sum(delta[f"rr_sec_{c}"] for c in causes)
+    rx_total = sum(delta[f"rr_rx_{c}"] for c in causes)
+    f_changed = delta["rx_reread_changed"] / max(1, delta["receptions_read"])
+    formed_parts = None
+    if perpair_parts is not None:
+        # The ceiling of reading and forming only the re-read seconds whose formed points changed
+        # (an oracle: which those are is known only once they are formed), with per-pair builds.
+        formed_parts = dict(perpair_parts)
+        formed_parts["reads"] = sum(delta[k] for k in reads) * f_changed
+        formed_parts["formation"] = delta["oracle_formation_changed_ns"]
+    out["reread"] = {
+        "cause_by_seconds": {c: round(delta[f"rr_sec_{c}"] / max(1, sec_total), 4) for c in causes},
+        "cause_by_receptions": {c: round(delta[f"rr_rx_{c}"] / max(1, rx_total), 4) for c in causes},
+        "changed_seconds": {c: delta[f"chg_{c}"] for c in causes},
+        "receptions_added": {"sync": delta["rx_added_sync"], "status": delta["rx_added_status"]}, "receptions_removed": {"sync": delta["rx_removed_sync"], "status": delta["rx_removed_status"]}, "receptions_moved": delta["rx_moved"],
+        "late_seconds": delta["late_seconds"],
+        "late_receivers_a_second": round(delta["late_receivers"] / max(1, delta["late_seconds"]), 2),
+        "late_age_behind_last_edge_s": {k: delta[f"late_age_{k}"] for k in ("0_2", "2_4", "4_8", "8_16", "16_20", "20_up")},
+        "removed_age_behind_last_edge_s": {k: delta[f"removed_age_{k}"] for k in ("0_2", "2_4", "4_8", "8_16", "16_20", "20_up")},
+        "formed_identical_by_seconds": round(delta["rr_formed_identical"] / max(1, delta["rr_formed_seconds"]), 4),
+        "formed_identical_by_receptions": round(delta["rr_formed_identical_rx"] / max(1, delta["rr_formed_rx"]), 4),
+        "reread_fraction_points_changed": round(f_changed, 4),
+    }
+    if perpair_parts is not None and "receptions_reread_sync" in delta:
+        f_sync = delta["receptions_reread_sync"] / max(1, delta["receptions_read"])
+        sync_parts = dict(perpair_parts)
+        sync_parts["reads"] = sum(delta[k] for k in reads) * f_sync
+        sync_parts["formation"] = delta["oracle_formation_sync_ns"]
+        out["reread"]["sync_digest"] = {
+            "reread_fraction": round(f_sync, 4),
+            "ratio": round(sum(sync_parts.values()) / max(1, base), 4),
+            "ms_a_refit_by_part": {k: round(v / 1e6 / max(1, delta["refits"]), 3) for k, v in sync_parts.items()},
+            "status_only_seconds_formed": delta["status_only_formed"],
+            "status_only_points_changed": delta["status_only_points_changed"],
+        }
+    if formed_parts is not None:
+        total = sum(formed_parts.values())
+        out["reread"]["ceiling_ratio"] = round(total / max(1, base), 4)
+        out["reread"]["ceiling_ms_a_refit_by_part"] = {k: round(v / 1e6 / max(1, delta["refits"]), 3) for k, v in formed_parts.items()}
 if seats:
     out["baseline_ms_a_seat_second"] = round(base / 1e6 / window / seats, 3)
     out["oracle_ms_a_seat_second"] = round(oracle / 1e6 / window / seats, 3)
