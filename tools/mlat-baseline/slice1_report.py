@@ -23,7 +23,7 @@ if "a" in d:
         "busy_cores_all": (d["b"]["busy"] - d["a"]["busy"]) / d["ticks_per_sec"] / window,
         "harness_cores": (d["b"].get("harness_ticks", 0) - d["a"].get("harness_ticks", 0)) / d["ticks_per_sec"] / window,
         "load_b": d["b"]["load"],
-        "seats_mean": seats, "seats_min": min(d["seats"] or [0]), "load_a": d["a"]["load"],
+        "seats_mean": seats, "other_relays_max": d.get("other_relays_max"), "seats_min": min(d["seats"] or [0]), "load_a": d["a"]["load"],
         "memory": d["b"]["probe"].get("memory"),
     }
 else:
@@ -44,6 +44,20 @@ oracle_parts = {
     "shadow_cold": delta["shadow_ns"],
 }
 oracle = sum(oracle_parts.values())
+# The per-pair oracle (slice 1's follow-up): the same reads and formation, each pair's digest, the
+# builds of only the pairs whose digest changed, the cut blocks settling rebuilds, the rest, and the
+# cold shadow. Present only in a probe built with it.
+perpair_parts = None
+if "perpair_build_ns" in delta:
+    perpair_parts = {
+        "reads": oracle_parts["reads"],
+        "formation": delta["oracle_formation_ns"],
+        "digest": delta["perpair_digest_ns"],
+        "changed_builds": delta["perpair_build_ns"],
+        "cut_builds": delta["cut_build_ns"],
+        "rest": oracle_parts["rest"],
+        "shadow_cold": delta["shadow_ns"],
+    }
 out = {
     "refits": delta["refits"],
     "reread_fraction": round(f, 4),
@@ -57,6 +71,17 @@ out = {
     "rebuilds": {k: delta[k] for k in ("builds_first", "builds_read_after", "builds_late", "blocks_reused", "pair_blocks_rebuilt", "pair_blocks_unchanged")},
     "checks": {k: delta[k] for k in ("order_checks", "order_mismatches", "shadow_runs", "shadow_mismatches", "shadow_failed")},
 }
+if perpair_parts is not None:
+    perpair = sum(perpair_parts.values())
+    out["perpair"] = {
+        "ratio": round(perpair / max(1, base), 4),
+        "ratio_without_shadow": round((perpair - delta["shadow_ns"]) / max(1, base), 4),
+        "ms_a_refit": round(perpair / 1e6 / max(1, delta["refits"]), 3),
+        "ms_a_refit_by_part": {k: round(v / 1e6 / max(1, delta["refits"]), 3) for k, v in perpair_parts.items()},
+        "pair_blocks": {k: delta[k] for k in ("perpair_rebuilt", "perpair_reused", "perpair_digest_misses", "perpair_digest_false")},
+    }
+    if seats:
+        out["perpair"]["ms_a_seat_second"] = round(perpair / 1e6 / window / seats, 3)
 if seats:
     out["baseline_ms_a_seat_second"] = round(base / 1e6 / window / seats, 3)
     out["oracle_ms_a_seat_second"] = round(oracle / 1e6 / window / seats, 3)

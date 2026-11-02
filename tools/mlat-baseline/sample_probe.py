@@ -1,9 +1,12 @@
 """RFC-0198 slice 1 (#40): a probe-built relay's refit counters (TALLY_REFIT_PROBE), /mlat and its
 CPU at two instants of a tally-load run's measured window, and its seats every second.
-usage: sample_probe.py PROBE_FILE FIRST_S SECOND_S OUT (seconds after this starts)."""
+usage: sample_probe.py PROBE_FILE FIRST_S SECOND_S OUT [MATCH] (seconds after this starts; MATCH,
+when given, picks the relay whose command line holds it, its run's state directory, so a relay
+still exiting from the run before is never sampled)."""
 import json, os, sys, time, urllib.request
 
 probe, first, second, out = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+match = sys.argv[5].encode() if len(sys.argv) > 5 else b""
 tck = os.sysconf("SC_CLK_TCK")
 start = time.time()
 
@@ -14,7 +17,7 @@ def relay():
                 cmd = open(f"/proc/{p}/cmdline", "rb").read().split(b"\0")
             except OSError:
                 continue
-            if cmd and cmd[0].endswith(b"tally-relay") and b"--stats-listen" in cmd:
+            if cmd and cmd[0].endswith(b"tally-relay") and b"--stats-listen" in cmd and any(match in c for c in cmd):
                 return int(p), [c.decode() for c in cmd]
     return None, None
 
@@ -56,12 +59,26 @@ def sample():
 
 time.sleep(max(0, start + first - time.time()))
 a = sample()
+def other_relays():
+    count = 0
+    for p in os.listdir("/proc"):
+        if p.isdigit() and int(p) != pid:
+            try:
+                cmd = open(f"/proc/{p}/cmdline", "rb").read().split(b"\0")
+            except OSError:
+                continue
+            if cmd and cmd[0].endswith(b"tally-relay"):
+                count += 1
+    return count
+
 seats = []
+others = []
 while time.time() < start + second:
+    others.append(other_relays())
     m = get("mlat")
     if m:
         seats.append(m.get("seats_taken", 0))
     time.sleep(1)
 b = sample()
-json.dump({"a": a, "b": b, "seats": seats, "ticks_per_sec": tck}, open(out, "w"))
+json.dump({"a": a, "b": b, "seats": seats, "other_relays_max": max(others or [0]), "ticks_per_sec": tck}, open(out, "w"))
 print("sampled", out)
