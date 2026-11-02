@@ -11,7 +11,11 @@ use std::sync::Arc;
 use super::{Clock, KNOT_NS, median, median_of_magnitudes, ns_per_count};
 use crate::clock::{ClockKey, Timebase};
 use crate::geo::C;
+#[cfg(tally_refit_probe)]
+use crate::probe::{self, P};
 use crate::sync::{self, Reader};
+#[cfg(tally_refit_probe)]
+use std::time::Instant;
 
 /// Blocks a block's robust line, scale and jump test pool: its own and the four before it.
 pub const LINE_BLOCKS: u64 = 5;
@@ -213,6 +217,8 @@ pub(super) fn build(
         .map(|(_, p)| (p.la, p.lb))
         .min()?;
     let (ka, kb) = (ns_per_count(ta), ns_per_count(tb));
+    #[cfg(tally_refit_probe)]
+    let started = Instant::now();
     let mut read: Vec<Read> = pooled
         .iter()
         .map(|(second, p)| {
@@ -226,6 +232,10 @@ pub(super) fn build(
             }
         })
         .collect();
+    #[cfg(tally_refit_probe)]
+    probe::since(P::copy_ns, started);
+    #[cfg(tally_refit_probe)]
+    let started = Instant::now();
     read.sort_by(|p, q| {
         p.x.total_cmp(&q.x)
             .then(p.point.la.cmp(&q.point.la))
@@ -233,6 +243,10 @@ pub(super) fn build(
             .then(p.point.address.cmp(&q.point.address))
             .then(p.second.cmp(&q.second))
     });
+    #[cfg(tally_refit_probe)]
+    probe::since(P::sort_ns, started);
+    #[cfg(tally_refit_probe)]
+    let started = Instant::now();
     let mut high = (i64::MIN, i64::MIN);
     let mut pooled_low = (i64::MAX, i64::MAX);
     let mut points = 0u32;
@@ -252,10 +266,14 @@ pub(super) fn build(
         units: Vec::new(),
         steps: Vec::new(),
     };
+    #[cfg(tally_refit_probe)]
+    probe::since(P::copy_ns, started);
     let n = read.len();
     if n < LINE_LEAST {
         return Some(block);
     }
+    #[cfg(tally_refit_probe)]
+    let started = Instant::now();
     // The line through the medians of the two halves, and the residuals' robust scale about it.
     let half = n / 2;
     let (mut xl, mut yl): (Vec<f64>, Vec<f64>) = read[..half].iter().map(|p| (p.x, p.y)).unzip();
@@ -271,12 +289,24 @@ pub(super) fn build(
     } else {
         0.0
     };
+    #[cfg(tally_refit_probe)]
+    probe::since(P::line_ns, started);
+    #[cfg(tally_refit_probe)]
+    let started = Instant::now();
     let residuals: Vec<f64> = read
         .iter()
         .map(|p| p.y - (myl + slope * (p.x - mxl)))
         .collect();
+    #[cfg(tally_refit_probe)]
+    probe::since(P::residuals_ns, started);
+    #[cfg(tally_refit_probe)]
+    let started = Instant::now();
     let mut magnitudes: Vec<u64> = residuals.iter().map(|r| r.abs().to_bits()).collect();
     let scale = (1.4826 * median_of_magnitudes(&mut magnitudes)).max(SCALE_FLOOR_NS);
+    #[cfg(tally_refit_probe)]
+    probe::since(P::mad_ns, started);
+    #[cfg(tally_refit_probe)]
+    let started = Instant::now();
     // Of the steps, the largest located in each second (ties to the earliest).
     let mut best: BTreeMap<u64, Step> = BTreeMap::new();
     for (cut, score) in steps(&residuals) {
@@ -293,6 +323,10 @@ pub(super) fn build(
         }
     }
     block.steps = best.into_values().collect();
+    #[cfg(tally_refit_probe)]
+    probe::since(P::steps_ns, started);
+    #[cfg(tally_refit_probe)]
+    let started = Instant::now();
     // Its own inliers, by knot interval of `a`'s grid.
     let kc = ta.knot_counts();
     let mut units: BTreeMap<i64, (Unit, BTreeMap<u32, Sums>)> = BTreeMap::new();
@@ -356,8 +390,14 @@ pub(super) fn build(
             unit
         })
         .collect();
+    #[cfg(tally_refit_probe)]
+    probe::since(P::sums_ns, started);
     Some(block)
 }
+
+/// The probe's exact-key run of one pair's points of one second, each with its second.
+#[cfg(tally_refit_probe)]
+type Run = Vec<(u64, RawPoint)>;
 
 /// One second's points, by pair of window clocks `(a, b)`, `a < b`, and its events.
 #[derive(Default)]
@@ -375,6 +415,14 @@ pub(super) struct Raw<'r> {
     /// Each window clock's network pairs above it, ascending.
     above: Vec<Vec<u32>>,
     seconds: BTreeMap<u64, Second>,
+    /// The probe's: the seconds slice 3 would read again (their read span changed), each pair's
+    /// exact-key run of a second made this refit, and the builds counted.
+    #[cfg(tally_refit_probe)]
+    pub(super) reread: std::collections::BTreeSet<u64>,
+    #[cfg(tally_refit_probe)]
+    runs: BTreeMap<((u32, u32), u64), Run>,
+    #[cfg(tally_refit_probe)]
+    builds: u64,
 }
 
 impl<'r> Raw<'r> {
@@ -384,6 +432,12 @@ impl<'r> Raw<'r> {
             window_of,
             above,
             seconds: BTreeMap::new(),
+            #[cfg(tally_refit_probe)]
+            reread: std::collections::BTreeSet::new(),
+            #[cfg(tally_refit_probe)]
+            runs: BTreeMap::new(),
+            #[cfg(tally_refit_probe)]
+            builds: 0,
         }
     }
 
@@ -393,6 +447,8 @@ impl<'r> Raw<'r> {
 
     fn second(&mut self, second: u64) -> &Second {
         if !self.seconds.contains_key(&second) {
+            #[cfg(tally_refit_probe)]
+            let started = Instant::now();
             let events = self.reader.events(second);
             let mut out = Second {
                 events: events.len(),
@@ -428,6 +484,13 @@ impl<'r> Raw<'r> {
                 }
             }
             self.seconds.insert(second, out);
+            #[cfg(tally_refit_probe)]
+            {
+                let ns = probe::since(P::formation_ns, started);
+                if self.reread.contains(&second) {
+                    probe::add(P::oracle_formation_ns, ns);
+                }
+            }
         }
         &self.seconds[&second]
     }
@@ -451,6 +514,11 @@ impl<'r> Raw<'r> {
         timebases: (Timebase, Timebase),
         from: (Option<i64>, Option<i64>),
     ) -> Option<PairBlock> {
+        for second in own.saturating_sub(LINE_BLOCKS - 1)..=own {
+            self.second(second);
+        }
+        #[cfg(tally_refit_probe)]
+        let started = Instant::now();
         let mut pooled: Vec<(u64, RawPoint)> = Vec::new();
         for second in own.saturating_sub(LINE_BLOCKS - 1)..=own {
             if let Some(list) = self.second(second).pairs.get(&pair) {
@@ -464,8 +532,165 @@ impl<'r> Raw<'r> {
                 );
             }
         }
+        #[cfg(tally_refit_probe)]
+        {
+            probe::since(P::copy_ns, started);
+            self.oracle(pair, own, timebases, from, &pooled);
+        }
         build(own, &pooled, timebases)
     }
+
+    /// The oracle's pooling (slice 3's ceiling, RFC-0198 §5): each pooled second's points of the
+    /// pair as a run in the exact key's order (made once a refit, charged only for a second slice 3
+    /// would read again), merged by that key, `x` recomputed in the block's frame, then an insertion
+    /// pass in version 8's order. One build in 16 checks the result against version 8's sort.
+    #[cfg(tally_refit_probe)]
+    fn oracle(
+        &mut self,
+        pair: (u32, u32),
+        own: u64,
+        (ta, tb): (Timebase, Timebase),
+        from: (Option<i64>, Option<i64>),
+        pooled: &[(u64, RawPoint)],
+    ) {
+        type Point = (f64, f64, u64, RawPoint);
+        let exact = |(second, p): &(u64, RawPoint)| (p.la, p.lb, p.address, *second);
+        let order = |p: &Point, q: &Point| {
+            p.0.total_cmp(&q.0)
+                .then(p.3.la.cmp(&q.3.la))
+                .then(p.3.lb.cmp(&q.3.lb))
+                .then(p.3.address.cmp(&q.3.address))
+                .then(p.2.cmp(&q.2))
+        };
+        let seconds: Vec<u64> = (own.saturating_sub(LINE_BLOCKS - 1)..=own).collect();
+        for second in &seconds {
+            let key = (pair, *second);
+            if !self.runs.contains_key(&key) {
+                let started = Instant::now();
+                let mut run: Vec<(u64, RawPoint)> = self
+                    .seconds
+                    .get(second)
+                    .and_then(|held| held.pairs.get(&pair))
+                    .map(|list| list.iter().map(|p| (*second, *p)).collect())
+                    .unwrap_or_default();
+                run.sort_by_key(exact);
+                let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                if self.reread.contains(second) {
+                    probe::add(P::oracle_runsort_ns, ns);
+                }
+                self.runs.insert(key, run);
+            }
+        }
+        let started = Instant::now();
+        let lists: Vec<&Vec<(u64, RawPoint)>> = seconds
+            .iter()
+            .filter_map(|second| self.runs.get(&(pair, *second)))
+            .collect();
+        let kept = |p: &RawPoint| {
+            from.0.is_none_or(|from| p.la >= from) && from.1.is_none_or(|from| p.lb >= from)
+        };
+        let Some(refs) = pooled
+            .iter()
+            .filter(|(second, _)| *second == own)
+            .map(|(_, p)| (p.la, p.lb))
+            .min()
+        else {
+            probe::since(P::oracle_merge_ns, started);
+            return;
+        };
+        let (ka, kb) = (ns_per_count(ta), ns_per_count(tb));
+        let mut heads = vec![0usize; lists.len()];
+        let mut merged: Vec<Point> = Vec::with_capacity(pooled.len());
+        loop {
+            let mut best: Option<usize> = None;
+            for (i, list) in lists.iter().enumerate() {
+                while heads[i] < list.len() && !kept(&list[heads[i]].1) {
+                    heads[i] += 1;
+                }
+                if heads[i] < list.len()
+                    && best.is_none_or(|b| exact(&list[heads[i]]) < exact(&lists[b][heads[b]]))
+                {
+                    best = Some(i);
+                }
+            }
+            let Some(i) = best else { break };
+            let (second, p) = lists[i][heads[i]];
+            heads[i] += 1;
+            let x = (p.la - refs.0) as f64 * ka - p.range_a;
+            let y = (p.lb - refs.1) as f64 * kb - p.range_b - x;
+            merged.push((x, y, second, p));
+        }
+        for i in 1..merged.len() {
+            let mut j = i;
+            while j > 0 && order(&merged[j], &merged[j - 1]).is_lt() {
+                merged.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+        probe::since(P::oracle_merge_ns, started);
+        self.builds += 1;
+        if self.builds.is_multiple_of(16) {
+            let mut sorted: Vec<Point> = pooled
+                .iter()
+                .map(|(second, p)| {
+                    let x = (p.la - refs.0) as f64 * ka - p.range_a;
+                    let y = (p.lb - refs.1) as f64 * kb - p.range_b - x;
+                    (x, y, *second, *p)
+                })
+                .collect();
+            sorted.sort_by(order);
+            probe::add(P::order_checks, 1);
+            let same = sorted.len() == merged.len()
+                && sorted.iter().zip(&merged).all(|(a, b)| {
+                    a.0.to_bits() == b.0.to_bits()
+                        && a.1.to_bits() == b.1.to_bits()
+                        && a.2 == b.2
+                        && (a.3.la, a.3.lb, a.3.address) == (b.3.la, b.3.lb, b.3.address)
+                });
+            if !same {
+                probe::add(P::order_mismatches, 1);
+            }
+        }
+    }
+}
+
+/// Whether two blocks hold the same, to the bit (the probe's per-pair invalidation count).
+#[cfg(tally_refit_probe)]
+fn same_block(a: &PairBlock, b: &PairBlock) -> bool {
+    let units = |x: &Unit, y: &Unit| {
+        x.knot == y.knot
+            && x.alpha.to_bits() == y.alpha.to_bits()
+            && x.beta.to_bits() == y.beta.to_bits()
+            && x.ww.to_bits() == y.ww.to_bits()
+            && x.weighted
+                .iter()
+                .zip(&y.weighted)
+                .all(|(p, q)| p.to_bits() == q.to_bits())
+            && x.plain
+                .iter()
+                .zip(&y.plain)
+                .all(|(p, q)| p.to_bits() == q.to_bits())
+            && x.aircraft.len() == y.aircraft.len()
+            && x.aircraft.iter().zip(&y.aircraft).all(|(p, q)| {
+                p.address == q.address
+                    && p.ww.to_bits() == q.ww.to_bits()
+                    && p.plain
+                        .iter()
+                        .zip(&q.plain)
+                        .all(|(r, s)| r.to_bits() == s.to_bits())
+                    && p.weighted
+                        .iter()
+                        .zip(&q.weighted)
+                        .all(|(r, s)| r.to_bits() == s.to_bits())
+            })
+    };
+    a.refs == b.refs
+        && a.points == b.points
+        && a.high == b.high
+        && a.pooled_low == b.pooled_low
+        && a.steps == b.steps
+        && a.units.len() == b.units.len()
+        && a.units.iter().zip(&b.units).all(|(x, y)| units(x, y))
 }
 
 /// What a block of a second read: a digest of every reception of the inputs in the seconds it is a
@@ -480,6 +705,11 @@ pub(super) struct BlockCache {
     /// reception at a collision it cannot see.
     key: [u64; 2],
     seconds: BTreeMap<u64, Held>,
+    /// The probe's: each second's own digest at the last update, and that update's end.
+    #[cfg(tally_refit_probe)]
+    previous: BTreeMap<u64, Digest>,
+    #[cfg(tally_refit_probe)]
+    edge: Option<u64>,
 }
 
 impl Default for BlockCache {
@@ -494,6 +724,10 @@ impl Default for BlockCache {
         Self {
             key: [draw(1), draw(2)],
             seconds: BTreeMap::new(),
+            #[cfg(tally_refit_probe)]
+            previous: BTreeMap::new(),
+            #[cfg(tally_refit_probe)]
+            edge: None,
         }
     }
 }
@@ -579,7 +813,14 @@ impl BlockCache {
         clocks: &[Clock],
         (first, end): (u64, u64),
     ) -> (usize, usize) {
+        #[cfg(tally_refit_probe)]
+        let started = Instant::now();
         let digests = self.digests(&raw.reader);
+        #[cfg(tally_refit_probe)]
+        {
+            probe::since(P::digests_ns, started);
+            self.reread(raw, &digests);
+        }
         let of = |second: u64| digests.get(&second).copied().unwrap_or(0);
         self.seconds
             .retain(|second, _| (first..end).contains(second));
@@ -602,6 +843,17 @@ impl BlockCache {
                 continue;
             }
             built += 1;
+            #[cfg(tally_refit_probe)]
+            let old = self.seconds.get(&second).map(|held| held.pairs.clone());
+            #[cfg(tally_refit_probe)]
+            probe::add(
+                match (&old, self.edge) {
+                    (None, _) => P::builds_first,
+                    (Some(_), Some(edge)) if second + READ_AFTER_S >= edge => P::builds_read_after,
+                    _ => P::builds_late,
+                },
+                1,
+            );
             let events = raw.events(second);
             let mut pairs = BTreeMap::new();
             for (a, b) in raw.pairs(second) {
@@ -612,6 +864,15 @@ impl BlockCache {
                     pairs.insert((ca.key, cb.key), Arc::new(block));
                 }
             }
+            #[cfg(tally_refit_probe)]
+            if let Some(old) = &old {
+                probe::add(P::pair_blocks_rebuilt, pairs.len() as u64);
+                let unchanged = pairs
+                    .iter()
+                    .filter(|(key, block)| old.get(key).is_some_and(|was| same_block(was, block)))
+                    .count();
+                probe::add(P::pair_blocks_unchanged, unchanged as u64);
+            }
             self.seconds.insert(
                 second,
                 Held {
@@ -621,7 +882,51 @@ impl BlockCache {
                 },
             );
         }
+        #[cfg(tally_refit_probe)]
+        {
+            probe::add(P::blocks_reused, reused as u64);
+            self.edge = Some(end);
+        }
         (built, reused)
+    }
+
+    /// The probe's re-read set: the seconds whose read span `[s - 2, s + 3)` holds a second whose
+    /// own digest changed since the last update (slice 3 reads those again), and the receptions
+    /// and seconds read against those it would read again.
+    #[cfg(tally_refit_probe)]
+    fn reread(&mut self, raw: &mut Raw<'_>, digests: &BTreeMap<u64, Digest>) {
+        let changed: Vec<u64> = digests
+            .iter()
+            .filter(|(second, digest)| self.previous.get(second) != Some(digest))
+            .map(|(second, _)| *second)
+            .chain(
+                self.previous
+                    .keys()
+                    .filter(|second| !digests.contains_key(second))
+                    .copied(),
+            )
+            .collect();
+        let mut per_second: BTreeMap<u64, u64> = BTreeMap::new();
+        for rx in &raw.reader.rxs {
+            *per_second.entry(rx.wall_ms / 1000).or_insert(0) += 1;
+        }
+        let again = |second: u64| {
+            changed
+                .iter()
+                .any(|c| *c + sync::LOOK_BACK_S >= second && *c <= second + READ_AFTER_S)
+        };
+        raw.reread = per_second.keys().copied().filter(|s| again(*s)).collect();
+        let total: u64 = per_second.values().sum();
+        let again_rx: u64 = per_second
+            .iter()
+            .filter(|(second, _)| raw.reread.contains(second))
+            .map(|(_, count)| count)
+            .sum();
+        probe::add(P::receptions_read, total);
+        probe::add(P::receptions_reread, again_rx);
+        probe::add(P::seconds_read, per_second.len() as u64);
+        probe::add(P::seconds_reread, raw.reread.len() as u64);
+        self.previous = digests.clone();
     }
 
     /// The second's blocks.

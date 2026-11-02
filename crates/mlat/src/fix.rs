@@ -759,7 +759,11 @@ pub fn refit(
     report: &mut Report,
 ) -> Vec<Arc<Held>> {
     let (fitted, part) = parallel(threads.max(1), refits, |refit, report: &mut Report| {
+        #[cfg(tally_refit_probe)]
+        let gathering = Instant::now();
         let inputs = arrived.area_inputs(refit.area, sites, edge_ms)?;
+        #[cfg(tally_refit_probe)]
+        tally_mlat_solver::probe::since(tally_mlat_solver::probe::P::gather_ns, gathering);
         let started = Instant::now();
         let warm = refit.warm.as_ref().map(|warm| &warm.prepared.model);
         let mut cache = refit
@@ -769,6 +773,8 @@ pub fn refit(
         let fitted = pair::fit(&inputs, warm, &mut cache);
         drop(cache);
         report.fit_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        #[cfg(tally_refit_probe)]
+        shadow(refit.area, edge_ms, &inputs, warm, &fitted);
         if refit.warm.is_some() {
             report.fits_warm += 1;
         } else {
@@ -799,6 +805,36 @@ pub fn refit(
     report.add(&part);
     report.refits += refits.len();
     fitted.into_iter().flatten().collect()
+}
+
+/// The probe's cold shadow (RFC-0198 slice 1): one area-edge in 64 refit again from empty caches
+/// and the same warm model, timed, and compared with the refit as published.
+#[cfg(tally_refit_probe)]
+fn shadow(
+    area: Region,
+    edge_ms: u64,
+    inputs: &tally_mlat_solver::scope::Inputs,
+    warm: Option<&PairModel>,
+    fitted: &Result<pair::Fitted, pair::PairError>,
+) {
+    use tally_mlat_solver::probe::{self, P};
+    let name = format!("{area:?}");
+    let hashed = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    });
+    if !probe::shadow_due(hashed, edge_ms) {
+        return;
+    }
+    let started = Instant::now();
+    let cold = probe::shadowing(|| pair::fit(inputs, warm, &mut PairCache::default()));
+    let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    probe::add_shadow(P::shadow_ns, ns);
+    probe::add_shadow(P::shadow_runs, 1);
+    match (fitted, &cold) {
+        (Ok(a), Ok(b)) if a.model == b.model => {}
+        (Err(_), Err(_)) => probe::add_shadow(P::shadow_failed, 1),
+        _ => probe::add_shadow(P::shadow_mismatches, 1),
+    }
 }
 
 /// The models a set owned by `owner` whose hearers are in `areas` is solved under (module docs,
