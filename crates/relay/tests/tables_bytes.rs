@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use tally_mlat::engine::{Capacity, Engine, Settings};
 use tally_mlat::intake::SiteRecord;
-use tally_mlat::replay::{replay, scenario};
+use tally_mlat::replay::{replay_with, scenario};
 use tally_relay::bounded::Bounded;
 use tally_relay::models::{Cited, Decoded, Model, Models};
 use tally_relay::products::{
@@ -61,13 +61,9 @@ fn hash(n: u64) -> Hash {
 }
 
 /// What a reference engine published: the site records it placed its receivers by, its records
-/// each with when it was published, and each owned area's memos' bytes when it ended
-/// (`Engine::area_caches`).
-type Published = (
-    Vec<SiteRecord>,
-    Vec<(u64, Record)>,
-    Vec<(tally_wire::Region, usize)>,
-);
+/// each with when it was published, and the most its memos and its own models held for each seat
+/// taking part before any step (`Engine::memos_bytes`, `Engine::own_models_bytes`).
+type Published = (Vec<SiteRecord>, Vec<(u64, Record)>, (usize, usize));
 
 /// The reference simulation's records as they reach an engine: its receivers' raw and site
 /// records, each with when it arrived.
@@ -164,12 +160,21 @@ fn published(delivered: &[(u64, Record)]) -> Result<Published, String> {
         .iter()
         .filter_map(|(_, record)| SiteRecord::of(record))
         .collect();
-    let steps = replay(&mut engine, delivered, &signer, until)?;
+    let mut most = (0, 0);
+    let steps = replay_with(&mut engine, delivered, &signer, until, |engine, _| {
+        let seats = engine.taking_part();
+        if seats > 0 {
+            most = (
+                most.0.max(engine.memos_bytes().div_ceil(seats)),
+                most.1.max(engine.own_models_bytes().div_ceil(seats)),
+            );
+        }
+    })?;
     let records = steps
         .into_iter()
         .flat_map(|(at, step)| step.records().into_iter().map(move |record| (at, record)))
         .collect();
-    Ok((sites, records, engine.area_caches()))
+    Ok((sites, records, most))
 }
 
 /// Every model `records` publish, as a member sends it, with when it was published.
@@ -393,9 +398,8 @@ const PERCENT_STEP: usize = 10;
 /// The lines the models' plans are drawn from, measured at the reference world (`published`):
 /// what an area's model holds for each of its receivers (`models::MODEL_BYTES_PER_RECEIVER`, its
 /// `held_bytes` over its area's receivers, `models::area_receivers`), what it holds over what it
-/// took on the wire (`models::DECODED_PER_WIRE_PERCENT`), and what an owned area's memos hold for
-/// each (`mlat_host::AREA_CACHE_BYTES_PER_RECEIVER`, `Engine::area_caches`), each the most of
-/// them rounded up. Every model is decoded as a relay decodes one a member sent and admitted to
+/// took on the wire (`models::DECODED_PER_WIRE_PERCENT`), each the most of them rounded up. Every
+/// model is decoded as a relay decodes one a member sent and admitted to
 /// one store as they come: what the store allocates is no more than it charges. And each model's
 /// records (its manifest, parts and client summary, as the hosted engine publishes them) are no
 /// more than it holds (the newest step's in flight, `models::BYTES_PER_SEAT`), and its prepared
@@ -403,9 +407,7 @@ const PERCENT_STEP: usize = 10;
 /// receiver and the one of the most held over its wire bytes.
 fn an_areas_model_is_within_its_bytes_per_receiver(
     records: &[(u64, Record)],
-    caches: &[(tally_wire::Region, usize)],
 ) -> Result<(Decoded, Decoded), String> {
-    use tally_relay::mlat_host::AREA_CACHE_BYTES_PER_RECEIVER;
     use tally_relay::models::{
         DECODED_PER_WIRE_PERCENT, MODEL_BYTES_PER_RECEIVER, area_receivers, held_bytes,
     };
@@ -413,7 +415,6 @@ fn an_areas_model_is_within_its_bytes_per_receiver(
     assert!(sent.len() > 10, "{} models", sent.len());
     let mut per_receiver: Option<(usize, Decoded)> = None;
     let mut per_wire: Option<(usize, Decoded)> = None;
-    let mut receivers_of: BTreeMap<tally_wire::Region, usize> = BTreeMap::new();
     let mut charged = 0;
     for (_, manifest, content) in &sent {
         let decoded =
@@ -421,7 +422,6 @@ fn an_areas_model_is_within_its_bytes_per_receiver(
         let bytes = held_bytes(&decoded);
         charged += bytes;
         let receivers = area_receivers(&decoded).max(1);
-        receivers_of.insert(decoded.area(), receivers);
         let each = bytes.div_ceil(receivers);
         let percent = (bytes * 100).div_ceil(wire_of(manifest, content));
         let prepared = &decoded.prepared.model;
@@ -458,17 +458,11 @@ fn an_areas_model_is_within_its_bytes_per_receiver(
             per_wire = Some((percent, variant(&decoded, None, decoded.edge_ms(), 0)));
         }
     }
-    let cache = caches
-        .iter()
-        .map(|(area, bytes)| bytes.div_ceil(receivers_of.get(area).copied().unwrap_or(1)))
-        .max()
-        .ok_or("no area's memos")?;
     let (each, per_receiver) = per_receiver.ok_or("no model")?;
     let (percent, per_wire) = per_wire.ok_or("no model")?;
     println!(
         "worst: an area's model holds {each} a receiver ({MODEL_BYTES_PER_RECEIVER} planned), \
-         {percent}% of its wire bytes ({DECODED_PER_WIRE_PERCENT}% planned), its memos {cache} a \
-         receiver ({AREA_CACHE_BYTES_PER_RECEIVER} planned)"
+         {percent}% of its wire bytes ({DECODED_PER_WIRE_PERCENT}% planned)"
     );
     // Admitted as members send them, by the clock of the records as they come.
     let store = Models::new();
@@ -486,15 +480,10 @@ fn an_areas_model_is_within_its_bytes_per_receiver(
     );
     drop(admitted);
     assert_eq!(
-        (
-            MODEL_BYTES_PER_RECEIVER,
-            DECODED_PER_WIRE_PERCENT,
-            AREA_CACHE_BYTES_PER_RECEIVER
-        ),
+        (MODEL_BYTES_PER_RECEIVER, DECODED_PER_WIRE_PERCENT),
         (
             each.div_ceil(BYTES_STEP) * BYTES_STEP,
-            percent.div_ceil(PERCENT_STEP) * PERCENT_STEP,
-            cache.div_ceil(BYTES_STEP) * BYTES_STEP
+            percent.div_ceil(PERCENT_STEP) * PERCENT_STEP
         ),
         "each line is the most measured, rounded up"
     );
@@ -831,10 +820,21 @@ fn the_tables_the_relay_is_sent_into_allocate_no_more_than_they_are_charged() ->
         step.div_ceil(BYTES_STEP) * BYTES_STEP,
         "a step's working set is the most measured, rounded up"
     );
-    let (_, records, caches) = published(&delivered)?;
+    let (_, records, (memos, own_models)) = published(&delivered)?;
+    // What the engine's memos and own models hold a seat (`mlat_host::MEMOS_BYTES_PER_SEAT`,
+    // `mlat_host::OWN_MODELS_BYTES_PER_SEAT`): planned at what the world relay's load measured,
+    // where an area's members are many times its own receivers, so the reference world's, whose
+    // areas' members are mostly their own, are within them.
+    println!(
+        "worst: the memos hold {memos} a seat ({} planned), the own models {own_models} ({} \
+         planned)",
+        tally_relay::mlat_host::MEMOS_BYTES_PER_SEAT,
+        tally_relay::mlat_host::OWN_MODELS_BYTES_PER_SEAT
+    );
+    assert!(memos <= tally_relay::mlat_host::MEMOS_BYTES_PER_SEAT);
+    assert!(own_models <= tally_relay::mlat_host::OWN_MODELS_BYTES_PER_SEAT);
     // The lines the models' plans are drawn from first: every plan below stands on them.
-    let (per_receiver, per_wire) =
-        an_areas_model_is_within_its_bytes_per_receiver(&records, &caches)?;
+    let (per_receiver, per_wire) = an_areas_model_is_within_its_bytes_per_receiver(&records)?;
     let areas = areas_of(&records);
     assert!(!areas.is_empty(), "no model's area");
     // Standing keeps the band of its areas beside its tables: the relay's configuration, built
