@@ -34,7 +34,7 @@ before-feeders 2968326637
 connections 2112
 floor 769203
 per-connection 1965032
-per-seat 6552772
+per-seat 7323844
 mlat-share-percent 25
 connection-limit 10124
 connections-by-memory 10931
@@ -43,7 +43,7 @@ connection-limit-bound cores
 max-receptions-per-sec 6079646
 max-bytes-per-sec 703911546
 max-records-per-sec 20265
-rate-by-memory 9269158
+rate-by-memory 9128720
 rate-by-cores 6079646
 rate-bound cores
 members-receptions-per-sec 75000
@@ -52,11 +52,11 @@ feeders-at-ceiling 2026
 limit-batches 1838916641
 window-batches 299
 members-window-batches 299
-limit-arrived 585774753
+limit-arrived 865302177
 limit-inbox 643530509
 window-inbox 105
 members-window-inbox 105
-limit-engine 213424398
+limit-engine 213796110
 limit-dedup 1280170464
 window-dedup 208
 members-window-dedup 208
@@ -114,7 +114,7 @@ members-window-consistency 8
 limit-twins 34798402
 limit-models 1581124798
 mlat-seats 363
-mlat-seats-by-memory 1334
+mlat-seats-by-memory 1194
 mlat-seats-by-cores 363
 member-products-bytes-per-sec 14788352
 mlat-seats-bound cores
@@ -132,7 +132,7 @@ handshakes-per-sec 40000
 members 1024
 member-feeders 125
 member-rate-pool 560299125
-planned 25251422364
+planned 25531321500
 allocator 2684354560
 headroom 2751463424
 limit 34359738368

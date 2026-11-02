@@ -17,6 +17,7 @@ use crate::linalg::{self, Cholesky, Matrix, Vec3};
 use crate::obs::{ObservationId, Reception, Site};
 use crate::scope::{Citation, Frontier, Inputs, Trailing};
 use crate::solve::{self, Item, Problem};
+pub use crate::sync::Reads;
 use crate::sync::{self, ReadCache};
 use crate::verify::PairModelFailure;
 
@@ -302,7 +303,11 @@ type FoundBlocks = BTreeMap<(u32, u32), Vec<(u64, Arc<PairBlock>)>>;
 impl Window {
     /// The window of `inputs`, its blocks the area's held ones where what they read is unchanged
     /// (`blocks::BlockCache`), and the raw the rest are read from.
-    fn read<'r>(inputs: &'r Inputs, cache: &'r mut PairCache) -> (Self, Raw<'r>) {
+    fn read<'r>(
+        inputs: &'r Inputs,
+        cache: &'r mut PairCache,
+        reads: Option<&'r Reads>,
+    ) -> (Self, Raw<'r>) {
         let PairCache {
             read,
             network,
@@ -311,7 +316,7 @@ impl Window {
         let network = PairCache::network_of(network, blocks, inputs.area, &inputs.scope);
         #[cfg(tally_refit_probe)]
         let started = std::time::Instant::now();
-        let reader = sync::Reader::new(inputs, read);
+        let reader = sync::Reader::new(inputs, read, reads);
         #[cfg(tally_refit_probe)]
         crate::probe::since(crate::probe::P::reader_ns, started);
         #[cfg(tally_refit_probe)]
@@ -1512,8 +1517,10 @@ fn full(upper: &[f32], size: usize) -> Vec<f64> {
     out
 }
 
-/// What a fitter keeps of an area between refits: the read's memos, the network of the last
-/// scope, and the blocks of its last window (crate docs, § The pairwise path, blocks).
+/// What a fitter keeps of an area between refits: the read's memos (its own, when it is fitted
+/// alone, `fit`; else only what its last read found anew, until the shared memos take it in,
+/// `fit_sharing`), the network of the last scope, and the blocks of its last window (crate docs,
+/// § The pairwise path, blocks).
 #[derive(Default)]
 pub struct PairCache {
     read: ReadCache,
@@ -1532,6 +1539,19 @@ impl PairCache {
             }),
             self.blocks.bytes(),
         ]
+    }
+
+    /// Hands what its last read found anew to `reads`, the memos it was read beside
+    /// (`fit_sharing`), keeping none of it.
+    pub fn hand_to(&mut self, reads: &mut Reads) {
+        reads.absorb(&mut self.read);
+    }
+
+    /// Exchanges its own read memos with `reads`: so a holder that shares one across its areas
+    /// lends it to a fit or check of one area alone (`fit`, `verify::verify_pair_model_held`), and
+    /// takes it back the same way.
+    pub fn swap_reads(&mut self, reads: &mut Reads) {
+        std::mem::swap(&mut self.read.own, reads);
     }
 
     /// Bytes it holds, as allocated: the read's memos, the network with the scope it is of, and
@@ -1575,14 +1595,38 @@ pub struct Fitted {
 /// fitted under them, sought from those of `warm` (the area's previous model) where it holds a
 /// clock, else its timebase's default noise and no rate. Each pass solves every valid pair from
 /// its sums, estimates the noise and takes a Newton step of the rates; once a pass settles, each
-/// pair is published as the verifier assesses it.
+/// pair is published as the verifier assesses it. The read's memos are `cache`'s own.
 pub fn fit(
     inputs: &Inputs,
     warm: Option<&PairModel>,
     cache: &mut PairCache,
 ) -> Result<Fitted, PairError> {
+    let fitted = fit_reading(inputs, warm, cache, None);
+    cache.read.settle();
+    fitted
+}
+
+/// As [`fit`], the read's memos `reads`, which the holder shares across the areas it fits (on
+/// several threads at once): what the read found anew stays in `cache` until the holder hands it
+/// to them (`PairCache::hand_to`), once no read is under way. The model is the same whatever the
+/// memos hold.
+pub fn fit_sharing(
+    inputs: &Inputs,
+    warm: Option<&PairModel>,
+    cache: &mut PairCache,
+    reads: &Reads,
+) -> Result<Fitted, PairError> {
+    fit_reading(inputs, warm, cache, Some(reads))
+}
+
+fn fit_reading(
+    inputs: &Inputs,
+    warm: Option<&PairModel>,
+    cache: &mut PairCache,
+    reads: Option<&Reads>,
+) -> Result<Fitted, PairError> {
     let started = std::time::Instant::now();
-    let (window, mut raw) = Window::read(inputs, cache);
+    let (window, mut raw) = Window::read(inputs, cache, reads);
     let read_ns = started.elapsed().as_nanos() as u64;
     let n = window.clocks.len();
     let index = window.index();
@@ -1608,7 +1652,7 @@ pub fn fit(
     #[cfg(tally_refit_probe)]
     let (settling, nested) = (std::time::Instant::now(), crate::probe::nested());
     let (outcomes, from) = settle(&window, &mut raw, &all);
-    raw.finish();
+    drop(raw);
     // Settling less the cut blocks it rebuilt, which their phases count.
     #[cfg(tally_refit_probe)]
     crate::probe::add(
@@ -1873,8 +1917,18 @@ fn relative(a: f64, b: f64) -> f64 {
 }
 
 /// The checks of a pair model against the window `inputs` (`verify::verify_pair_model`, crate
-/// docs, § The pairwise path, verifying a model).
+/// docs, § The pairwise path, verifying a model), the read's memos `cache`'s own.
 pub(crate) fn check_model(
+    inputs: &Inputs,
+    model: &PairModel,
+    cache: &mut PairCache,
+) -> Vec<PairModelFailure> {
+    let failures = check_model_reading(inputs, model, cache);
+    cache.read.settle();
+    failures
+}
+
+fn check_model_reading(
     inputs: &Inputs,
     model: &PairModel,
     cache: &mut PairCache,
@@ -1902,7 +1956,7 @@ pub(crate) fn check_model(
         failures.push(PairModelFailure::Unordered);
         return failures;
     }
-    let (window, mut raw) = Window::read(inputs, cache);
+    let (window, mut raw) = Window::read(inputs, cache, None);
     let index = window.index();
     let n = window.clocks.len();
     // The window index of each model clock.
@@ -1930,13 +1984,12 @@ pub(crate) fn check_model(
         conditions.rates[*at as usize] = clock.rate;
     }
     if !failures.is_empty() {
-        raw.finish();
         return failures;
     }
     // The jumps and the drops: the rule's, replayed over every candidate from no jump.
     let all: Vec<u32> = (0..window.keys.len() as u32).collect();
     let (outcomes, from) = settle(&window, &mut raw, &all);
-    raw.finish();
+    drop(raw);
     let local: BTreeMap<u32, u32> = at_of
         .iter()
         .enumerate()

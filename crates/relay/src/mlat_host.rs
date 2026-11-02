@@ -664,21 +664,35 @@ pub const SOLVED_BYTES_PER_SEAT: usize = {
 /// solved under (`tally_mlat::fix::usable`: `MAX_CARRY` past it), one a refit, and the newest.
 pub const ENGINE_EDGES: usize =
     (tally_wire::budget::MAX_CARRY_MS / tally_wire::budget::REFIT_EVERY_MS) as usize + 1;
-/// What an area's memos take for each receiver of it, at most (`tally_mlat_solver::PairCache`: what
-/// its fit read last time and its network): measured with `models::MODEL_BYTES_PER_RECEIVER`
-/// (`tests/tables_bytes.rs`, `an_areas_model_is_within_its_bytes_per_receiver`), the most of
-/// them rounded up (212,268 on 2026-10-30, with the pair blocks of 2026-10-27). Before them
-/// 130,048, and 128,000 when the read's memo hashed message hashes again
-/// (`tally_mlat_solver::obs::ByDigest`): the table grows at other points.
-pub const AREA_CACHE_BYTES_PER_RECEIVER: usize = 212_992;
-/// What a seat's share of the engine's own models takes: its area's model at every edge it holds
-/// ([`ENGINE_EDGES`]), each at most `models::MODEL_BYTES_PER_RECEIVER` for the seat, and its
-/// area's memos ([`AREA_CACHE_BYTES_PER_RECEIVER`]). The models are the allocation the relay's
-/// store holds too (`models::Models::insert_own`), counted here as `Engine::bytes` counts them, so
-/// the `Arrived` charge is the engine's own figure; a neighbour's model it holds is the store's
-/// alone (`Engine::bytes` counts only its own).
-pub const WARM_MODELS_BYTES_PER_SEAT: usize =
-    ENGINE_EDGES * crate::models::MODEL_BYTES_PER_RECEIVER + AREA_CACHE_BYTES_PER_RECEIVER;
+/// What the engine's memos take for each seat taking part, at most (`Engine::memos_bytes`: each
+/// area's pair blocks and network, `tally_mlat_solver::PairCache`, and the read's memos the areas
+/// share, `pair::Reads`): measured in the world relay's load (`tally-load` at the seat test's plan,
+/// 2,000 feeders on the world relay's 16 cores, a refit-probe build's `Engine::bytes` by part read
+/// every second, three runs at 258 to 283 seats on 2026-11-02: 0.639 to 0.672 MB a seat at the
+/// most, the pair blocks 0.60 to 0.64 of it, the shared read's memos 0.03), with a fifth more.
+/// An area's memos grow with its members, its own receivers and every receiver they keep
+/// (`Sites::members`), and in that load an area has some fifteen times as many members as seats
+/// of its own, so the line is a seat's, not an area receiver's. Before (2026-10-30), 212,992 an
+/// area's receiver, measured on the reference simulation, whose areas' members are mostly their
+/// own: the load held 1.35 MB a seat (#37), each area's read memos a copy of every message its
+/// members heard, some twenty copies of each.
+pub const MEMOS_BYTES_PER_SEAT: usize = 800 << 10;
+/// What the engine's own models take for each seat taking part, at most
+/// (`Engine::own_models_bytes`: each owned area's model at every edge it holds, [`ENGINE_EDGES`]):
+/// measured in the same runs as [`MEMOS_BYTES_PER_SEAT`] (0.230 to 0.237 MB a seat at the most),
+/// with a fifth more. An area's model holds its members' clocks and the pairs its receivers keep,
+/// so in that load it holds more for each seat than `models::MODEL_BYTES_PER_RECEIVER` (measured
+/// for each receiver of an area on the reference simulation) at every edge, which was planned
+/// before (2026-11-02, 131,072).
+pub const OWN_MODELS_BYTES_PER_SEAT: usize = 288 << 10;
+const _: () =
+    assert!(OWN_MODELS_BYTES_PER_SEAT >= ENGINE_EDGES * crate::models::MODEL_BYTES_PER_RECEIVER);
+/// What a seat's share of the engine's own models and memos takes ([`OWN_MODELS_BYTES_PER_SEAT`],
+/// [`MEMOS_BYTES_PER_SEAT`]). The models are the allocation the relay's store holds too
+/// (`models::Models::insert_own`), counted here as `Engine::bytes` counts them, so the `Arrived`
+/// charge is the engine's own figure; a neighbour's model it holds is the store's alone
+/// (`Engine::bytes` counts only its own).
+pub const WARM_MODELS_BYTES_PER_SEAT: usize = OWN_MODELS_BYTES_PER_SEAT + MEMOS_BYTES_PER_SEAT;
 
 /// What one seat costs the `Arrived` store: its kept receptions over the hold at the mean, in the
 /// relay's one pool (`arrived::Rates::cost`), what its transmissions solved
@@ -706,11 +720,12 @@ pub fn arrived_bytes_per_seat() -> usize {
 /// what the engine held before it, less what it leaves held, for each receiver taking part, the
 /// most measured by the counting allocator over the reference simulation and a dense one whose
 /// every receiver keeps its full 40 neighbours (`tests/tables_bytes.rs`, `step_bytes_per_seat`,
-/// 565,702 bytes on 2026-10-30 with the pair blocks of 2026-10-27, rounded up to the KiB; 212,816
-/// before them, the reference scene alone then 131,981). Before, 192 KiB, an upper bound from the
-/// window steps it replaced (RFC-0181, "Sizing", 2026-10-08), which the dense scene's step
-/// exceeds.
-pub const STEP_BYTES_PER_SEAT: usize = 553 << 10;
+/// 566,598 bytes on 2026-11-02 with the read's memos shared across areas, what a refit reads anew
+/// held until the step hands it to them, rounded up to the KiB; 565,702 on 2026-10-30 with the
+/// pair blocks of 2026-10-27; 212,816 before them, the reference scene alone then 131,981).
+/// Before, 192 KiB, an upper bound from the window steps it replaced (RFC-0181, "Sizing",
+/// 2026-10-08), which the dense scene's step exceeds.
+pub const STEP_BYTES_PER_SEAT: usize = 554 << 10;
 /// What one seat makes its own engine publish in positions over a step, at most, which is what of
 /// them may wait untaken (the network task takes them every tick): its fixes raw and tagged
 /// (`consistency::POSITIONS_BYTES_PER_SEAT_PER_SEC`). Charged to `Engine` as they are queued, by

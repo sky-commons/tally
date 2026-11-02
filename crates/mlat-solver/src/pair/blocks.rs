@@ -441,10 +441,6 @@ impl<'r> Raw<'r> {
         }
     }
 
-    pub(super) fn finish(self) {
-        self.reader.finish();
-    }
-
     fn second(&mut self, second: u64) -> &Second {
         if !self.seconds.contains_key(&second) {
             #[cfg(tally_refit_probe)]
