@@ -2041,3 +2041,7 @@ fn map_growth<K, V>((len, capacity): (usize, usize), more: usize) -> usize {
 #[cfg(test)]
 #[path = "arrived_tests.rs"]
 mod tests;
+
+/// The probe's incremental gather (RFC-0198 Appendix C, the held-read prototype).
+#[cfg(tally_refit_probe)]
+pub(crate) mod proto;

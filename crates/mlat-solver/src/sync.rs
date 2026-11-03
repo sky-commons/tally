@@ -98,6 +98,31 @@ fn site_table(sites: &[Site]) -> BTreeMap<PublicKey, SiteInfo> {
         .collect()
 }
 
+/// The probe's held read (RFC-0198 Appendix C, the held-read prototype).
+#[cfg(tally_refit_probe)]
+pub(crate) mod held;
+
+/// The probe's held-read prototype's: the usable sites of `scope`, as a read finds them.
+#[cfg(tally_refit_probe)]
+pub(crate) fn sites_of(scope: &[Site]) -> BTreeMap<PublicKey, SiteInfo> {
+    site_table(scope)
+}
+
+/// The probe's held-read prototype's: a reception's linear count as `linearize` finds it.
+#[cfg(tally_refit_probe)]
+pub(crate) fn linear_of(timebase: Timebase, timestamp: u64, wall_ms: u64) -> Option<i64> {
+    let value = timebase.linear(timestamp)?;
+    match timebase {
+        Timebase::Mhz12 => Some(value),
+        Timebase::GpsNanos => {
+            let wall_ns = i128::from(wall_ms) * 1_000_000;
+            let day = i128::from(DAY_NS);
+            let start = (wall_ns - i128::from(value) + day / 2).div_euclid(day) * day;
+            i64::try_from(start + i128::from(value)).ok()
+        }
+    }
+}
+
 /// Each distinct message as read, by its hash, shared by every area one holder fits
 /// (`pair::fit_sharing`): a message is read the same whatever area reads it, and a seat is a member
 /// of many areas (its own and every area one of whose receivers keeps it, `Sites::members`), so

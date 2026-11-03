@@ -2199,6 +2199,12 @@ impl Host {
     /// a host that cut and whose last steps all ran well within the budget once its seats settled
     /// lifts its cut as far as the worst of them allows. One change in flight at a time.
     fn judge(&mut self, ran_ms: u64, taken: u64) {
+        // The probe's same-run A/B (RFC-0198 Appendix C) refits every area-edge twice: it holds
+        // its seats, so the prototype's held state is measured over a steady scope.
+        #[cfg(tally_refit_probe)]
+        if tally_mlat_solver::probe::proto_on() {
+            return;
+        }
         let Some(through) = self.through.map(Mono::ms) else {
             return;
         };

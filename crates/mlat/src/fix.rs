@@ -762,6 +762,10 @@ pub fn refit(
 ) -> Vec<Arc<Held>> {
     let (fitted, part) = parallel(threads.max(1), refits, |refit, report: &mut Report| {
         #[cfg(tally_refit_probe)]
+        if tally_mlat_solver::probe::proto_on() {
+            return proto_refit(arrived, sites, edge_ms, refit, reads, report);
+        }
+        #[cfg(tally_refit_probe)]
         let gathering = Instant::now();
         let inputs = arrived.area_inputs(refit.area, sites, edge_ms)?;
         #[cfg(tally_refit_probe)]
@@ -807,6 +811,156 @@ pub fn refit(
     report.add(&part);
     report.refits += refits.len();
     fitted.into_iter().flatten().collect()
+}
+
+/// The probe's held-read refit (RFC-0198 Appendix C, `pair::fit_proto`), timed whole as the
+/// refit's fit (its gather in it), with the cold shadow of one area-edge in 64 against the
+/// engine's own inputs.
+#[cfg(tally_refit_probe)]
+fn proto_refit(
+    arrived: &Arrived,
+    sites: &Sites,
+    edge_ms: u64,
+    refit: &Refit,
+    reads: &Reads,
+    report: &mut Report,
+) -> Option<Arc<Held>> {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use tally_mlat_solver::probe::{self, P};
+    // The same-run A/B (RFC-0198 Appendix C): the engine's refit (its gather and fit) and the
+    // prototype's (its own held state) of the same area-edge, on the same thread, one first and
+    // the other first on alternate refits; the engine's model is the one published, and the two
+    // are compared byte for byte.
+    static TURN: AtomicU64 = AtomicU64::new(0);
+    let warm = refit.warm.as_ref().map(|warm| &warm.prepared.model);
+    let mut cache = refit
+        .cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let engine_first = TURN.fetch_add(1, Relaxed).is_multiple_of(2);
+    let mut engine_out = None;
+    let mut proto_out = None;
+    let (mut engine_ns, mut gather_ns, mut proto_ns) = (0u64, 0u64, 0u64);
+    for turn in 0..2 {
+        if (turn == 0) == engine_first {
+            let started = Instant::now();
+            let inputs = arrived.area_inputs(refit.area, sites, edge_ms);
+            gather_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let fitted = inputs
+                .as_ref()
+                .map(|inputs| pair::fit_sharing(inputs, warm, &mut cache, reads));
+            engine_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            engine_out = Some((inputs, fitted));
+        } else {
+            let started = Instant::now();
+            let fitted =
+                pair::fit_proto(arrived, sites, refit.area, edge_ms, warm, &mut cache, reads);
+            proto_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            proto_out = Some(fitted);
+        }
+    }
+    pair::sample_proto_bytes(&mut cache);
+    drop(cache);
+    let (Some((inputs, engine)), Some(proto)) = (engine_out, proto_out) else {
+        return None;
+    };
+    report.fit_ns += engine_ns.saturating_sub(gather_ns);
+    probe::add(P::ab_refits, 1);
+    probe::add(P::ab_engine_ns, engine_ns);
+    probe::add(P::ab_engine_gather_ns, gather_ns);
+    probe::add(P::ab_proto_ns, proto_ns);
+    if engine_first {
+        probe::add(P::ab_engine_first, 1);
+    }
+    let (inputs, fitted, proto) = match (inputs, engine, proto) {
+        (Some(inputs), Some(fitted), Some(proto)) => (inputs, fitted, proto),
+        (None, None, None) => return None,
+        _ => {
+            probe::add(P::ab_mismatches, 1);
+            return None;
+        }
+    };
+    match (&fitted, &proto) {
+        (Ok(a), Ok(b)) if a.model == b.model => probe::add(P::ab_same, 1),
+        (Err(a), Err(b)) if a == b => probe::add(P::ab_same, 1),
+        _ => probe::add(P::ab_mismatches, 1),
+    }
+    {
+        let name = format!("{:?}", refit.area);
+        let hashed = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        });
+        if probe::shadow_due(hashed, edge_ms) {
+            // The prototype's model against a cold refit of the engine's inputs.
+            shadow_now(&inputs, warm, &proto, Instant::now());
+        }
+    }
+    if refit.warm.is_some() {
+        report.fits_warm += 1;
+    } else {
+        report.fits_cold += 1;
+    }
+    let fitted = match fitted {
+        Ok(fitted) => fitted,
+        Err(error) => {
+            report.unfitted += 1;
+            if matches!(error, pair::PairError::NotConverged) {
+                report.not_converged += 1;
+            }
+            report
+                .unfitted_reason
+                .get_or_insert_with(|| error.to_string());
+            return None;
+        }
+    };
+    let held = Held::fitted(fitted.model);
+    if held.is_none() {
+        report.unfitted += 1;
+        report
+            .unfitted_reason
+            .get_or_insert_with(|| "a model the wire cannot carry".to_owned());
+    }
+    held.map(Arc::new)
+}
+
+/// The cold shadow's refit of `inputs` and its comparison, timed from `started`.
+#[cfg(tally_refit_probe)]
+fn shadow_now(
+    inputs: &tally_mlat_solver::scope::Inputs,
+    warm: Option<&PairModel>,
+    fitted: &Result<pair::Fitted, pair::PairError>,
+    started: Instant,
+) {
+    use tally_mlat_solver::probe::{self, P};
+    let cold = probe::shadowing(|| pair::fit(inputs, warm, &mut PairCache::default()));
+    let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    probe::add_shadow(P::shadow_ns, ns);
+    probe::add_shadow(P::shadow_runs, 1);
+    match (fitted, &cold) {
+        (Ok(a), Ok(b)) if a.model == b.model => {}
+        (Err(a), Err(b)) if a == b => probe::add_shadow(P::shadow_failed, 1),
+        _ => {
+            probe::add_shadow(P::shadow_mismatches, 1);
+            if std::env::var_os("TALLY_REFIT_PROTO_DEBUG").is_some() {
+                eprintln!(
+                    "proto shadow mismatch at {}: {:?}",
+                    inputs.trailing.edge_ms,
+                    match (fitted, &cold) {
+                        (Ok(a), Ok(b)) => format!(
+                            "input {} {} clocks {} {} pairs {} {}",
+                            a.model.input == b.model.input,
+                            a.model.frontier == b.model.frontier,
+                            a.model.clocks.len(),
+                            b.model.clocks.len(),
+                            a.model.pairs.len(),
+                            b.model.pairs.len()
+                        ),
+                        _ => format!("{:?} {:?}", fitted.as_ref().err(), cold.as_ref().err()),
+                    }
+                );
+            }
+        }
+    }
 }
 
 /// The probe's cold shadow (RFC-0198 slice 1): one area-edge in 64 refit again from empty caches
