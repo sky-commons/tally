@@ -70,7 +70,7 @@ back to today's questions; non-interactively the install stops naming `TALLY_LAT
 `TALLY_ALT`. All of it happens before anything is installed, so nothing half-installs.
 
 **Upgrades.** Nothing migrates: the location is kept as before, and `//packaging:upgrade_test`
-holds every earlier install to that. `geoid.txt` is fetched only when locating.
+holds every earlier install to that. `geoid.txt.gz` is fetched only when locating.
 
 ## §3 The relay checks the site
 
