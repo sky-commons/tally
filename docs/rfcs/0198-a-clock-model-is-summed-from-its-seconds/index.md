@@ -855,6 +855,95 @@ per-pair rebuilds and held reads together. A refit at about 0.44 of today's 5.04
 2.2 ms a seat-second; with the shadow check, `tally-relay check` planned about 554 world-relay
 seats at 2.25 ms in the fourth revision.
 
+### 2026-11-03: the held-read prototype, measured in the same run: no gain
+
+#45's invalidation alone left the refit's cost where it was (about 0.97 of main): a block built
+again still formed its pooled seconds, and every refit still gathered and read the whole window.
+The founder asked what the larger redesign really reaches before deciding: keep each second's
+formed points between refits, and gather and read incrementally, so that a refit pays only for
+what changed. This is that redesign, built as a working prototype under `--cfg tally_refit_probe`
+and measured without assuming any saving.
+
+*The prototype* (`arrived/proto.rs`, `sync/held.rs`, `pair/proto.rs`; the relay runs it with
+`TALLY_REFIT_PROTO`):
+- an area's gather is kept between refits. Each cited part is read once, when it is first cited.
+  Its entries enter and leave the window as the window slides. Events, and whether a status is
+  kept, are kept as counts. The citation and kept count are made as `collect` makes them;
+- each kept reception is placed in its second once, linearized as `linearize` does, and indexed
+  as a `Reader` indexes it (each message's receptions, each second's messages, each aircraft's
+  positions and NACp by second). Each second's digest is #45's rule, kept by adding and taking
+  away each reception's part;
+- a second's formed points are held by the digest of the seconds they read, and formed again
+  from the held index only when it changed; a block is held as `BlockCache` holds it and built
+  from held formed seconds; the fit is the engine's;
+- a new scope keeps the read (a member whose site changed is linearized again) and lets go of the
+  formed seconds and blocks, as the engine's `BlockCache` does.
+
+*Correctness.* Every model the prototype made was byte-identical to the engine's:
+- in the simulator (`the_held_read_prototype_publishes_what_a_cold_refit_publishes`, probe
+  only), against a cold refit of the engine's own inputs at every area-edge, with batches
+  reordered and one in twenty 3 to 12 s late: 164, 198 and 311 refits over three scenes;
+- on the relay, against the engine's own refit of the same area-edge in the same run, at every
+  refit: 2,656 refits over the five runs below, 0 mismatches;
+- against a cold refit (the probe's shadow, one area-edge in 64): 33 shadows, 0 mismatches.
+
+*How it was measured.* anvil is rarely quiet, so the comparison is made inside one probe relay
+(`tools/mlat-baseline/abrun.sh`, `ab_report.py`): every area-edge is refit both ways on the same
+thread, the engine first on alternate refits. The engine's way is its gather and fit
+(`Arrived::area_inputs`, `pair::fit_sharing`), and the slice-1 and re-read oracles are off. The
+prototype's way is its own held state, which it carries between refits as production would. The
+engine's model is the one published. The governor holds its seats during these runs: refitting
+twice under the host's other load (load averages 42 to 72) otherwise cuts seats to 40 and changes
+every scope. At 2,000 feeders the relay overran (`arrived_over`, `unfitted`), so the runs use 400
+feeders, which seat the plan's 363 steadily with neither. Each run's instructions are sampled by
+call path for 40 s (`perf record`, DWARF unwinding) as a cross-check.
+
+| run | refits | time ratio | instructions ratio | scope changes | load, start / end |
+|---|---|---|---|---|---|
+| 11 | 803 | 1.089 | 0.821 | 16 | 49.9 / 56.6 |
+| 12 | 536 | 1.324 | 1.304 | 110 | 57.1 / 60.3 |
+| 13 | 767 | 1.081 | 0.935 | 64 | 50.4 / 46.4 |
+| 14 | 268 | 1.731 | 1.370 | 184 | 42.4 / 71.6 |
+| 15 | 282 | 1.523 | 1.390 | 184 | 61.2 / 66.4 |
+
+Time ratio: the prototype's refit time over the engine's, on the same refits. The median is
+1.32, over a range of 1.08 to 1.73. The prototype is slower, and slowest where scopes change
+most (each change lets go of its formed seconds and blocks, as the engine's). The instruction
+ratio is lower than the time ratio in every run, by 0.02 to 0.36: the prototype's tables are hash
+tables, read at random, and part of its time is in their misses, which instructions do not count.
+Both put the prototype above 0.8, and four of five runs above 0.9.
+
+*Where the time goes* (run 11, ms a refit; the engine's areas in this load are large, 127 ms a
+refit against about 28 at the world plan):
+
+| | engine | prototype |
+|---|---|---|
+| gather | 9.3 | 35.4 (kept by change) |
+| read: index, clocks, digests | 18.7 (reader 15.9, clocks 1.4, digests 1.4) | 39.5 (placing each change 35.0, digests 4.5) |
+| formation | 36.2 (every second) | 21.8 (the seconds whose digest changed, 57% of them) |
+| blocks built, window and fit | 62.7 | 41.6 (blocks 23.6, window 1.0, fit 16.9) |
+| whole | 126.9 | 138.2 |
+
+A refit's changes are some 35,000 receptions entering and leaving here. The prototype pays about
+2 µs for each, in its gather and in placing it; the engine gathers and reads its whole window in
+28 ms. Formation from the held
+index costs more for each second formed than a `Reader`'s does. The saving where it was meant to
+be is real but smaller than its price: forming 57% of the seconds and building their blocks
+saves 35 ms; gathering and reading by change costs 47 ms more.
+
+*Its ceiling.* With the gather and the placing free, the prototype would take 68 ms of the
+engine's 127 (0.53). To reach 0.6, they would have to take 8 ms between them, against 70 now and
+28 for the engine's whole gather and read. So the per-change bookkeeping would have to cost less
+for each change than the engine's batch pays for each reception, and nothing measured here
+suggests it can. Its memory is over the plan as well: the held state is about 6 MB a seat
+(memos 6.7 MB a seat in these runs, against 896 KiB planned). `tally-relay check` with the
+refit at 1.32 times and that memory plans 302 world-relay seats (bound by the cores; 648 by the
+memory), against 363 now.
+
+*Decision.* Far from the bar of 0.6: the redesign is not built. #45 is left for
+the founder. The prototype and its tools stay in the probe, so a later design can be measured
+the same way.
+
 ## Appendix D: what an exact-integer-sums RFC must specify
 
 This is recorded for slice 6, which this RFC does not propose. An RFC that proposes exact integer

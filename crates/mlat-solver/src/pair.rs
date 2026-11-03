@@ -22,6 +22,11 @@ use crate::sync::{self, ReadCache};
 use crate::verify::PairModelFailure;
 
 mod blocks;
+/// The probe's held-read prototype (RFC-0198 Appendix C).
+#[cfg(tally_refit_probe)]
+mod proto;
+#[cfg(tally_refit_probe)]
+pub use proto::{fit_proto, sample_proto_bytes};
 
 use blocks::{BlockCache, Kept, PairBlock, Raw, Step};
 pub use blocks::{LINE_BLOCKS, LINE_LEAST, READ_BACK_MS};
@@ -312,6 +317,8 @@ impl Window {
             read,
             network,
             blocks,
+            #[cfg(tally_refit_probe)]
+                proto: _,
         } = cache;
         let network = PairCache::network_of(network, blocks, inputs.area, &inputs.scope);
         #[cfg(tally_refit_probe)]
@@ -1526,9 +1533,20 @@ pub struct PairCache {
     read: ReadCache,
     network: Option<(Region, Vec<Site>, Network)>,
     blocks: BlockCache,
+    /// The probe's held read (`proto`), when the area is refit by it.
+    #[cfg(tally_refit_probe)]
+    proto: Option<Box<proto::Proto>>,
 }
 
 impl PairCache {
+    /// The probe's held read's bytes (none without the probe).
+    fn proto_bytes(&self) -> usize {
+        #[cfg(tally_refit_probe)]
+        return self.proto.as_ref().map_or(0, |proto| proto.bytes());
+        #[cfg(not(tally_refit_probe))]
+        0
+    }
+
     /// The probe's split of `bytes`: the read's memos, the network with its scope, the blocks.
     #[cfg(tally_refit_probe)]
     pub fn bytes_parts(&self) -> [usize; 3] {
@@ -1537,7 +1555,7 @@ impl PairCache {
             self.network.as_ref().map_or(0, |(_, scope, network)| {
                 tally_wire::footprint::vec::<Site>(scope.capacity()) + network.bytes()
             }),
-            self.blocks.bytes(),
+            self.blocks.bytes() + self.proto.as_ref().map_or(0, |proto| proto.bytes()),
         ]
     }
 
@@ -1562,6 +1580,7 @@ impl PairCache {
                 tally_wire::footprint::vec::<Site>(scope.capacity()) + network.bytes()
             })
             + self.blocks.bytes()
+            + self.proto_bytes()
     }
 
     /// The network of `scope` in `area`, held while the scope is; a new scope lets every held
