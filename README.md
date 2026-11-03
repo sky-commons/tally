@@ -50,6 +50,12 @@ It ends by printing your station's page, which says whether it is feeding, and w
 updates are on. Run it again to change the location; `--uninstall` removes it and keeps the key
 (`--uninstall --purge` deletes the key too).
 
+Don't know your antenna's coordinates or its height? `sudo bash /tmp/tally-install.sh --locate`
+asks for its street address (or pass `TALLY_ADDRESS="..."`) and works both out on the receiver
+itself: the address goes only to the US Census geocoder and OpenStreetMap, never to Tally, and
+only the coordinates are kept. A relay checks the location against the aircraft your receiver
+hears; if your station's page says the location looks wrong, run it with `--locate`.
+
 ### Upgrading
 
 **Automatic updates are on unless you turn them off.** Once a day, at a time of its own,

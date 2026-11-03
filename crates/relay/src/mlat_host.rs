@@ -141,7 +141,7 @@
 //!   not judge steps nothing: the steps it passed are collapsed into the one it resyncs at, counted
 //!   (`MlatReport::steps_unsynced`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -218,6 +218,11 @@ pub trait MlatHost: Send + Sync {
     /// area's, which the engine's fixes may cite once it is verified or corroborated (module docs,
     /// Areas). Offered again when another of its area's engines signs it.
     fn offer_model(&self, _model: crate::models::Model) {}
+    /// The receivers whose sites the relay's location check holds wrong (`siting`, RFC-0204), the
+    /// whole set each time: from its next step the host holds them out of MLAT as a receiver with
+    /// no site is held out (it takes no part, its raw is let go), and takes them back as soon as
+    /// they leave the set. Their batches still reach every other duty of the relay.
+    fn set_misplaced(&self, _receivers: BTreeSet<PublicKey>) {}
 }
 
 /// A model the hosted engine published (`MlatHost::take_own_models`): the engine's own decoded
@@ -1273,6 +1278,9 @@ struct Shared {
     /// What the records not yet taken are charged to: the positions' store (`Engine`) and the
     /// clock models' (`Models`).
     published_gauges: (Arc<Gauge>, Arc<Gauge>),
+    /// The receivers the relay's location check holds wrong, handed at the next step when they
+    /// changed (`MlatHost::set_misplaced`).
+    misplaced: Mutex<Option<BTreeSet<PublicKey>>>,
     /// The neighbouring areas' models the relay's store offered, by pair model id, not yet handed
     /// to the engine (`MlatHost::offer_model`): each a handle on the store's, handed at the next
     /// step.
@@ -1421,6 +1429,7 @@ impl HostedMlat {
             cuts: Mutex::new(Cuts::default()),
             published: Mutex::new(Published::default()),
             published_gauges: (Arc::clone(&gauges.engine), Arc::clone(&gauges.models)),
+            misplaced: Mutex::new(None),
             neighbours: Mutex::new(BTreeMap::new()),
             gate: Gate::new(settings.threads.max(1)),
             clock,
@@ -1702,6 +1711,10 @@ impl MlatHost for HostedMlat {
 
     fn take_cuts(&self) -> Vec<Cut> {
         std::mem::take(&mut lock(&self.shared.cuts).decided)
+    }
+
+    fn set_misplaced(&self, receivers: BTreeSet<PublicKey>) {
+        *lock(&self.shared.misplaced) = Some(receivers);
     }
 
     fn report(&self) -> MlatReport {
@@ -2068,6 +2081,7 @@ impl Host {
             counts.refused += refused;
         });
         self.apply_cuts(step_ms);
+        self.apply_misplaced();
         let descriptions = lock(&self.shared.descriptions).take_through(step_ms);
         for (_, record) in tally_mlat::intake::taking_effect(descriptions) {
             self.describe(&record);
@@ -2102,6 +2116,23 @@ impl Host {
             .collect();
         self.count_refused();
         self.forget(left);
+    }
+
+    /// The receivers the relay's location check holds wrong, if they changed since the last step:
+    /// each one that leaves the set takes part again on its own signed site, each one that joins
+    /// it stops taking part, and is forgotten as one that loses its site is.
+    fn apply_misplaced(&mut self) {
+        let Some(misplaced) = lock(&self.shared.misplaced).take() else {
+            return;
+        };
+        let described = self.intake.set_misplaced(misplaced);
+        self.count_refused();
+        self.forget(described.left);
+        for other in described.moved {
+            if self.intake.settle(&other) {
+                self.forget(vec![other]);
+            }
+        }
     }
 
     /// The engine steps at `step` (module docs): its working set reserved in the `Engine` store

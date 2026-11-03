@@ -12,7 +12,8 @@ use tally_relay::stations::{StationReport, StationsReport};
 use tally_wire::PublicKey;
 
 use tally_api_types::{
-    Aircraft, MeResponse, MeStation, Network, PositionSource, SourceCounts, Station, StationState,
+    Aircraft, LocationCheck, LocationCheckState, MeResponse, MeStation, Network, PositionSource,
+    SourceCounts, Station, StationState,
 };
 
 use crate::feeders::Board;
@@ -115,6 +116,7 @@ impl Stations {
             cell: self.places.get(key).map(|place| place.cell.clone()),
             location: self.places.get(key).map(|place| place.centre),
             software: report.software.clone(),
+            location_check: report.location_check.map(location_check),
         })
     }
 
@@ -184,6 +186,21 @@ pub fn state_of(report: &StationReport) -> StationState {
         StationState::Silent
     } else {
         StationState::Offline
+    }
+}
+
+/// The relay's location check (RFC-0204) as the API serves it: the state, and the distance only
+/// for a place held wrong.
+fn location_check(check: tally_relay::siting::LocationCheck) -> LocationCheck {
+    use tally_relay::siting::CheckState;
+    let state = match check.state {
+        CheckState::Unjudged => LocationCheckState::Unjudged,
+        CheckState::Fits => LocationCheckState::Fits,
+        CheckState::Wrong => LocationCheckState::Wrong,
+    };
+    LocationCheck {
+        state,
+        off_km: check.off_km.filter(|_| state == LocationCheckState::Wrong),
     }
 }
 
@@ -325,6 +342,7 @@ mod tests {
             cell: cell(),
             software: Some("tally-feed 0.1.0".to_owned()),
             address: None,
+            location_check: None,
         }
     }
 
@@ -540,6 +558,7 @@ mod tests {
             cell: None,
             software: Some("tally-feed 0.3.0".to_owned()),
             address: None,
+            location_check: None,
         };
         let stations = Stations::from_report(
             StationsReport {

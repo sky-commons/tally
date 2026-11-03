@@ -24,7 +24,7 @@ cores 10
 connection-limit 9405
 connections-by-cores 11147
 connection-limit-bound memory
-max-receptions-per-sec 5643686
+max-receptions-per-sec 5643497
 rate-by-cores 6876553
 rate-bound memory
 mlat-seats 0
