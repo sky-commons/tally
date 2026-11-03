@@ -8,11 +8,29 @@
 # (`curl -fsSL .../install.sh | sudo bash` works too: everything runs only once the whole script
 # has arrived, and what it must ask, it asks on the terminal either way.)
 #
-# It downloads tally-feed for this machine and checks its sha256, finds the receiver's decoders and
-# location, makes the receiver's key if there is none, starts tally-feed.service, waits until it
-# publishes, and prints the station's page. It changes no readsb or dump978 setting and no other feed. It installs no updater and no timer:
-# tally-feed never updates itself. A newer version is this script again, run by the owner; a rerun
-# upgrades the binary and keeps the key.
+# It downloads tally-feed for this machine and checks its sha256 and its signature (below), finds
+# the receiver's decoders and location, makes the receiver's key if there is none, starts
+# tally-feed.service, waits until it publishes, and prints the station's page. It changes no readsb
+# or dump978 setting and no other feed. A rerun upgrades the binary and keeps the key, the location
+# found before, the owner's own flags and the owner's choice about automatic updates.
+#
+# Automatic updates (RFC-0203) are on unless the owner says otherwise: TALLY_AUTO_UPDATE=0 (or
+# --no-auto-update) installs with them off, and `systemctl disable --now tally-feed-update.timer`
+# turns them off later, which every rerun keeps. tally-feed-update.timer runs
+# /usr/local/lib/tally/update about once a day, at a time of its own for each receiver: it installs
+# a newer release only when this release's cosign (pinned below by its sha256) finds it signed by
+# this repository's release workflow on that release's own tag, never an older release, and puts
+# the old files back when the new feeder does not start. The feeder itself never updates itself
+# and takes no orders from the network (RFC-0171 §3.5): the updater is this script's, asks only
+# GitHub for the latest release, and the owner can turn it off.
+#
+# Every file of a release this script installs is checked twice: against the .sha256 beside it
+# (a broken download) and against its cosign signature bundle, .sigstore.json (a release someone
+# other than the release workflow made), with the certificate identity pinned to
+# https://github.com/sky-commons/tally/.github/workflows/release.yml@refs/tags/VERSION. What reads
+# the network and parses what it brought (curl, cosign) runs as a throwaway unprivileged user of its
+# own (a transient systemd unit with DynamicUser=); root only writes what they fetched to files and
+# installs it once it is checked.
 #
 # /etc/default/tally-feed is shared. The block between its BEGIN and END lines is this script's,
 # rewritten on every run, so a rerun with a new TALLY_LAT, TALLY_LON or TALLY_ALT
@@ -61,18 +79,21 @@
 # reads FILE as this script reads a seed list and prints each relay and its operator, or refuses it
 # saying why; it installs nothing and needs no root.
 #
-#   install.sh --uninstall           stops tally-feed and removes its unit, binary, what it learned
-#                                    and /etc/default/tally-feed; keeps the key, so a later install
-#                                    is the same station
+#   install.sh --no-auto-update      installs with automatic updates off (as TALLY_AUTO_UPDATE=0)
+#   install.sh --upgrade             what the updater runs: no questions, no container route, and a
+#                                    longer wait for the new feeder to publish
+#   install.sh --uninstall           stops tally-feed and its updater and removes its units, binary,
+#                                    what it learned and /etc/default/tally-feed; keeps the key, so a
+#                                    later install is the same station
 #   install.sh --uninstall --purge   the same, and deletes the key: the station's identity is gone
 #                                    for good
 set -euo pipefail
 
-VERSION="v0.7.0"
+VERSION="v0.7.2"
 # Where this release is published, whose `tally-feed` binaries, unit and seed list this script
 # installs. The source names no publisher: the publisher writes its release's address here when it
 # publishes it, and TALLY_RELEASE overrides it.
-PUBLISHED_RELEASE="https://github.com/sky-commons/tally/releases/download/v0.7.0"
+PUBLISHED_RELEASE="https://github.com/sky-commons/tally/releases/download/v0.7.2"
 # What any public map shows of the location: the feeder's public cell (H3 resolution 6).
 PUBLIC_AREA="~5 km"
 BIN=/usr/local/bin/tally-feed
@@ -90,8 +111,33 @@ SYSTEMD_AT_LEAST=247
 STATION_PAGE=https://tally.flightlines.ai/en/station
 ISSUES=https://github.com/sky-commons/tally/issues
 IMAGE=ghcr.io/sky-commons/tally-feed
-# How long a started feeder has to say it is publishing before the install calls it failed.
+# How long a started feeder has to say it is publishing before the install calls it failed; an
+# automatic update (--upgrade) waits longer before it calls the new release failed and rolls back.
 WAIT_SECONDS=20
+UPGRADE_WAIT_SECONDS=90
+
+# Who signs a release: this repository's release workflow, run on the release's own tag (cosign
+# keyless, .github/workflows/release.yml), its certificate issued for GitHub Actions' token.
+SIGNER_REPOSITORY=sky-commons/tally
+SIGNER_ISSUER=https://token.actions.githubusercontent.com
+# The cosign that checks the signatures, pinned by version and by each build's sha256 (from its
+# release's cosign_checksums.txt). It is the trust anchor an automatic update checks the next
+# release with, so moving it is a change to this script, itself signed.
+COSIGN_VERSION=v2.6.5
+COSIGN_SHA256_X86_64=c3b4f5410e608af03a5eb0aaac84a4313d8da131248e08ff1759ac70c79d1644
+COSIGN_SHA256_AARCH64=426193b4c5da4d4d643e822f48fe0cc8a476ca1782a272704831f5a0cef716d7
+COSIGN_SHA256_ARMV7=5eeda8f80117783b03dcbaa7f74d0aeb52bd42218fa509274a0bf4c030802331
+# The updater's files: cosign, the updater, the version installed, and its units.
+LIB=/usr/local/lib/tally
+COSIGN=$LIB/cosign
+UPDATER=$LIB/update
+INSTALLED=$LIB/installed
+UPDATE_UNIT=/etc/systemd/system/tally-feed-update.service
+UPDATE_TIMER=/etc/systemd/system/tally-feed-update.timer
+TIMER=tally-feed-update.timer
+# Where root's work directory goes: not /tmp, which the unprivileged units have one of their own of,
+# so that they can read what root fetched.
+WORK_ROOT=/var/cache
 
 # Where receivers keep their location, read in this order (none is ever sourced: each is someone
 # else's code).
@@ -118,22 +164,146 @@ stop() {
   exit 1
 }
 
-fetch() {
-  curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$2" "$1"
+# Runs COMMAND... as a throwaway unprivileged user (a transient unit with DynamicUser=, which can
+# write nothing but a /tmp of its own and holds no capability), its standard output the caller's.
+# Root runs curl and cosign this way; anyone else is unprivileged already.
+unprivileged() {
+  if [[ $EUID -ne 0 ]]; then
+    "$@"
+    return
+  fi
+  systemd-run --quiet --wait --pipe --collect -p Type=exec -p DynamicUser=yes \
+    -p ProtectSystem=strict -p ProtectHome=yes -p PrivateDevices=yes -p NoNewPrivileges=yes \
+    -p CapabilityBoundingSet= -p 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' \
+    -p ProtectKernelTunables=yes -p ProtectKernelModules=yes -p ProtectControlGroups=yes \
+    --setenv=HOME=/tmp -- "$@"
 }
 
-# Downloads NAME from the release with NAME.sha256 beside it, into the work directory, and stops if
-# they disagree. A NAME that cannot be downloaded stops saying WHY, if given.
+# Downloads URL into FILE, as an unprivileged user; root only writes what it is handed.
+fetch() {
+  unprivileged curl -fsSL --proto '=https' --tlsv1.2 --retry 3 "$1" </dev/null >"$2"
+}
+
+sha256_of() {
+  sha256sum "$1" | awk '{ print $1 }'
+}
+
+# Downloads NAME from the release with NAME.sha256 and NAME.sigstore.json beside it, into the work
+# directory, and stops if NAME and its sha256 disagree. A NAME that cannot be downloaded stops saying
+# WHY, if given. Its signature is checked once cosign is here (signed).
 fetch_verified() {
   local name="$1"
   fetch "$release/$name" "$work/$name" || stop "${2:-could not download $release/$name}"
   fetch "$release/$name.sha256" "$work/$name.sha256" ||
     stop "could not download $release/$name.sha256"
-  local expected actual
+  local expected
   expected="$(awk 'NR == 1 { print $1 }' "$work/$name.sha256")"
-  actual="$(sha256sum "$work/$name" | awk '{ print $1 }')"
-  if [[ -z $expected || $expected != "$actual" ]]; then
+  if [[ -z $expected || $expected != "$(sha256_of "$work/$name")" ]]; then
     stop "$name does not match its sha256; nothing was installed"
+  fi
+  fetched+=("$name")
+}
+
+# Is FILE signed (FILE.sigstore.json beside it) by the release workflow of SIGNER_REPOSITORY run
+# on the tag TAG? Checked by COSIGN as an unprivileged user.
+signed_by_release() {
+  local file="$1" tag="$2"
+  unprivileged "$COSIGN" verify-blob "$file" --bundle "$file.sigstore.json" \
+    --certificate-identity "https://github.com/$SIGNER_REPOSITORY/.github/workflows/release.yml@refs/tags/$tag" \
+    --certificate-oidc-issuer "$SIGNER_ISSUER" \
+    --certificate-github-workflow-repository "$SIGNER_REPOSITORY" \
+    --certificate-github-workflow-trigger push \
+    --certificate-github-workflow-ref "refs/tags/$tag" </dev/null >/dev/null 2>&1
+}
+
+# Stops, having installed nothing of the release, unless every file fetched_verified fetched is
+# signed by the release workflow on this release's tag, VERSION.
+signed() {
+  local name
+  for name in "${fetched[@]}"; do
+    fetch "$release/$name.sigstore.json" "$work/$name.sigstore.json" ||
+      stop "could not download $release/$name.sigstore.json, $name's signature; nothing was installed"
+    signed_by_release "$work/$name" "$VERSION" ||
+      stop "$name is not signed by the release workflow of $SIGNER_REPOSITORY on the tag $VERSION (cosign verify-blob refused it); nothing was installed"
+  done
+  say "checked the signatures of ${fetched[*]}: the release workflow of $SIGNER_REPOSITORY on $VERSION"
+}
+
+# Installs SOURCE at TARGET with MODE in one rename, so nothing ever runs or reads half a file.
+place() {
+  local mode="$1" source="$2" target="$3"
+  install -m "$mode" "$source" "$target.tally-new"
+  mv -f "$target.tally-new" "$target"
+}
+
+# cosign's build for ARCH and its pinned sha256, as `NAME SHA256`.
+cosign_build() {
+  case "$ARCH" in
+    x86_64) printf 'cosign-linux-amd64 %s' "$COSIGN_SHA256_X86_64" ;;
+    aarch64) printf 'cosign-linux-arm64 %s' "$COSIGN_SHA256_AARCH64" ;;
+    armv7) printf 'cosign-linux-arm %s' "$COSIGN_SHA256_ARMV7" ;;
+  esac
+}
+
+# Puts the pinned cosign at COSIGN unless it is there already, checked by its sha256 before it is
+# ever run.
+install_cosign() {
+  local name want
+  read -r name want <<<"$(cosign_build)"
+  if [[ -x $COSIGN && $(sha256_of "$COSIGN") == "$want" ]]; then
+    return 0
+  fi
+  say "downloading cosign $COSIGN_VERSION, which checks the release's signatures"
+  fetch "https://github.com/sigstore/cosign/releases/download/$COSIGN_VERSION/$name" "$work/cosign" ||
+    stop "could not download cosign $COSIGN_VERSION ($name); nothing was installed"
+  [[ $(sha256_of "$work/cosign") == "$want" ]] ||
+    stop "cosign $COSIGN_VERSION ($name) does not match the sha256 this script pins; nothing was installed"
+  install -d -m 0755 "$LIB"
+  place 0755 "$work/cosign" "$COSIGN"
+}
+
+# Settles auto_update (1 or 0) and auto_update_from: --no-auto-update or TALLY_AUTO_UPDATE if
+# given; else what an earlier install left (its timer enabled or not, which is how the owner turns
+# it off); else on.
+settle_auto_update() {
+  local value="${TALLY_AUTO_UPDATE:-}"
+  [[ -n $no_auto_update ]] && value=0
+  case "${value,,}" in
+    0 | no | off | false) auto_update=0 auto_update_from="you said so" ;;
+    1 | yes | on | true) auto_update=1 auto_update_from="you said so" ;;
+    "")
+      if [[ -f $UPDATE_TIMER ]]; then
+        auto_update=0
+        systemctl is-enabled --quiet "$TIMER" 2>/dev/null && auto_update=1
+        auto_update_from="the earlier install"
+      else
+        auto_update=1 auto_update_from="the default"
+      fi
+      ;;
+    *) stop "TALLY_AUTO_UPDATE is 1 or 0, not $value; nothing was installed" ;;
+  esac
+}
+
+# The lines that say whether automatic updates are on and how to change that.
+auto_update_lines() {
+  if [[ $auto_update == 1 ]]; then
+    printf 'Automatic updates are on (%s): about once a day %s installs a newer release, only when
+' "$auto_update_from" "$TIMER"
+    printf 'it is signed by the release workflow of %s, never an older one, and puts the old one back
+' "$SIGNER_REPOSITORY"
+    printf 'if it does not start (journalctl -u tally-feed-update). To turn them off:
+'
+    printf '  sudo systemctl disable --now %s
+' "$TIMER"
+    printf 'or install with TALLY_AUTO_UPDATE=0. Running this script again keeps your choice.
+'
+  else
+    printf 'Automatic updates are off (%s). To turn them on:
+' "$auto_update_from"
+    printf '  sudo systemctl enable --now %s
+' "$TIMER"
+    printf 'or install with TALLY_AUTO_UPDATE=1. Running this script again keeps your choice.
+'
   fi
 }
 
@@ -473,7 +643,7 @@ require_published_arch() {
 # publishes a `seeds` beside it, so an install names both itself. sudo passes a NAME=value given
 # before the command into its environment.
 how_to_pass() {
-  printf '%s. Until a release pipeline publishes them, name the release (a directory holding tally-feed-x86_64-linux, tally-feed-aarch64-linux and tally-feed.service, each with its .sha256) and a seed list file (one HOST:PORT=KEY OPERATOR a line) yourself:\n  sudo TALLY_RELEASE=RELEASE TALLY_SEEDS=/path/to/seeds bash /tmp/tally-install.sh\nNothing was installed.' "$1"
+  printf '%s. Until a release pipeline publishes them, name the release (a directory holding tally-feed-x86_64-linux, tally-feed-aarch64-linux and tally-feed.service, each with its .sha256 and its .sigstore.json, as the release workflow signs them) and a seed list file (one HOST:PORT=KEY OPERATOR a line) yourself:\n  sudo TALLY_RELEASE=RELEASE TALLY_SEEDS=/path/to/seeds bash /tmp/tally-install.sh\nNothing was installed.' "$1"
 }
 
 # Prints the compose service that feeds from the ultrafeeder container NAME, configured as
@@ -633,15 +803,18 @@ uninstall() {
       [[ $answer == delete ]] || stop "nothing was removed"
     fi
   fi
+  if [[ -f $UPDATE_TIMER ]]; then
+    systemctl disable --now "$TIMER" >/dev/null 2>&1 || true
+  fi
   if [[ -f $UNIT ]]; then
     systemctl disable --now tally-feed.service >/dev/null 2>&1 || true
   fi
-  rm -f -- "$UNIT"
-  rm -rf -- "$STATE_PRIVATE" "$STATE"
+  rm -f -- "$UNIT" "$UPDATE_UNIT" "$UPDATE_TIMER"
+  rm -rf -- "$STATE_PRIVATE" "$STATE" "$LIB"
   systemctl daemon-reload
-  systemctl reset-failed tally-feed.service >/dev/null 2>&1 || true
+  systemctl reset-failed tally-feed.service tally-feed-update.service >/dev/null 2>&1 || true
   rm -f -- "$BIN" "$DEFAULTS"
-  say "removed tally-feed.service, $BIN, $DEFAULTS and what it learned ($STATE)"
+  say "removed tally-feed.service, its updater ($TIMER, $LIB), $BIN, $DEFAULTS and what it learned ($STATE)"
   if [[ -n $purge ]]; then
     rm -f -- "$KEY"
     rmdir -- "${KEY%/*}" 2>/dev/null || true
@@ -672,7 +845,21 @@ main() {
       return 0
       ;;
   esac
-  [[ $# -eq 0 ]] || stop "unknown argument $1 (install.sh takes none, --uninstall [--purge] or --check-seeds FILE)"
+  no_auto_update="" upgrade=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-auto-update) no_auto_update=1 ;;
+      --upgrade) upgrade=1 ;;
+      *) stop "unknown argument $1 (install.sh takes none, --no-auto-update, --upgrade, --uninstall [--purge] or --check-seeds FILE)" ;;
+    esac
+    shift
+  done
+  # An automatic update asks nothing (it has no one to ask) and gives the new feeder longer.
+  if [[ -n $upgrade ]]; then
+    have_tty() { false; }
+    WAIT_SECONDS=$UPGRADE_WAIT_SECONDS
+  fi
+  umask 022
 
   # Where it installs from and the relays it starts from are settled first, before root is asked
   # for: neither needs it, and an owner told what to pass is told before anything else.
@@ -684,8 +871,15 @@ main() {
   for tool in curl sha256sum timeout awk; do
     command -v "$tool" >/dev/null || stop "$tool is required"
   done
-  work="$(mktemp -d)"
+  # Root's work directory is readable by the unprivileged cosign that checks what is in it.
+  if [[ $EUID -eq 0 ]]; then
+    work="$(mktemp -d "$WORK_ROOT/tally-install.XXXXXX")"
+    chmod 0755 "$work"
+  else
+    work="$(mktemp -d)"
+  fi
   trap 'rm -rf "$work"' EXIT
+  fetched=()
 
   # A feeder that knows no relay publishes nothing, so this is settled before anything is installed.
   if [[ -n ${TALLY_SEEDS:-} ]]; then
@@ -697,7 +891,10 @@ main() {
   read_seeds "$seeds"
 
   require_root
-  command -v systemctl >/dev/null || stop "systemctl is required"
+  for tool in systemctl systemd-run; do
+    command -v "$tool" >/dev/null || stop "$tool is required"
+  done
+  settle_auto_update
 
   detect_arch
   require_published_arch
@@ -711,7 +908,7 @@ main() {
   local beast="" container
   if listening 127.0.0.1 30005; then
     beast=1
-  else
+  elif [[ -z $upgrade ]]; then
     container="$(ultrafeeder_container)"
     if [[ -n $container ]]; then
       discover_location quiet
@@ -729,6 +926,12 @@ main() {
   say "downloading tally-feed $VERSION for $ARCH"
   fetch_verified "tally-feed-$ARCH-linux"
   fetch_verified "tally-feed.service"
+  fetch_verified "tally-feed-update.service"
+  fetch_verified "tally-feed-update.timer"
+  fetch_verified "update.sh"
+  # Nothing of the release is installed or run before every file of it is checked.
+  install_cosign
+  signed
 
   args=()
   for n in "${!seed_relays[@]}"; do
@@ -751,7 +954,7 @@ main() {
   done
   args+=(--lat "$lat" --lon "$lon" --alt "$alt")
 
-  install -m 0755 "$work/tally-feed-$ARCH-linux" "$BIN"
+  place 0755 "$work/tally-feed-$ARCH-linux" "$BIN"
   install -d -m 0755 "${KEY%/*}"
   if [[ ! -f $KEY ]]; then
     say "making this receiver's key, $KEY (keep it: it is the antenna's name forever)"
@@ -762,9 +965,21 @@ main() {
 
   write_defaults "${args[@]}"
 
-  install -m 0644 "$work/tally-feed.service" "$UNIT"
+  place 0644 "$work/tally-feed.service" "$UNIT"
+  # The updater is installed either way, so turning it on later is one systemctl.
+  install -d -m 0755 "$LIB"
+  place 0755 "$work/update.sh" "$UPDATER"
+  place 0644 "$work/tally-feed-update.service" "$UPDATE_UNIT"
+  place 0644 "$work/tally-feed-update.timer" "$UPDATE_TIMER"
+  printf '%s\n' "$VERSION" >"$work/installed"
+  place 0644 "$work/installed" "$INSTALLED"
   systemctl daemon-reload
   systemctl enable tally-feed.service >/dev/null
+  if [[ $auto_update == 1 ]]; then
+    systemctl enable --now "$TIMER" >/dev/null 2>&1
+  else
+    systemctl disable --now "$TIMER" >/dev/null 2>&1 || true
+  fi
   systemctl restart tally-feed.service
 
   say "started tally-feed; waiting up to ${WAIT_SECONDS} s for it to publish"
@@ -779,7 +994,8 @@ main() {
     printf '\nNext: tally-feed keeps trying on its own. Watch it with journalctl -u tally-feed -f; it is\n' >&2
     printf 'feeding once it says "publishing to". If it never does, the lines above say why (a\n' >&2
     printf 'firewall blocking outbound TCP to %s, say). Fix that and run this again,\n' "${seed_relays[*]%%=*}" >&2
-    printf 'or open an issue with those lines: %s\n' "$ISSUES" >&2
+    printf 'or open an issue with those lines: %s\n\n' "$ISSUES" >&2
+    auto_update_lines >&2
     exit 1
   fi
   if ! grep -q '^tally-feed: reading ' <<<"$log"; then
@@ -793,7 +1009,8 @@ main() {
   printf "\nIts station page, once the network holds its first receptions:\n\n  %s/%s/\n\n" "$STATION_PAGE" "$(base64url "$public")"
   printf "What it publishes, in open data anyone can read: every reception this receiver's decoders\n"
   printf 'report, signed with that key.\n%s\n' "$(privacy_line)"
-  printf 'To change the location, run this again with TALLY_LAT, TALLY_LON and TALLY_ALT.\n'
+  printf 'To change the location, run this again with TALLY_LAT, TALLY_LON and TALLY_ALT.\n\n'
+  auto_update_lines
 }
 
 # Run, unless sourced (the installer's tests source it to call its parts). Piped into bash,
