@@ -10,6 +10,7 @@
   "batches": 9001,
   "gaps": 3,
   "late_batches": 0,
+  "cell": null,
   "location": null,
   "software": null
 }

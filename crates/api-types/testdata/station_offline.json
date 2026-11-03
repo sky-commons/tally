@@ -10,6 +10,7 @@
   "batches": 9001,
   "gaps": 3,
   "late_batches": 0,
-  "location": { "lat": 37.4884, "lon": -122.2529 },
+  "cell": "862834297ffffff",
+  "location": { "lat": 37.49, "lon": -122.25 },
   "software": "tally-feed 0.3.1"
 }

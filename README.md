@@ -9,7 +9,8 @@ together.
 **Status: early.** Releases are signed and public
 ([releases](https://github.com/sky-commons/tally/releases)), one public relay runs
 (`relay.tally.flightlines.ai`, by Flightlines, the only operator in the seed list so far), and the
-first receivers feed it. The map and each station's numbers are at https://tally.flightlines.ai.
+first receivers feed it. The site is https://tally.skycommons.org (each station's numbers at
+`https://tally.skycommons.org/feeders/<key>`), and the full map is https://tally-map.skycommons.org.
 
 ## How it works
 

@@ -375,14 +375,14 @@ fn an_install_waits_for_publishing_and_prints_the_station_page() -> Result {
     assert!(out.contains("installed and publishing"), "{out}");
     assert!(
         out.contains(
-            "https://tally.flightlines.ai/en/station/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-_8/"
+            "https://tally.skycommons.org/feeders/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-_8\n"
         ),
         "{out}"
     );
     // Exact to the relays alone, and only the public cell anywhere else, said in one line; no
     // flag for it.
     assert!(
-        out.contains("Your exact location goes only to Tally relays, for MLAT. Nothing a data user reads contains it; public maps show only the ~5 km area."),
+        out.contains("Your exact location goes only to Tally relays, for MLAT. Nothing a data user reads contains it; public maps show only the ~6 km area."),
         "{out}"
     );
     let written = sandbox.read("root/etc/default/tally-feed")?;

@@ -10,6 +10,7 @@
   "batches": 0,
   "gaps": 0,
   "late_batches": 0,
+  "cell": null,
   "location": null,
   "software": "tally-feed 0.3.0"
 }

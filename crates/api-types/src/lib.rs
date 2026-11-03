@@ -11,9 +11,10 @@
 //! - a SPAN is `*_for_ms`, a count of milliseconds.
 //!
 //! No answer carries a receiver's exact place, and the API never holds one: a receiver's site is
-//! relay-only (wire version 3). A station's `location` is a pin inside its public cell (the H3
-//! cell of resolution 6, about 36 km², its owner signed into its description), the same on every
-//! read, and a feeder's figures (its area, its range) are measured from that cell, never the site
+//! relay-only (wire version 3). A station is placed by its public `cell` (the H3 cell of
+//! resolution 6, about 36 km² and about 6 km across, its owner signed into its description) and
+//! that cell's centre rounded to 0.01° (`location`), the same for every receiver of the cell, and
+//! a feeder's figures (its area, its range) are measured from that cell, never the site
 //! (`tally-api`'s `privacy`, `tally_relay::figures`).
 //!
 //! A client may ignore a field it does not read; a field a type states is always present (an
@@ -207,11 +208,15 @@ pub struct Station {
     /// its backlog), and nothing else tells its owner. Absent from an older API, read as 0.
     #[serde(default)]
     pub late_batches: u64,
-    /// About where it says it is: a pin inside its public cell (H3 resolution 6, about 36 km²), at
-    /// an offset its key fixes, the same on every read; never the place itself. `null` when it
-    /// names no cell, and for a station the relay has forwarded no batch of (a connection alone
-    /// publishes no place). The exact place travels only between relays, in its signed site,
-    /// which MLAT reads.
+    /// The public cell it says it is in: its H3 index (resolution 6, about 36 km², about 6 km
+    /// across) in lowercase hex. `null` when it names no cell, and for a station the relay has
+    /// forwarded no batch of (a connection alone publishes no place). Absent from an older API,
+    /// read as `null`.
+    #[serde(default)]
+    pub cell: Option<String>,
+    /// The centre of `cell`, rounded to 0.01° (about 1 km): the same for every receiver of the
+    /// cell, never the place itself, and `null` when `cell` is. The exact place travels only
+    /// between relays, in its signed site, which MLAT reads.
     pub location: Option<Position>,
     /// What it runs, as it says; `null` when it says nothing.
     pub software: Option<String>,

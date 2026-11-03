@@ -12,8 +12,7 @@ use tally_relay::stations::{StationReport, StationsReport};
 use tally_wire::PublicKey;
 
 use tally_api_types::{
-    Aircraft, MeResponse, MeStation, Network, Position, PositionSource, SourceCounts, Station,
-    StationState,
+    Aircraft, MeResponse, MeStation, Network, PositionSource, SourceCounts, Station, StationState,
 };
 
 use crate::feeders::Board;
@@ -32,10 +31,10 @@ pub struct Stations {
     /// The relay's reports: each carries a station's public cell at most, never a site (the
     /// relay's stats hold none).
     pub by_key: HashMap<PublicKey, StationReport>,
-    /// Where the API may say each receiver is (`privacy::public_location`): a pin inside its
-    /// public cell, or absent when it states none. Every receiver place the API serves is read
-    /// here.
-    pub places: HashMap<PublicKey, Position>,
+    /// Where the API may say each receiver is (`privacy::public_place`): its public cell and the
+    /// cell's rounded centre, or absent when it states none. Every receiver place the API serves
+    /// is read here.
+    pub places: HashMap<PublicKey, crate::privacy::PublicPlace>,
     /// Observations a second, per station, between the previous report and this one.
     pub rates: HashMap<PublicKey, f64>,
     pub online: u32,
@@ -53,9 +52,9 @@ impl Stations {
         for station in report.stations {
             // A key the relay printed is always one; one that is not is skipped, not trusted.
             if let Ok(key) = PublicKey::from_base64(&station.key) {
-                // The one door a receiver's place comes in by: its public cell, pinned.
-                if let Some(pin) = crate::privacy::public_location(&key, &station) {
-                    places.insert(key, pin);
+                // The one door a receiver's place comes in by: its public cell, and its centre.
+                if let Some(place) = crate::privacy::public_place(&station) {
+                    places.insert(key, place);
                 }
                 by_key.insert(key, station);
             }
@@ -113,7 +112,8 @@ impl Stations {
             batches: report.batches,
             gaps: report.gaps,
             late_batches: report.late_batches,
-            location: self.places.get(key).copied(),
+            cell: self.places.get(key).map(|place| place.cell.clone()),
+            location: self.places.get(key).map(|place| place.centre),
             software: report.software.clone(),
         })
     }
@@ -495,8 +495,9 @@ mod tests {
             (station.key.clone(), station.batches, station.gaps),
             (a.to_base64(), 3, 4)
         );
-        // Served at its pin inside its public cell, the finest the relay told the API.
-        let pin = station.location.ok_or("no pin")?;
+        // Served by its public cell, the finest the relay told the API, and the cell's centre.
+        assert_eq!(station.cell, cell());
+        let pin = station.location.ok_or("no place")?;
         let pinned = Region::public_cell(&Location {
             lat_e7: (pin.lat * 1e7).round() as i32,
             lon_e7: (pin.lon * 1e7).round() as i32,
