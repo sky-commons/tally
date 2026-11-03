@@ -60,6 +60,8 @@ refuse() {
 docker run -d --name "$name" -p 127.0.0.1::8080 \
 	-e TALLY_MAP_MAX_UPLOAD=80Mbit/s -e TALLY_MAP_IPV6=off \
 	-e TALLY_MAP_URL=https://map.example.org -e 'TALLY_MAP_TITLE=Tally & co' \
+	-e TALLY_MAP_CENTER=37.62,-122.38,8 -e TALLY_MAP_SITE_URL=https://example.org/ \
+	-e 'TALLY_MAP_FEED_URL=https://example.org/feed?from=map&x=1' \
 	-e TALLY_MAP_TILES=http://127.0.0.1:8089 "$image" >/dev/null
 docker cp "$here/map_feed.py" "$name:/tmp/map_feed.py"
 docker cp "$here/map_tiles.py" "$name:/tmp/map_tiles.py"
@@ -105,6 +107,17 @@ expect "a ~hex" "$page" '<meta property="og:title" content="~A32806">'
 headers="$(curl -s -D - -o "$scratch/plain" "$map/")"
 refuse "no tags without an aircraft" "$(cat "$scratch/plain")" 'og:'
 expect "the plain page keeps its ETag" "$headers" 'ETag:'
+
+# The page's title, its links back to the operator's site and to feeding, none of tar1090's
+# placeholder links to its upstream's aggregator, and where it opens.
+plain="$(cat "$scratch/plain")"
+expect "the page's title" "$plain" '<title>Tally &#38; co</title>'
+expect "the page's links" "$plain" '<nav id="tally-map-links"><a href="https://example.org/">example.org</a> &middot; <a href="https://example.org/feed?from=map&#38;x=1">Add your receiver</a></nav></body>'
+expect "tar1090's own feeding link is the operator's" "$plain" 'href="https://example.org/feed?from=map&#38;x=1">Tally &#38; co</a>'
+refuse "no placeholder aggregator" "$plain" 'aggregator.com'
+expect "a link to an aircraft has the title too" "$(get '/?icao=a32806')" '<title>Tally &#38; co</title>'
+config="$(get /config.js)"
+expect "where the map opens" "$config" $'DefaultCenterLat = 37.62;\nDefaultCenterLon = -122.38;\nDefaultZoomLvl = 8;'
 
 # The pictures.
 curl -s -D "$scratch/card.h" -o "$scratch/card.jpg" "$map/card.jpg"
@@ -199,6 +212,10 @@ done
 expect "the default tile server is OpenStreetMap's" "$(docker exec "$default" cat /run/tally-map/tiles.conf)" \
 	'tile_origin "https://tile.openstreetmap.org";'
 expect "the collector is ready" "$(docker exec "$default" ls /run/tally-map)" 'acars.ready'
+refuse "unset, tar1090's own centre" "$(docker exec "$default" cat /run/tally-map/config.js)" 'DefaultCenterLat'
+refuse "unset, no links of the operator's" "$(docker exec "$default" cat /run/tally-map/page.conf)" 'tally-map-links'
+expect "unset, tar1090's README for feeding" "$(docker exec "$default" cat /run/tally-map/page.conf)" \
+	"'https://aggregator.com/how-to-feed/' 'https://github.com/wiedehopf/tar1090#readme'"
 # Today as the container's clock has it, which is what the collector files by.
 today="$(docker exec "$default" date -u +%Y/%m/%d)"
 midnight="$(docker exec "$default" sh -c 'echo $(($(date -u +%s) / 86400 * 86400))')"

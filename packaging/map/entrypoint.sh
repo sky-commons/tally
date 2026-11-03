@@ -13,6 +13,12 @@
 #   TALLY_MAP_ACARS       the relay's --acars-out, HOST:PORT; unset, no ACARS is collected
 #   TALLY_MAP_ACARS_DAY_MAX  the most bytes of ACARS lines kept for one day (default 268435456)
 #   TALLY_MAP_TITLE       the page's title, and the site a preview names (default Tally)
+#   TALLY_MAP_CENTER      where the map opens for a first visit, LAT,LON or LAT,LON,ZOOM (default
+#                         tar1090's own, over New York at zoom 9)
+#   TALLY_MAP_SITE_URL    the operator's site, which the page links back to; unset, no link
+#   TALLY_MAP_SITE_NAME   that link's words (default the site's host)
+#   TALLY_MAP_FEED_URL    where a visitor learns to feed, which the page links to as "Add your
+#                         receiver" and tar1090's own "Improve Coverage" names; unset, no link
 #   TALLY_MAP_API         the tally-api origin routes are asked of, https://host[:port]; unset,
 #                         routes are off
 #   TALLY_MAP_PREVIEWS    on or off: a link's preview carries a picture of the map, which
@@ -440,8 +446,58 @@ js_string() {
 	printf '"%s"' "$s"
 }
 
+# html_text TEXT: TEXT as HTML's text or an attribute's value, every character that is not a letter,
+# a digit or one of a URL's own as a character reference, so it can be neither markup nor, in the
+# nginx configuration it is written into, a quote or a variable.
+html_text() {
+	local s="$1" out="" c i LC_ALL=C.UTF-8
+	for ((i = 0; i < ${#s}; i++)); do
+		c="${s:i:1}"
+		if [[ "$c" =~ ^[A-Za-z0-9./:_~#%=?,+@\ -]$ ]]; then
+			out+="$c"
+		else
+			printf -v c '&#%d;' "'$c"
+			out+="$c"
+		fi
+	done
+	printf '%s' "$out"
+}
+
+# A link's target: an http or https URL, nothing a page or a quote could take for its end.
+url_of() {
+	[[ "$1" =~ ^https?://[][A-Za-z0-9.:-]+(/[A-Za-z0-9._~:/?#@!\&+,\;=%-]*)?$ ]] ||
+		fail "$2 is '$1'; it is an http or https URL, such as https://example.org/"
+	printf '%s' "$1"
+}
+
 # tar1090's settings: config.js is read after its defaults.js and assigns over them.
 title="${TALLY_MAP_TITLE:-Tally}"
+[[ "$title" != *[[:cntrl:]]* ]] || fail "TALLY_MAP_TITLE holds a control character"
+
+# Where the map opens for a visitor it has not seen (tar1090 keeps where each visitor left it): the
+# operator's coverage, rather than tar1090's default over New York.
+center="${TALLY_MAP_CENTER:-}"
+center_lat="" center_lon="" center_zoom=""
+if [[ -n "$center" ]]; then
+	number='-?[0-9]{1,3}(\.[0-9]+)?'
+	[[ "$center" =~ ^($number),($number)(,([0-9]{1,2}(\.[0-9]+)?))?$ ]] ||
+		fail "TALLY_MAP_CENTER is '$center'; it is LAT,LON or LAT,LON,ZOOM, such as 34.05,-118.25,8"
+	center_lat="${BASH_REMATCH[1]}" center_lon="${BASH_REMATCH[3]}" center_zoom="${BASH_REMATCH[6]}"
+	awk -v lat="$center_lat" -v lon="$center_lon" -v zoom="${center_zoom:-0}" \
+		'BEGIN { exit !(lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180 && zoom >= 0 && zoom <= 20) }' ||
+		fail "TALLY_MAP_CENTER is '$center'; its latitude is within 90, its longitude within 180, its zoom 0 to 20"
+fi
+
+# The page's own links, back to the operator's site and to where a visitor learns to feed.
+site_url="" feed_url=""
+[[ -z "${TALLY_MAP_SITE_URL:-}" ]] || site_url="$(url_of "$TALLY_MAP_SITE_URL" TALLY_MAP_SITE_URL)" || exit
+[[ -z "${TALLY_MAP_FEED_URL:-}" ]] || feed_url="$(url_of "$TALLY_MAP_FEED_URL" TALLY_MAP_FEED_URL)" || exit
+site_name="${TALLY_MAP_SITE_NAME:-}"
+[[ "$site_name" != *[[:cntrl:]]* ]] || fail "TALLY_MAP_SITE_NAME holds a control character"
+if [[ -z "$site_name" && -n "$site_url" ]]; then
+	site_name="${site_url#*://}"
+	site_name="${site_name%%/*}"
+fi
 api="${TALLY_MAP_API:-}"
 api="${api%/}"
 {
@@ -454,6 +510,11 @@ api="${api%/}"
 	# No receiver is placed on the map (docs/relay-operators.md): readsb below is given no
 	# location, so receiver.json names none and no aircraft carries a distance from one; and
 	# tar1090 draws no site marker, range rings or range outline even if one were named.
+	if [[ -n "$center_lat" ]]; then
+		echo "DefaultCenterLat = $center_lat;"
+		echo "DefaultCenterLon = $center_lon;"
+		[[ -z "$center_zoom" ]] || echo "DefaultZoomLvl = $center_zoom;"
+	fi
 	echo 'SiteShow = false;'
 	echo 'SiteCircles = false;'
 	echo 'actual_range_show = false;'
@@ -468,6 +529,41 @@ api="${api%/}"
 	fi
 } >/run/tally-map/config.js.new
 mv /run/tally-map/config.js.new /run/tally-map/config.js
+
+# The page as nginx serves it (nginx.conf's /index.html): tar1090's own, with the title above in its
+# <title> (tar1090 sets it again once its script runs, so a link's preview and a page still loading
+# name it too), its placeholder credits and links to its upstream's aggregator (aggregator.com,
+# which tar1090 shows only on that site) pointed at this map's own or tar1090's README, and the
+# operator's links back to its site and to how to feed, at the map's top left (below tar1090's
+# buttons where the screen is narrow, as a phone's is). Each replacement is
+# written as HTML character references (html_text), so nothing an operator sets is markup here or
+# a quote or a variable to nginx.
+readme="https://github.com/wiedehopf/tar1090#readme"
+title_html="$(html_text "$title")"
+links=""
+if [[ -n "$site_url" ]]; then
+	links+="<a href=\"$(html_text "$site_url")\">$(html_text "$site_name")</a>"
+fi
+if [[ -n "$feed_url" ]]; then
+	[[ -z "$links" ]] || links+=" &middot; "
+	links+="<a href=\"$(html_text "$feed_url")\">Add your receiver</a>"
+fi
+{
+	echo "# Written by the tally-map image at start, from its environment (entrypoint.sh)."
+	echo "sub_filter_once off;"
+	echo "sub_filter_last_modified on;"
+	style=""
+	if [[ -n "$links" ]]; then
+		style="<style>#tally-map-links{position:absolute;top:8px;left:8px;z-index:200;padding:6px 10px;border-radius:8px;background:rgba(255,255,255,.94);color:#1c2024;box-shadow:0 1px 3px rgba(0,0,0,.3);font:600 13px/1.3 -apple-system,BlinkMacSystemFont,\"Segoe UI\",system-ui,sans-serif}#tally-map-links a{color:#0b7aa3;text-decoration:none}#tally-map-links a:hover{text-decoration:underline}@media (max-width:700px){#tally-map-links{top:64px}}</style>"
+		echo "sub_filter '</body>' '<nav id=\"tally-map-links\">$links</nav></body>';"
+	fi
+	echo "sub_filter '<title>tar1090</title>' '<title>$title_html</title>$style';"
+	echo "sub_filter '>aggregator.com<' '>$title_html<';"
+	echo "sub_filter 'https://aggregator.com/how-to-feed/' '$(html_text "${feed_url:-$readme}")';"
+	echo "sub_filter 'https://aggregator.com/faq/' '$readme';"
+	echo "sub_filter 'https://aggregator.com/map-help/' '$readme';"
+} >/run/tally-map/page.conf.new
+mv /run/tally-map/page.conf.new /run/tally-map/page.conf
 
 mkdir -p /run/readsb /var/globe_history/internal_state /var/globe_history/archive
 [[ -w /var/globe_history ]] ||
