@@ -67,44 +67,62 @@ fn batch(
 
 /// One receiver's row at every cap: a batch every minute of the window and the hour after it (the
 /// most its minutes hold between two hourly signings), and more aircraft, each placed by its own
-/// pair in a coverage cell of its own, than a row holds.
+/// pair in a coverage cell of its own, than a row holds; its site in force, so its location check
+/// holds a grid in each of its two epochs (`siting`).
 #[test]
 fn a_full_row_costs_no_more_than_its_charge() {
     let figures = Figures::new();
     let feeder = Identity::from_seed([7; 32]);
-    let public = Region::public_cell(&Location {
+    let site = Location {
         lat_e7: 375_000_000,
         lon_e7: -1_222_500_000,
         alt_m: 0,
         precision_m: 0,
-    })
-    .unwrap_or_else(|error| panic!("{error}"));
+    };
+    let public = Region::public_cell(&site).unwrap_or_else(|error| panic!("{error}"));
+    let point = Region::point(&site).unwrap_or_else(|error| panic!("{error}"));
     // Built before the count: the batches are the test's, not the row's.
     let aircraft = (MAX_PER_FEEDER + 64) as u32;
     let mut batches = Vec::new();
-    for n in 0..aircraft {
-        // Spread over a few hundred kilometres: a coverage cell (about 16 km across) each.
-        let lat = 35.5 + f64::from(n / 24) * 0.17;
-        let lon = -124.5 + f64::from(n % 24) * 0.2;
-        let at = T + u64::from(n) * 1_000;
-        batches.push(batch(
-            &feeder,
-            u64::from(n),
-            at,
-            vec![
-                airborne(0x10_0000 + n, lat, lon, false),
-                airborne(0x10_0000 + n, lat, lon, true),
-            ],
-        ));
+    // Once in each of the location check's two epochs.
+    for (epoch, from) in [T, T + tally_relay::siting::EPOCH_MS]
+        .into_iter()
+        .enumerate()
+    {
+        for n in 0..aircraft {
+            // Spread over a few hundred kilometres: a coverage cell (about 16 km across) each.
+            let lat = 35.5 + f64::from(n / 24) * 0.17;
+            let lon = -124.5 + f64::from(n % 24) * 0.2;
+            let at = from + u64::from(n) * 1_000;
+            batches.push(batch(
+                &feeder,
+                epoch as u64 * u64::from(aircraft) + u64::from(n),
+                at,
+                vec![
+                    airborne(0x10_0000 + n, lat, lon, false),
+                    airborne(0x10_0000 + n, lat, lon, true),
+                ],
+            ));
+        }
     }
     let minutes = (WINDOW_HOURS + 1) * 60;
     for minute in 0..minutes {
         let at = T + minute * 60_000 + 30_000;
-        batches.push(batch(&feeder, u64::from(aircraft) + minute, at, Vec::new()));
+        batches.push(batch(
+            &feeder,
+            2 * u64::from(aircraft) + minute,
+            at,
+            Vec::new(),
+        ));
     }
     let before = tally_counting::CountingAll::live();
     for decoded in &batches {
-        figures.batch(decoded, Some(public), judged(decoded.wall_ms()));
+        figures.batch_sited(
+            decoded,
+            Some(public),
+            Some(point),
+            judged(decoded.wall_ms()),
+        );
     }
     let row = tally_counting::CountingAll::live() - before;
     assert_eq!(figures.rows(), 1);

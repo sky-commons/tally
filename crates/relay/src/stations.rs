@@ -148,6 +148,12 @@ pub struct StationReport {
     /// on loopback only (`config::parse_loopback`), and `tally-api` answers a client only the
     /// connected stations of the client's own address (`GET /v1/me`).
     pub address: Option<String>,
+    /// What the relay's location check says of the site it claims (RFC-0204, `siting`): whether
+    /// it fits the aircraft the receiver hears, and when it is held wrong, by about how far (in
+    /// steps of 5 km, never which way or where the receiver seems to be). `None` while the relay
+    /// has judged nothing of it. Absent from a relay older than this field, read as `None`.
+    #[serde(default)]
+    pub location_check: Option<crate::siting::LocationCheck>,
 }
 
 /// How a station report names a cell: its H3 index in lowercase hex, as H3's own tools print it.
@@ -247,6 +253,7 @@ impl Tally {
             cell: None,
             software: None,
             address,
+            location_check: None,
         }
     }
 }
@@ -281,6 +288,7 @@ fn connected_only(
         cell: None,
         software: None,
         address,
+        location_check: None,
     }
 }
 

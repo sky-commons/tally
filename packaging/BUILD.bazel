@@ -25,11 +25,13 @@ rust_test(
     ],
     crate_root = "tests/install.rs",
     data = [
+        "geoid/geoid.txt",
         "install.sh",
         "update.sh",
     ],
     edition = "2024",
     env = {
+        "TALLY_GEOID": "$(rootpath geoid/geoid.txt)",
         "TALLY_INSTALLER": "$(rootpath install.sh)",
         "TALLY_UPDATER": "$(rootpath update.sh)",
     },

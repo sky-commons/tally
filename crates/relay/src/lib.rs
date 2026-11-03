@@ -54,6 +54,7 @@ pub mod selection;
 pub mod sharing;
 pub mod shed;
 pub mod signer;
+pub mod siting;
 pub mod sockets;
 pub mod standing;
 pub mod stations;

@@ -83,6 +83,7 @@ fn report_of(cell: Option<String>, software: Option<&str>, observations: u64) ->
         cell,
         software: software.map(str::to_owned),
         address: Some("203.0.113.7".to_owned()),
+        location_check: None,
     }
 }
 
@@ -229,6 +230,25 @@ fn the_network_and_station_answers_are_the_fixtures() -> Result<(), String> {
         &located.station(&station_key()).ok_or("no station")?,
         fixtures::STATION,
     )?;
+    // The relay's location check holds its place wrong by about 45 km (RFC-0204).
+    let misplaced = Stations::from_report(
+        StationsReport {
+            now_ms: NOW_MS,
+            stations: vec![StationReport {
+                late_batches: 7,
+                location_check: Some(tally_relay::siting::LocationCheck {
+                    state: tally_relay::siting::CheckState::Wrong,
+                    off_km: Some(45),
+                }),
+                ..report(place.clone(), Some("tally-feed 0.3.1"))
+            }],
+        },
+        Some(&earlier(place.clone(), Some("tally-feed 0.3.1"))),
+    );
+    same(
+        &misplaced.station(&station_key()).ok_or("no station")?,
+        fixtures::STATION_MISPLACED,
+    )?;
     let bare = Stations::from_report(
         StationsReport {
             now_ms: NOW_MS,
@@ -260,6 +280,7 @@ fn the_network_and_station_answers_are_the_fixtures() -> Result<(), String> {
                 cell: None,
                 software: Some("tally-feed 0.3.0".to_owned()),
                 address: None,
+                location_check: None,
             }],
         },
         None,
@@ -380,7 +401,11 @@ fn no_public_answer_carries_a_place_finer_than_the_cell() -> Result<(), String> 
         assert_eq!(answers(lat, lon)?.0, text, "an antenna at {lat}, {lon}");
     }
     // The fixtures say the same of theirs: the one place in them is their cell's rounded centre.
-    for fixture in [fixtures::STATION, fixtures::STATION_OFFLINE] {
+    for fixture in [
+        fixtures::STATION,
+        fixtures::STATION_OFFLINE,
+        fixtures::STATION_MISPLACED,
+    ] {
         let mut served = Vec::new();
         places(
             &serde_json::from_str(fixture).map_err(|e| e.to_string())?,

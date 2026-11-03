@@ -3108,7 +3108,8 @@ impl Hub {
                 .message()
                 .route(producer, decoded, area, stamp.raw());
         }
-        self.network.on_batch(decoded.as_ref(), cells.public, stamp);
+        self.network
+            .on_batch(decoded.as_ref(), cells.public, cells.point, stamp);
         let record = Record::Batch(batch);
         self.share(&origin, &record, Now::from(stamp));
         self.fanout.publish(Item {
@@ -3213,6 +3214,10 @@ impl Hub {
         let mut reports: Vec<(PublicKey, StationReport)> =
             rows.map(|rows| rows.reports(now)).unwrap_or_default();
         reports.sort_by_key(|(key, _)| *key);
+        // What the location check says of each (`siting`), before the directory's lock.
+        for (key, report) in &mut reports {
+            report.location_check = self.network.location_check(key);
+        }
         let stations = match self.directory.lock() {
             Ok(directory) => reports
                 .into_iter()
@@ -3234,7 +3239,10 @@ impl Hub {
             .ok()?
             .report(receiver, self.clock.read())?;
         let directory = self.directory.lock().ok()?;
-        Some(described(report, directory.known.get(receiver)))
+        let mut report = described(report, directory.known.get(receiver));
+        drop(directory);
+        report.location_check = self.network.location_check(receiver);
+        Some(report)
     }
 
     /// Where `receiver`'s newest signed description places it: the finest cell, projected once
@@ -7569,6 +7577,86 @@ mod tests {
             ),
             crate::sharing::Deadlines::RELAY,
         )
+    }
+
+    /// RFC-0204: the relay checks a receiver's site against the aircraft it itself hears. A
+    /// receiver that says it is in London and hears only aircraft some 330 km south-east of it,
+    /// forty of them, is held wrong once `siting::WRONG_AFTER` judgments in a row find it so; its
+    /// station report says by about how far, never where it seems to be; and its batches are
+    /// still forwarded.
+    #[test]
+    fn a_site_that_does_not_fit_what_its_receiver_hears_is_reported_wrong() -> Result<(), String> {
+        use tally_mlat_solver::modes;
+        let airborne = |address: u32, lat: f64, lon: f64, odd: bool| {
+            let (lat_cpr, lon_cpr) = modes::cpr_encode(
+                modes::LatLon {
+                    lat_deg: lat,
+                    lon_deg: lon,
+                },
+                odd,
+            );
+            let me = modes::encode_airborne_position(11, 0x0c38, odd, lat_cpr, lon_cpr);
+            let mut body = vec![
+                (17 << 3) | 5,
+                (address >> 16) as u8,
+                (address >> 8) as u8,
+                address as u8,
+            ];
+            body.extend_from_slice(&me);
+            Observation {
+                format: b'3',
+                timestamp: 1,
+                signal: 100,
+                data: modes::with_parity(&body, 0),
+            }
+        };
+        let hub = Arc::new(stamped_hub(8, crate::sharing::Deadlines::RELAY));
+        let (receiver, receiver_key) = key()?;
+        let (info, place, _) = located(&receiver)?;
+        hub.publish_info(1, info, receiver_key, 1, Some(place), true);
+        let at = now_ms();
+        for n in 0..40u32 {
+            let (lat, lon) = (
+                48.8 + f64::from(n % 5) * 0.05,
+                2.2 + f64::from(n / 5) * 0.05,
+            );
+            let address = 0x40_0000 + n;
+            let heard = vec![
+                airborne(address, lat, lon, false),
+                airborne(address, lat, lon, true),
+                airborne(address, lat, lon, false),
+            ];
+            assert!(hub.publish_batch(
+                1,
+                signed_batch_at(&receiver, u64::from(n), heard, at)?,
+                receiver_key
+            ));
+        }
+        for round in 1..=crate::siting::WRONG_AFTER {
+            hub.network().judge_sites(judged(at));
+            let state = hub
+                .station(&receiver_key)
+                .and_then(|station| station.location_check)
+                .map(|check| check.state);
+            assert_eq!(
+                state == Some(crate::siting::CheckState::Wrong),
+                round == crate::siting::WRONG_AFTER,
+                "round {round}: {state:?}"
+            );
+        }
+        let check = hub
+            .station(&receiver_key)
+            .and_then(|station| station.location_check)
+            .ok_or("no location check")?;
+        assert_eq!(check.state, crate::siting::CheckState::Wrong);
+        let off_km = check.off_km.ok_or("no distance")?;
+        assert!((300..=375).contains(&off_km), "{off_km}");
+        assert!(hub.network().figures.rows() == 1);
+        assert_eq!(
+            hub.station(&receiver_key).map(|station| station.batches),
+            Some(40)
+        );
+        Ok(())
     }
 
     /// A station's instants are timed on the monotonic clock and served as Unix times

@@ -220,6 +220,36 @@ pub struct Station {
     pub location: Option<Position>,
     /// What it runs, as it says; `null` when it says nothing.
     pub software: Option<String>,
+    /// What the relay's location check says of the place the station claims (RFC-0204): whether
+    /// it fits the aircraft the station itself hears. Absent while the relay has judged nothing of
+    /// it (it has heard too little, holds no site for it, or is older than this field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_check: Option<LocationCheck>,
+}
+
+/// The relay's check of a station's claimed place against the aircraft it hears (RFC-0204). It
+/// catches places kilometres off (a guessed location, a mistyped degree), never metres. A station
+/// held `wrong` takes no part in MLAT until its owner fixes the place (`install.sh --locate`); its
+/// receptions still reach the map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocationCheck {
+    pub state: LocationCheckState,
+    /// When `wrong`: about how far off the claimed place is, kilometres, in steps of 5. Never which
+    /// way, and never where the station seems to be.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub off_km: Option<u32>,
+}
+
+/// What the location check found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LocationCheckState {
+    /// Too little heard yet, or nothing that can tell.
+    Unjudged,
+    /// The place fits what it hears.
+    Fits,
+    /// The place does not fit what it hears.
+    Wrong,
 }
 
 /// `GET /v1/me`: the stations connected now from the asking client's own host (its IPv4 address or
@@ -467,6 +497,9 @@ pub mod fixtures {
     pub const STATION_SILENT: &str = include_str!("../testdata/station_silent.json");
     /// `GET /v1/stations/{key}`: a station that fed and is no longer connected (`offline`).
     pub const STATION_OFFLINE: &str = include_str!("../testdata/station_offline.json");
+    /// `GET /v1/stations/{key}`: a located station whose place the relay's location check holds
+    /// wrong by about 45 km (RFC-0204).
+    pub const STATION_MISPLACED: &str = include_str!("../testdata/station_misplaced.json");
     /// The key the station fixtures name, as base64url without padding (the path's form).
     pub const STATION_KEY_URL: &str = "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw";
     /// `GET /v1/me`: the one station of the asking client's address.
@@ -515,6 +548,7 @@ mod tests {
         whole::<Station>(fixtures::STATION_BARE)?;
         whole::<Station>(fixtures::STATION_SILENT)?;
         whole::<Station>(fixtures::STATION_OFFLINE)?;
+        whole::<Station>(fixtures::STATION_MISPLACED)?;
         whole::<FeederStats>(fixtures::FEEDER_STATS)?;
         whole::<FeederStats>(fixtures::FEEDER_STATS_UNRANKED)?;
         whole::<Leaderboards>(fixtures::LEADERBOARDS)?;
