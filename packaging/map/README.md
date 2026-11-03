@@ -88,7 +88,11 @@ gh attestation verify oci://ghcr.io/sky-commons/tally-map:vX.Y.Z --repo sky-comm
 | `TALLY_MAP_BEAST`              | `127.0.0.1:30105` | The relay's `--beast-out`, `HOST:PORT` (or readsb's `HOST,PORT`). readsb dials it and redials every 5 s while it is down.                        |
 | `TALLY_MAP_ACARS`              | unset             | The relay's `--acars-out`, `HOST:PORT`: each ACARS, VDL2 and HFDL message, copies merged, filed into its UTC day's archive (below). Unset, none. |
 | `TALLY_MAP_ACARS_DAY_MAX`      | `268435456`       | The most bytes of ACARS lines kept for one day; past it the rest of the day's are dropped. As it is packed, it takes three times that on disk.   |
-| `TALLY_MAP_TITLE`              | `Tally`           | The page's title, and the site a preview names.                                                                                                  |
+| `TALLY_MAP_TITLE`              | `Tally`           | The page's title (its `<title>` and tar1090's), and the site a preview names.                                                                    |
+| `TALLY_MAP_CENTER`             | unset             | Where the map opens for a first visit, `LAT,LON` or `LAT,LON,ZOOM` (`34.05,-118.25,8`). Unset, tar1090's own: New York, zoom 9.                  |
+| `TALLY_MAP_SITE_URL`           | unset             | The operator's site, which the page links back to at its top left. Unset, no link.                                                               |
+| `TALLY_MAP_SITE_NAME`          | the site's host   | That link's words.                                                                                                                               |
+| `TALLY_MAP_FEED_URL`           | unset             | Where a visitor learns to feed: the page's "Add your receiver" link, and tar1090's own "Improve Coverage". Unset, no link.                        |
 | `TALLY_MAP_API`                | unset             | The `tally-api` origin (`https://host[:port]`, no path). The map asks it for routes at `/api/0/routeset`. Unset, routes are off.                 |
 | `TALLY_MAP_URL`                | unset             | The map's public origin (`https://host[:port]`), which a preview's links name in full. Unset, `https://` and the host asked for.                 |
 | `TALLY_MAP_PREVIEWS`           | `on`              | `on` or `off`: a link's preview carries a picture of the map. Off, `preview.py` does not run and every preview's picture is the site's card (below).|
@@ -102,6 +106,11 @@ gh attestation verify oci://ghcr.io/sky-commons/tally-map:vX.Y.Z --repo sky-comm
 | `TALLY_MAP_TRUSTED_PROXIES`    | unset             | The proxies whose header is believed: CIDRs or addresses, separated by commas or spaces. Set exactly when `TALLY_MAP_CLIENT_IP_HEADER` is.       |
 | `TALLY_MAP_ARCHIVE_PUBLIC`     | `on`              | `on` or `off`: `/archive/` is open to anyone. Off, it answers 404 to any request without the token below.                                        |
 | `TALLY_MAP_ARCHIVE_TOKEN_FILE` | unset             | A file holding that token (one line of at least 32 letters, digits, `_` or `-`: `openssl rand -hex 32`), readable by uid 100. Required when off. |
+
+tar1090's page is served as it is but for what these settings put in it, as nginx serves it: the
+title in its `<title>`, the links above at the map's top left, and tar1090's placeholder credits and
+links to its upstream's aggregator (aggregator.com, which tar1090 shows only on that site) pointed at
+the title, the feeding link or tar1090's README.
 
 ## What it sends
 
