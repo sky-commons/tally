@@ -22,6 +22,36 @@ macro_rules! counters {
 }
 
 counters!(
+    // The held-read prototype's (`pair::proto`): its phases, nanoseconds, what it formed and
+    // built against what it held, its bytes summed over its refits, and its refits.
+    proto_gather_ns,
+    proto_store_ns,
+    proto_digest_ns,
+    proto_reader_ns,
+    proto_formation_ns,
+    proto_build_ns,
+    proto_window_ns,
+    proto_formed,
+    proto_formed_held,
+    proto_blocks_built,
+    proto_blocks_held,
+    proto_bytes,
+    proto_bytes_samples,
+    proto_refits,
+    // The same-run A/B: refits run both ways, each way's nanoseconds (the engine's gather apart
+    // too), how many ran the engine first, and the models alike and not.
+    ab_refits,
+    proto_changes,
+    proto_parts_new,
+    proto_parts_gone,
+    proto_touched,
+    proto_resets,
+    ab_engine_ns,
+    ab_engine_gather_ns,
+    ab_proto_ns,
+    ab_engine_first,
+    ab_same,
+    ab_mismatches,
     // Baseline phases, nanoseconds.
     gather_ns,
     reader_ns,
@@ -166,6 +196,18 @@ pub fn shadowing<T>(work: impl FnOnce() -> T) -> T {
 }
 static MEMORY: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
 static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Whether the held-read prototype refits (`TALLY_REFIT_PROTO` set), read once.
+pub fn proto_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TALLY_REFIT_PROTO").is_some())
+}
+
+/// Whether the slice-1 and re-read oracles run: not beside the held-read prototype's A/B, whose
+/// engine path is timed as the engine runs it.
+pub fn oracles() -> bool {
+    !proto_on()
+}
 
 /// Adds `value` to `counter`.
 pub fn add(counter: P, value: u64) {

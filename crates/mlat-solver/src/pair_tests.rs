@@ -1344,6 +1344,255 @@ fn a_warm_refit_publishes_what_a_cold_refit_publishes() -> Result {
     Ok(())
 }
 
+/// The probe's held-read prototype (`pair::fit_proto`) publishes, refit after refit of every
+/// area, the bytes a cold refit of the engine's own inputs (`Arrived::area_inputs_over`) publishes
+/// from the same warm model: over a scene whose batches arrive out of order and some late, so
+/// receptions join old seconds, status receptions come and go with their aircraft's events, and
+/// the window slides.
+#[cfg(tally_refit_probe)]
+#[test]
+fn the_held_read_prototype_publishes_what_a_cold_refit_publishes() -> Result {
+    let (seed, duration) = (env("PROTO_SEED", 9000), env("PROTO_DURATION_S", 45.0));
+    let scenario = if env("PROTO_WORLD", 0) == 1 {
+        world_density(seed, duration)
+    } else {
+        of(seed, duration)
+    };
+    let mut simulation = sim::run(&scenario);
+    let arrivals = sim::arrivals(&mut simulation, scenario.seed);
+    let mut arrivals = reordered(&relayed(&arrivals, 7), &mut Rng::new(11));
+    // One batch in twenty late by 3 to 12 s: its receiver's later batches wait for it (its
+    // frontier), and all of them join seconds the window has read before.
+    let mut rng = Rng::new(env("PROTO_LATE_SEED", 23));
+    for arrival in &mut arrivals {
+        if rng.uniform() < 0.05 {
+            arrival.at_ms += 3_000 + (rng.uniform() * 9_000.0) as u64;
+        }
+    }
+    let sites = Sites::new(&simulation.sites());
+    let mut arrived = Arrived::new(Limits {
+        held_ms: HELD_MS,
+        ..Limits::UNBOUNDED
+    });
+    let (Some(first), Some(last)) = (
+        arrivals.iter().map(|arrival| arrival.at_ms).min(),
+        arrivals.iter().map(|arrival| arrival.at_ms).max(),
+    ) else {
+        return Err("no arrivals".into());
+    };
+    let mut order: Vec<usize> = (0..arrivals.len()).collect();
+    order.sort_by_key(|at| arrivals[*at].at_ms);
+    let reads = crate::sync::Reads::default();
+    let mut held: BTreeMap<Region, (PairCache, Option<PairModel>)> = BTreeMap::new();
+    let (mut compared, mut failed, mut built, mut reused) = (0usize, 0usize, 0usize, 0usize);
+    let mut next = 0;
+    let mut now = first.next_multiple_of(STEP_MS);
+    while now <= last + SETTLE_MS {
+        while let Some(at) = order.get(next).filter(|at| arrivals[**at].at_ms <= now) {
+            let arrival = &arrivals[*at];
+            arrived.admit(arrival.batch, arrival.at_ms, &arrival.receptions);
+            next += 1;
+        }
+        arrived.seal(now);
+        if now.is_multiple_of(REFIT_EVERY_MS) {
+            let edge_ms = Trailing::fitted_at(now).edge_ms;
+            for area in sites.areas().map(|(area, _)| *area).collect::<Vec<_>>() {
+                let (cache, warm) = held.entry(area).or_default();
+                let warm_model = warm.clone();
+                let proto = pair::fit_proto(
+                    &arrived,
+                    &sites,
+                    area,
+                    edge_ms,
+                    warm_model.as_ref(),
+                    cache,
+                    &reads,
+                );
+                let inputs = arrived.area_inputs(area, &sites, edge_ms);
+                let (proto, inputs) = match (proto, inputs) {
+                    (None, None) => continue,
+                    (Some(proto), Some(inputs)) => (proto, inputs),
+                    (proto, inputs) => {
+                        return Err(format!(
+                            "{area:?} at {edge_ms}: prototype {} inputs {}",
+                            proto.is_some(),
+                            inputs.is_some()
+                        ));
+                    }
+                };
+                let cold = pair::fit(&inputs, warm_model.as_ref(), &mut PairCache::default());
+                match (&proto, &cold) {
+                    (Ok(a), Ok(b)) => {
+                        assert_eq!(
+                            a.model.input, b.model.input,
+                            "{area:?} at {edge_ms}: the citation"
+                        );
+                        assert_eq!(
+                            publish::encode_pairs(&a.model).map_err(text)?,
+                            publish::encode_pairs(&b.model).map_err(text)?,
+                            "{area:?} at {edge_ms}: the prototype publishes other bytes"
+                        );
+                        compared += 1;
+                        built += a.stats.blocks_built;
+                        reused += a.stats.blocks_reused;
+                        *warm = Some(a.model.clone());
+                    }
+                    (Err(a), Err(b)) => {
+                        assert_eq!(a, b, "{area:?} at {edge_ms}");
+                        failed += 1;
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{area:?} at {edge_ms}: prototype {:?}, cold {:?}",
+                            proto.as_ref().err(),
+                            cold.as_ref().err()
+                        ));
+                    }
+                }
+            }
+        }
+        now += STEP_MS;
+    }
+    eprintln!(
+        "prototype: {compared} refits compared, {failed} failed alike, {built} seconds built, {reused} held"
+    );
+    assert!(compared >= 40, "{compared} refits compared");
+    assert!(reused > 0, "{reused} seconds held, {built} built");
+    Ok(())
+}
+
+/// What the held-read prototype costs against the engine's refit, on one thread over the world
+/// density (`PROTO_DURATION_S` long, every area every refit): each one's gather and fit, whole,
+/// summed over the refits after the first window, and the prototype's phases (the probe's
+/// counters). A measurement: run with --ignored --nocapture.
+#[cfg(tally_refit_probe)]
+#[test]
+#[ignore = "a measurement: run with --ignored --nocapture"]
+fn the_held_read_prototypes_cost() -> Result {
+    let scenario = world_density(env("PROTO_SEED", 9000), env("PROTO_DURATION_S", 60.0));
+    let mut simulation = sim::run(&scenario);
+    let arrivals = sim::arrivals(&mut simulation, scenario.seed);
+    let sites = Sites::new(&simulation.sites());
+    let mut arrived = Arrived::new(Limits {
+        held_ms: HELD_MS,
+        ..Limits::UNBOUNDED
+    });
+    let (Some(first), Some(last)) = (arrivals.first(), arrivals.last()) else {
+        return Err("no arrivals".into());
+    };
+    let measured_from = first.at_ms + TRAILING_WINDOW_MS + REFIT_EVERY_MS;
+    let reads = crate::sync::Reads::default();
+    let mut engine: BTreeMap<Region, (PairCache, Option<PairModel>)> = BTreeMap::new();
+    let mut proto: BTreeMap<Region, PairCache> = BTreeMap::new();
+    let (mut engine_ns, mut proto_ns, mut refits) = (0u128, 0u128, 0usize);
+    let mut engine_blocks = (0usize, 0usize);
+    let mut base: Option<Vec<(&str, u64)>> = None;
+    let mut next = 0;
+    let mut now = first.at_ms.next_multiple_of(STEP_MS);
+    while now <= last.at_ms {
+        while let Some(arrival) = arrivals.get(next).filter(|arrival| arrival.at_ms <= now) {
+            arrived.admit(arrival.batch, arrival.at_ms, &arrival.receptions);
+            next += 1;
+        }
+        arrived.seal(now);
+        if now.is_multiple_of(REFIT_EVERY_MS) {
+            let measured = now >= measured_from;
+            if measured && base.is_none() {
+                base = Some(crate::probe::snapshot());
+            }
+            let edge_ms = Trailing::fitted_at(now).edge_ms;
+            for area in sites.areas().map(|(area, _)| *area).collect::<Vec<_>>() {
+                let (cache, warm) = engine.entry(area).or_default();
+                let warm_model = warm.clone();
+                let started = Instant::now();
+                let fitted = if std::env::var_os("PROTO_ONLY").is_some() {
+                    Err(pair::PairError::Empty)
+                } else {
+                    let Some(inputs) = arrived.area_inputs(area, &sites, edge_ms) else {
+                        continue;
+                    };
+                    pair::fit_sharing(&inputs, warm_model.as_ref(), cache, &reads)
+                };
+                let spent = started.elapsed().as_nanos();
+                let started = Instant::now();
+                let skip_proto = std::env::var_os("ENGINE_ONLY").is_some();
+                let held = if skip_proto {
+                    None
+                } else {
+                    pair::fit_proto(
+                        &arrived,
+                        &sites,
+                        area,
+                        edge_ms,
+                        warm_model.as_ref(),
+                        proto.entry(area).or_default(),
+                        &reads,
+                    )
+                };
+                let spent_proto = started.elapsed().as_nanos();
+                if let (Ok(a), Some(Ok(b))) = (&fitted, &held) {
+                    assert_eq!(a.model, b.model, "{area:?} at {edge_ms}");
+                }
+                if measured {
+                    engine_ns += spent;
+                    proto_ns += spent_proto;
+                    refits += 1;
+                }
+                if let Ok(fitted) = &fitted
+                    && measured
+                {
+                    engine_blocks.0 += fitted.stats.blocks_built;
+                    engine_blocks.1 += fitted.stats.blocks_reused;
+                }
+                if let Ok(fitted) = fitted {
+                    *warm = Some(fitted.model);
+                } else if let Some(Ok(held)) = held {
+                    *warm = Some(held.model);
+                }
+            }
+        }
+        now += STEP_MS;
+    }
+    let after = crate::probe::snapshot();
+    let base = base.unwrap_or_default();
+    let delta = |name: &str| {
+        let at =
+            |list: &[(&str, u64)]| list.iter().find(|(n, _)| *n == name).map_or(0, |(_, v)| *v);
+        at(&after) - at(&base)
+    };
+    let per = |ns: u128| ns as f64 / 1e6 / refits.max(1) as f64;
+    println!(
+        "{refits} refits: engine {:.3} ms a refit, prototype {:.3} (ratio {:.3})",
+        per(engine_ns),
+        per(proto_ns),
+        proto_ns as f64 / engine_ns.max(1) as f64
+    );
+    println!(
+        "  engine blocks built {} held {}",
+        engine_blocks.0, engine_blocks.1
+    );
+    for name in [
+        "proto_gather_ns",
+        "proto_store_ns",
+        "proto_digest_ns",
+        "proto_reader_ns",
+        "proto_formation_ns",
+        "proto_build_ns",
+        "proto_window_ns",
+    ] {
+        println!("  {name} {:.3}", per(u128::from(delta(name))));
+    }
+    println!(
+        "  formed {} held {}; blocks built {} held {}; bytes an area-refit {}",
+        delta("proto_formed"),
+        delta("proto_formed_held"),
+        delta("proto_blocks_built"),
+        delta("proto_blocks_held"),
+        delta("proto_bytes") / delta("proto_bytes_samples").max(1)
+    );
+    Ok(())
+}
+
 /// A receiver whose clock is unknown or whose location is too coarse is in no model.
 #[test]
 fn a_receiver_with_an_unknown_clock_or_coarse_location_takes_no_part() -> Result {

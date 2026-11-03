@@ -434,6 +434,9 @@ pub(super) struct Raw<'r> {
     /// The seconds a digest of sync receptions alone would read again.
     #[cfg(tally_refit_probe)]
     reread_sync: std::collections::BTreeSet<u64>,
+    /// The held-read prototype's formed seconds, which its cut blocks are built from.
+    #[cfg(tally_refit_probe)]
+    pub(super) proto: Option<super::proto::Pool>,
 }
 
 impl<'r> Raw<'r> {
@@ -457,6 +460,8 @@ impl<'r> Raw<'r> {
             per_second: BTreeMap::new(),
             #[cfg(tally_refit_probe)]
             reread_sync: std::collections::BTreeSet::new(),
+            #[cfg(tally_refit_probe)]
+            proto: None,
         }
     }
 
@@ -502,8 +507,11 @@ impl<'r> Raw<'r> {
             #[cfg(tally_refit_probe)]
             {
                 let ns = probe::since(P::formation_ns, started);
-                if self.reread.contains(&second) {
+                if probe::oracles() && self.reread.contains(&second) {
                     probe::add(P::oracle_formation_ns, ns);
+                }
+                if !probe::oracles() {
+                    return &self.seconds[&second];
                 }
                 // The formed points' digest, by their own words (window clock indices move between
                 // refits; the counts do not), summed so their order does not matter.
@@ -569,6 +577,10 @@ impl<'r> Raw<'r> {
         timebases: (Timebase, Timebase),
         from: (Option<i64>, Option<i64>),
     ) -> Option<PairBlock> {
+        #[cfg(tally_refit_probe)]
+        if let Some(pool) = &self.proto {
+            return pool.block(pair, own, timebases, from);
+        }
         for second in own.saturating_sub(LINE_BLOCKS - 1)..=own {
             self.second(second);
         }
@@ -590,7 +602,9 @@ impl<'r> Raw<'r> {
         #[cfg(tally_refit_probe)]
         {
             probe::since(P::copy_ns, started);
-            self.oracle(pair, own, timebases, from, &pooled);
+            if probe::oracles() {
+                self.oracle(pair, own, timebases, from, &pooled);
+            }
         }
         build(own, &pooled, timebases)
     }
@@ -934,7 +948,9 @@ impl BlockCache {
         #[cfg(tally_refit_probe)]
         {
             probe::since(P::digests_ns, started);
-            self.reread(raw, &digests);
+            if probe::oracles() {
+                self.reread(raw, &digests);
+            }
         }
         let of = |second: u64| digests.get(&second).copied().unwrap_or(0);
         self.seconds
@@ -962,7 +978,11 @@ impl BlockCache {
             }
             built += 1;
             #[cfg(tally_refit_probe)]
-            let old = self.seconds.get(&second).map(|held| held.pairs.clone());
+            let old = self
+                .seconds
+                .get(&second)
+                .filter(|_| probe::oracles())
+                .map(|held| held.pairs.clone());
             #[cfg(tally_refit_probe)]
             probe::add(
                 match (&old, self.edge) {
@@ -994,33 +1014,37 @@ impl BlockCache {
                             probe::local(P::oracle_runsort_ns) + probe::local(P::oracle_merge_ns)
                                 - pooled,
                         );
-                    let hashing = Instant::now();
-                    let digest = raw.pair_digest((a, b), second, self.key);
-                    probe::since(P::perpair_digest_ns, hashing);
-                    let key = (ca.key, cb.key);
-                    let was = self
-                        .pair_digests
-                        .get(&second)
-                        .and_then(|held| held.get(&key))
-                        .copied();
-                    let old_block = old.as_ref().and_then(|old| old.get(&key));
-                    let same = match (old_block, &block) {
-                        (Some(was), Some(now)) => same_block(was, now),
-                        _ => false,
-                    };
-                    if was == Some(digest) {
-                        probe::add(P::perpair_reused, 1);
-                        if old_block.is_some() && block.is_some() && !same {
-                            probe::add(P::perpair_digest_misses, 1);
-                        }
+                    if !probe::oracles() {
+                        let _ = build_ns;
                     } else {
-                        probe::add(P::perpair_rebuilt, 1);
-                        probe::add(P::perpair_build_ns, build_ns);
-                        if same {
-                            probe::add(P::perpair_digest_false, 1);
+                        let hashing = Instant::now();
+                        let digest = raw.pair_digest((a, b), second, self.key);
+                        probe::since(P::perpair_digest_ns, hashing);
+                        let key = (ca.key, cb.key);
+                        let was = self
+                            .pair_digests
+                            .get(&second)
+                            .and_then(|held| held.get(&key))
+                            .copied();
+                        let old_block = old.as_ref().and_then(|old| old.get(&key));
+                        let same = match (old_block, &block) {
+                            (Some(was), Some(now)) => same_block(was, now),
+                            _ => false,
+                        };
+                        if was == Some(digest) {
+                            probe::add(P::perpair_reused, 1);
+                            if old_block.is_some() && block.is_some() && !same {
+                                probe::add(P::perpair_digest_misses, 1);
+                            }
+                        } else {
+                            probe::add(P::perpair_rebuilt, 1);
+                            probe::add(P::perpair_build_ns, build_ns);
+                            if same {
+                                probe::add(P::perpair_digest_false, 1);
+                            }
                         }
+                        digests_now.insert(key, digest);
                     }
-                    digests_now.insert(key, digest);
                 }
                 if let Some(block) = block {
                     pairs.insert((ca.key, cb.key), Arc::new(block));
