@@ -42,6 +42,22 @@ Raspberry Pi OS Bullseye and anything newer).
     counts as unset (only `TALLY_ALT=0` says 0), and with none found it is asked for on the
     terminal, or, with no terminal, the install stops naming `TALLY_ALT`, having installed
     nothing. A position found nowhere is handled the same way.
+  - **Location from an address** (RFC-0204), for an owner who does not know the antenna's
+    coordinates or its height above the WGS84 ellipsoid: `install.sh --locate` asks for the
+    street address (whatever was found before), `TALLY_ADDRESS="..."` gives it with no terminal,
+    and an install that finds no location anywhere asks for an address before coordinates. The
+    US Census geocoder places a US address (OpenStreetMap's Nominatim is its check, and places
+    any other), USGS EPQS (the US) or Open-Meteo (elsewhere) gives the ground's elevation, one
+    question gives the antenna's height above the ground (`TALLY_ANTENNA=window`, `upstairs`,
+    `roof` or metres; a window's 2 m when there is no terminal), and the release's `geoid.txt.gz`
+    (EGM2008, within 2 m on land) turns it into height above the ellipsoid, on the receiver. The
+    place is shown with an OpenStreetMap link, and on a terminal the owner confirms it; when
+    readsb has no location of its own, the owner is offered to set it there too (the old
+    `/etc/default/readsb` is kept beside it). The address goes only to those services, never to
+    Tally, and is never printed, logged or stored; only the coordinates are kept. Any lookup
+    that fails falls back to the questions above (or, with no terminal, stops naming
+    `TALLY_LAT`, `TALLY_LON` and `TALLY_ALT`), before anything is installed. An automatic update
+    never locates.
   - **Who sees the location:** it asks nothing and passes no flag for it. The feed carries the
     exact location only to Tally relays, as MLAT needs, in a record relays never pass to a client.
     Nothing a data user reads (the API, the streams, the stats) contains it: the receiver's public

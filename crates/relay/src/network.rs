@@ -50,6 +50,8 @@ pub const TICK: Duration = Duration::from_millis(100);
 const CORROBORATE_EVERY_MS: u64 = 10_000;
 /// An `M` reading no pace has started from yet.
 const NEVER_MS: u64 = u64::MAX;
+/// How often every receiver's site is judged against what it hears (`siting`, RFC-0204), by `M`.
+pub const SITING_EVERY_MS: u64 = 600_000;
 /// Clock models held for member links, at most: a member link carries a model (its parts, then
 /// its manifest) before the first record citing it (`link`'s `Told`), and a model's first part
 /// names its area, its group.
@@ -233,6 +235,11 @@ pub struct Network {
     pub delivery: Delivery,
     /// The feeder figures of the receivers it hosts or carries (`figures`).
     pub figures: crate::figures::Figures,
+    /// What the location check holds of each receiver's site (`siting`, RFC-0204): the ones held
+    /// wrong are kept out of the hosted MLAT, and each station's report says what it holds.
+    siting: Mutex<crate::siting::Verdicts>,
+    /// When the sites were last judged, by `M` (`NEVER_MS` before the first time).
+    sites_judged_ms: AtomicU64,
     /// The checks a client's positions pass before a client is sent them (`consistency`).
     pub consistency: crate::consistency::Consistency,
     /// The relay's decoded clock models, one store that standing and the checks both cite
@@ -288,6 +295,8 @@ impl Network {
             admission: Admission::new(),
             delivery: Delivery::new(),
             figures: crate::figures::Figures::new(),
+            siting: Mutex::new(crate::siting::Verdicts::default()),
+            sites_judged_ms: AtomicU64::new(NEVER_MS),
             consistency: crate::consistency::Consistency::new(Arc::clone(&clock_models)),
             clock_models: Arc::clone(&clock_models),
             directory: Directory::on(clock),
@@ -727,13 +736,34 @@ impl Network {
     ) {
         if let Ok(receiver) = info.receiver() {
             self.figures
-                .described(&receiver, info.public_cell().ok().flatten());
+                .described(&receiver, info.public_cell().ok().flatten(), place);
         }
         if let Some(site) = site {
             self.consistency.site(site);
         }
         self.credit.described(info.clone(), now);
         self.products.described(info, place);
+    }
+
+    /// Judges every receiver's site at `now` (`siting`), and hands the hosted MLAT the ones held
+    /// wrong.
+    pub fn judge_sites(&self, now: tally_wire::clocks::Judged) {
+        let judged = self.figures.judge_sites(now);
+        let misplaced = match self.siting.lock() {
+            Ok(mut verdicts) => {
+                verdicts.judged(judged);
+                verdicts.misplaced()
+            }
+            Err(_) => return,
+        };
+        if let Some(mlat) = self.mlat() {
+            mlat.set_misplaced(misplaced);
+        }
+    }
+
+    /// What the location check says of `receiver`'s site, if it has been judged.
+    pub fn location_check(&self, receiver: &PublicKey) -> Option<crate::siting::LocationCheck> {
+        self.siting.lock().ok()?.check(receiver)
     }
 
     /// The one decode of a receiver's batch the hub forwarded (new, verified), when this build
@@ -747,14 +777,17 @@ impl Network {
         &self,
         decoded: Option<&Arc<Decoded>>,
         public: Option<Region>,
+        point: Option<Region>,
         stamp: crate::ingest::Stamp,
     ) {
         let Some(decoded) = decoded else {
             return;
         };
         // The feeder figures, on the ingest worker that owns the receiver's shard: a batch's own
-        // clock judged against the relay's.
-        self.figures.batch(decoded, public, stamp.judged());
+        // clock judged against the relay's. Its site (`point`, the finest cell of the site in
+        // force) is what its location check judges (`siting`).
+        self.figures
+            .batch_sited(decoded, public, point, stamp.judged());
         if let Some(mlat) = self.mlat() {
             mlat.offer_batch(decoded, stamp.mono_ms());
         }
@@ -1370,6 +1403,14 @@ impl Network {
             }
         }
         self.credit.expire(now);
+        // Every receiver's site against what it hears (`siting`), by the judging clock, never by
+        // one that does not judge: the ones held wrong are handed to the hosted MLAT, which holds
+        // them out from its next step.
+        let last = self.sites_judged_ms.load(Ordering::Relaxed);
+        if synced && (last == NEVER_MS || now.mono_ms().saturating_sub(last) >= SITING_EVERY_MS) {
+            self.sites_judged_ms.store(now.mono_ms(), Ordering::Relaxed);
+            self.judge_sites(now.judged());
+        }
         if let Some(mlat) = self.mlat() {
             // The choice is recomputed only when what it follows moved (`Selection::solved`), and
             // handed on only when it came out different.

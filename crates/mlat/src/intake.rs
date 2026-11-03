@@ -15,7 +15,12 @@
 //!   from anything a client can read. The record also gives the receiver's site id (what a model
 //!   names it by) and reception key (what its receptions are tagged under for clients), carried
 //!   with its site ([`Sited`]). An area's members are these signed sites alone, never which
-//!   receivers' raw arrived.
+//!   receivers' raw arrived. The one thing besides its own word that keeps a receiver out is the
+//!   relay's check that its site fits the aircraft it hears (RFC-0204, [`Intake::set_misplaced`]):
+//!   a site held wrong is taken as no site, until the relay takes it back or the receiver signs a
+//!   new one. That check is the relay's own judgment, so two relays holding one area can differ on
+//!   it for as long as what each heard of the receiver differs (one restarted, say); they solve
+//!   the same bytes again once both hold it wrong, or neither.
 //! - A batch is used once: from a receiver that takes part (or is not described yet, below), with
 //!   a (boot, sequence) not already used and not too far behind that boot's newest (§3.1,
 //!   [`Intake::take`]).
@@ -802,6 +807,9 @@ pub struct Intake {
     undescribed: BTreeMap<PublicKey, Undescribed>,
     /// Receivers refused whole for room since the last call ([`Intake::take_refused`]).
     refused: u64,
+    /// Receivers whose signed sites the relay's location check holds wrong (RFC-0204,
+    /// [`Intake::set_misplaced`]): none of them takes part, as if it had declared no site.
+    misplaced: BTreeSet<PublicKey>,
 }
 
 impl Described {
@@ -818,6 +826,7 @@ impl Intake {
             receivers: BTreeMap::new(),
             undescribed: BTreeMap::new(),
             refused: 0,
+            misplaced: BTreeSet::new(),
             seats,
         }
     }
@@ -1032,6 +1041,55 @@ impl Intake {
         description
     }
 
+    /// The receivers whose sites are held wrong are now `misplaced` (RFC-0204: the relay's check
+    /// that a site fits the aircraft its receiver hears), the whole set. Each receiver that joins
+    /// or leaves it is decided again: one in it takes no part, as a receiver that declared no site
+    /// takes none, and is ranked for its seat as one; one that left it takes part again on its own
+    /// signed site. The receivers here that stopped taking part (their holder forgets what they
+    /// heard), and those of other intakes whose seat changed.
+    pub fn set_misplaced(&mut self, misplaced: BTreeSet<PublicKey>) -> Description {
+        let changed: Vec<PublicKey> = self
+            .misplaced
+            .symmetric_difference(&misplaced)
+            .copied()
+            .collect();
+        self.misplaced = misplaced;
+        let mut description = Description {
+            ingested: Ingested::Ignored,
+            left: Vec::new(),
+            moved: Vec::new(),
+        };
+        let mut decided = Vec::new();
+        let mut moved = Vec::new();
+        for key in changed {
+            let Some(known) = self.receivers.get(&key) else {
+                continue;
+            };
+            let (was, cell) = (known.taking_part(), seat_cell(known.location));
+            let site = self.site(key, known.location, known.clock, known.id);
+            if let Some(known) = self.receivers.get_mut(&key) {
+                known.site = site;
+            }
+            moved.extend(self.seats.rank(key, site.is_none(), cell));
+            decided.push((key, was));
+        }
+        moved.sort_unstable();
+        moved.dedup();
+        for other in moved {
+            if !self.receivers.contains_key(&other) {
+                description.moved.push(other);
+            } else if !decided.iter().any(|(key, _)| *key == other) && self.settle(&other) {
+                description.left.push(other);
+            }
+        }
+        for (key, was) in decided {
+            if self.settle_was(&key, was) {
+                description.left.push(key);
+            }
+        }
+        description
+    }
+
     /// A new engine begins: nothing it used is the old one's. The descriptions stay (they are the
     /// receivers' word, not the engine's); the sequences used go.
     pub fn restart(&mut self) {
@@ -1054,6 +1112,9 @@ impl Intake {
         id: SiteId,
     ) -> Option<Site> {
         let regions = self.regions.as_ref()?;
+        if self.misplaced.contains(&key) {
+            return None;
+        }
         let location = location?;
         let inside = regions.is_empty() || regions.covers(&location);
         let usable = Timebase::of(clock).is_some() && location.precision_m <= MAX_SITE_PRECISION_M;
@@ -1517,6 +1578,54 @@ mod tests {
             let bytes: Vec<&[u8]> = due.iter().map(|(_, info)| info.as_bytes()).collect();
             assert_eq!(bytes, [newer.as_bytes(), theirs.as_bytes()], "{order:?}");
         }
+        Ok(())
+    }
+
+    /// RFC-0204: a receiver whose site the relay's location check holds wrong takes no part, as
+    /// one that declared no site, and its seat goes to the next best ranked; once it leaves the
+    /// set it takes part again on the site it signed, without describing itself again.
+    #[test]
+    fn a_receiver_held_misplaced_takes_no_part_until_it_is_taken_back() -> Result<(), String> {
+        let sited = |seed: u8| {
+            let identity = Identity::from_seed([seed; 32]);
+            ReceiverSite::sign(
+                &identity,
+                &tally_wire::ReceiverSiteContent {
+                    issued_ms: 1,
+                    location: place_at(374_100_000 + i32::from(seed) * 1_000_000, -1_221_000_000),
+                    clock: Clock::Dump1090,
+                },
+            )
+            .map(|site| (identity.public(), SiteRecord::Site(site)))
+            .map_err(|error| error.to_string())
+        };
+        let (wrong, wrong_site) = sited(1)?;
+        let (other, other_site) = sited(2)?;
+        let (waiting, waiting_site) = sited(3)?;
+        // Two seats for three receivers: the one ranked last waits.
+        let mut ranked = [wrong, other, waiting];
+        ranked.sort_unstable_by_key(draw);
+        let seats = Arc::new(Seats::new(2));
+        let mut intake = Intake::new(Arc::clone(&seats), Some(Regions::default()));
+        for record in [&wrong_site, &other_site, &waiting_site] {
+            let _ = intake.describe(record)?;
+        }
+        assert_eq!(intake.taking_part(), 2);
+        let held_out = ranked[0];
+        let left = intake.set_misplaced(BTreeSet::from([held_out]));
+        assert_eq!(left.left, vec![held_out]);
+        assert_eq!(intake.described(&held_out), Some(false));
+        // Its seat went to the one that waited.
+        assert_eq!(intake.described(&ranked[2]), Some(true));
+        assert!(intake.sites().all(|sited| sited.site.receiver != held_out));
+        // The same set again changes nothing.
+        let again = intake.set_misplaced(BTreeSet::from([held_out]));
+        assert!(again.left.is_empty() && again.moved.is_empty());
+        // Taken back: it takes part on its own signed site again, and the last ranked waits.
+        let back = intake.set_misplaced(BTreeSet::new());
+        assert_eq!(back.left, vec![ranked[2]]);
+        assert_eq!(intake.described(&held_out), Some(true));
+        assert_eq!(intake.taking_part(), 2);
         Ok(())
     }
 }

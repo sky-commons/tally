@@ -98,6 +98,7 @@ mod tests {
             cell: Some(cell_name(cell)),
             software: None,
             address: None,
+            location_check: None,
         })
     }
 

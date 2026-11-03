@@ -109,6 +109,7 @@ _UNIT_TEST_MODULES = {
     "sharing": "medium",  # 27.4 s
     "shed": "small",  # 4.6 s
     "signer": "small",  # under 0.1 s
+    "siting": "small",
     "sockets": "small",  # under 0.1 s
     "standing": "small",  # 0.2 s
     "stations": "small",  # under 0.1 s

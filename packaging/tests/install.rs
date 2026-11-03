@@ -902,3 +902,327 @@ fn a_release_that_does_not_start_is_rolled_back() -> Result {
     assert_eq!(sandbox.read("root/usr/local/bin/tally-feed")?, old);
     Ok(())
 }
+
+// Locating from an address (RFC-0204). The address of a public landmark (San Francisco's City
+// Hall), the answers each service gave for it on 2026-11-03, and the Eiffel Tower for an address
+// outside the US.
+
+const ADDRESS: &str = "1 Dr Carlton B Goodlett Pl, San Francisco, CA 94102";
+const CENSUS: &str = r#"{"result":{"input":{"address":{"address":"1 Dr Carlton B Goodlett Pl, San Francisco, CA 94102"}},"addressMatches":[{"coordinates":{"x":-122.41831039539,"y":37.778536095745},"matchedAddress":"1 DR CARLTON P GOODLETT PL, SAN FRANCISCO, CA, 94102"}]}}"#;
+const CENSUS_NONE: &str = r#"{"result":{"input":{"address":{"address":"x"}},"addressMatches":[]}}"#;
+const NOMINATIM: &str = r#"[{"place_id":319846272,"licence":"Data © OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyright","lat":"37.7792929","lon":"-122.4192601","display_name":"San Francisco City Hall, 1, Dr. Carlton B. Goodlett Place","address":{"city":"San Francisco","country":"United States","country_code":"us"}}]"#;
+const NOMINATIM_PARIS: &str = r#"[{"lat":"48.8582599","lon":"2.2945006","display_name":"Tour Eiffel","address":{"country":"France","country_code":"fr"}}]"#;
+const EPQS: &str = r#"{"location":{"x":-122.4183,"y":37.7785,"spatialReference":{"wkid":4326}},"locationId":0,"value":"18.678731918","rasterId":72150,"resolution":1}"#;
+const OPEN_METEO: &str = r#"{"elevation":[36.0]}"#;
+
+/// A sandbox with the services answering `answers` (`service/NAME`), the release made with its
+/// geoid grid beside it, and the stub `ask` answering the lines of `typed` in turn (logging each
+/// question in `asked.log`).
+fn locating(name: &str, answers: &[(&str, &str)], typed: &[&str]) -> Result<Sandbox> {
+    let sandbox = Sandbox::new(name)?;
+    sandbox.release()?;
+    sandbox.file(
+        "journal",
+        "tally-feed: reading 127.0.0.1:30005\ntally-feed: publishing to relay.example:10900 (version 4)\n",
+    )?;
+    for (service, answer) in answers {
+        sandbox.file(&format!("service/{service}"), answer)?;
+    }
+    let geoid = sandbox::path_of("TALLY_GEOID")?;
+    let gzipped = io(Command::new("gzip").arg("-9nc").arg(&geoid).output())?;
+    io(std::fs::write(
+        sandbox.dir.join("release/geoid.txt.gz"),
+        gzipped.stdout,
+    ))?;
+    sandbox.file("typed", &format!("{}\n", typed.join("\n")))?;
+    Ok(sandbox)
+}
+
+/// `body` after a terminal is made up: `have_tty` true, and `ask` answering `typed` in turn.
+const ON_A_TERMINAL: &str = r#"
+have_tty() { true; }
+ask() {
+  local n
+  n=$(($(cat "$T/asked" 2>/dev/null || echo 0) + 1))
+  echo "$n" > "$T/asked"
+  printf '%s\n' "$1" >> "$T/asked.log"
+  sed -n "${n}p" "$T/typed"
+}
+"#;
+
+/// Every file the install wrote or a stub logged, but what the location services were asked
+/// (`services.log`): none of them may hold the address.
+fn holds_no_address(sandbox: &Sandbox, output: &str) -> Result {
+    let words = ["Carlton", "Goodlett", "Carlton%20B"];
+    let mut files = vec![output.to_owned()];
+    for name in [
+        "curl-args.log",
+        "curl.log",
+        "systemctl.log",
+        "cosign.log",
+        "root/etc/default/tally-feed",
+    ] {
+        files.push(sandbox.log(name));
+    }
+    for (text, word) in files
+        .iter()
+        .flat_map(|text| words.iter().map(move |word| (text, word)))
+    {
+        if text.contains(word) {
+            return Err(format!("{word:?} was kept or shown: {text}"));
+        }
+    }
+    Ok(())
+}
+
+/// TALLY_ADDRESS, no terminal: the Census geocoder places it (OpenStreetMap is its check, 119 m
+/// off, which is said), USGS gives the ground, the release's geoid grid turns ground and antenna
+/// into height above the ellipsoid, and only the coordinates are kept. The address went to the
+/// geocoders and nowhere else: not on curl's command line, not to the elevation service, not into
+/// any file or anything printed. The geoid grid's signature is checked with the release's.
+#[test]
+fn an_address_is_located_and_only_its_coordinates_are_kept() -> Result {
+    let sandbox = locating(
+        "locate-us",
+        &[("census", CENSUS), ("nominatim", NOMINATIM), ("epqs", EPQS)],
+        &[],
+    )?;
+    let env = install_env(
+        &sandbox,
+        &[("TALLY_ADDRESS", ADDRESS), ("TALLY_ANTENNA", "roof")],
+    );
+    let output = sandbox.ok(INSTALL, &borrowed(&env))?;
+    let written = sandbox.read("root/etc/default/tally-feed")?;
+    // 18.7 m of ground, 8 m of roof, and the geoid's -32.5 m there.
+    assert!(
+        written.contains("--lat 37.778536 --lon -122.418310 --alt -6\""),
+        "{written}"
+    );
+    for said in [
+        "never to Tally",
+        "place it 119 m apart",
+        "https://www.openstreetmap.org/?mlat=37.778536&mlon=-122.418310",
+        "OpenStreetMap contributors",
+        "USGS 3DEP",
+        "8 m above it (TALLY_ANTENNA)",
+    ] {
+        assert!(output.contains(said), "it did not say {said:?}: {output}");
+    }
+    let asked = sandbox.log("services.log");
+    let geocoders: Vec<&str> = asked
+        .lines()
+        .filter(|url| url.contains("Carlton%20B%20Goodlett"))
+        .collect();
+    assert_eq!(geocoders.len(), 2, "{asked}");
+    assert!(geocoders[0].starts_with("https://geocoding.geo.census.gov/"));
+    assert!(geocoders[1].starts_with("https://nominatim.openstreetmap.org/"));
+    assert!(
+        asked.contains("https://epqs.nationalmap.gov/v1/json?x=-122.418310&y=37.778536"),
+        "{asked}"
+    );
+    holds_no_address(&sandbox, &output)?;
+    assert!(
+        sandbox.log("cosign.log").contains("geoid.txt.gz"),
+        "the geoid grid's signature was not checked"
+    );
+    Ok(())
+}
+
+/// An address outside the US: the Census geocoder matches nothing, OpenStreetMap places it, and
+/// the ground comes from Open-Meteo, never from USGS.
+#[test]
+fn an_address_outside_the_us_is_placed_by_openstreetmap_and_open_meteo() -> Result {
+    let sandbox = locating(
+        "locate-fr",
+        &[
+            ("census", CENSUS_NONE),
+            ("nominatim", NOMINATIM_PARIS),
+            ("open-meteo", OPEN_METEO),
+        ],
+        &[],
+    )?;
+    let env = install_env(
+        &sandbox,
+        &[
+            (
+                "TALLY_ADDRESS",
+                "Champ de Mars, 5 Av. Anatole France, Paris",
+            ),
+            ("TALLY_ANTENNA", "5"),
+        ],
+    );
+    let output = sandbox.ok(INSTALL, &borrowed(&env))?;
+    let written = sandbox.read("root/etc/default/tally-feed")?;
+    // 36 m of ground, 5 m of antenna, and the geoid's 44.6 m there.
+    assert!(
+        written.contains("--lat 48.858260 --lon 2.294501 --alt 86\""),
+        "{written}"
+    );
+    assert!(output.contains("Copernicus DEM, by Open-Meteo"), "{output}");
+    assert!(!sandbox.log("services.log").contains("epqs"));
+    Ok(())
+}
+
+/// A lookup that fails with no terminal stops, saying why and naming the coordinates to pass
+/// instead, with nothing installed; and an address given beside coordinates is refused.
+#[test]
+fn a_failed_lookup_stops_with_nothing_installed() -> Result {
+    let sandbox = locating("locate-fails", &[("census", CENSUS_NONE)], &[])?;
+    let env = install_env(&sandbox, &[("TALLY_ADDRESS", ADDRESS)]);
+    let refusal = sandbox.stopped(INSTALL, &borrowed(&env))?;
+    for said in [
+        "neither the US Census geocoder nor OpenStreetMap found that address",
+        "TALLY_LAT=",
+        "Nothing was installed",
+    ] {
+        assert!(refusal.contains(said), "{refusal}");
+    }
+    assert!(!sandbox.exists("root/etc/default/tally-feed"));
+    assert!(!sandbox.exists("root/usr/local/bin/tally-feed"));
+    holds_no_address(&sandbox, &refusal)?;
+    let both = install_env(
+        &sandbox,
+        &[
+            ("TALLY_ADDRESS", ADDRESS),
+            ("TALLY_LAT", "37.7"),
+            ("TALLY_LON", "-122.4"),
+        ],
+    );
+    let refusal = sandbox.stopped(INSTALL, &borrowed(&both))?;
+    assert!(refusal.contains("give one"), "{refusal}");
+    Ok(())
+}
+
+/// On a terminal with no location found anywhere, the address is asked for first, the place
+/// shown and confirmed, the antenna's height asked as one question, and readsb, which has no
+/// location of its own, set too once the owner says yes, its old file kept.
+#[test]
+fn on_a_terminal_the_address_is_asked_and_readsb_offered_the_place() -> Result {
+    let sandbox = locating(
+        "locate-tty",
+        &[("census", CENSUS), ("nominatim", NOMINATIM), ("epqs", EPQS)],
+        &[ADDRESS, "y", "2", "y"],
+    )?;
+    let readsb = "# readsb configuration\nRECEIVER_OPTIONS=\"--net-only\"\nDECODER_OPTIONS=\"--max-range 500\"\nNET_OPTIONS=\"--net\"\n";
+    sandbox.file("root/etc/default/readsb", readsb)?;
+    let env = install_env(&sandbox, &[]);
+    let output = sandbox.ok(&format!("{ON_A_TERMINAL}\n{INSTALL}"), &borrowed(&env))?;
+    let asked = sandbox.log("asked.log");
+    let questions: Vec<&str> = asked.lines().collect();
+    assert_eq!(questions.len(), 4, "{asked}");
+    assert!(questions[0].contains("street address"), "{asked}");
+    assert!(
+        questions[1].contains("Is that the antenna's place?"),
+        "{asked}"
+    );
+    assert!(questions[2].contains("How high is the antenna?"), "{asked}");
+    assert!(questions[3].contains("readsb has no location"), "{asked}");
+    let written = sandbox.read("root/etc/default/tally-feed")?;
+    // Upstairs: 5 m.
+    assert!(
+        written.contains("--lat 37.778536 --lon -122.418310 --alt -9\""),
+        "{written}"
+    );
+    let readsb_now = sandbox.read("root/etc/default/readsb")?;
+    assert!(
+        readsb_now
+            .contains("DECODER_OPTIONS=\"--max-range 500 --lat 37.778536 --lon -122.418310\""),
+        "{readsb_now}"
+    );
+    let kept: Vec<_> = io(std::fs::read_dir(sandbox.dir.join("root/etc/default")))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("readsb.tally-backup.")
+        })
+        .collect();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(io(std::fs::read_to_string(kept[0].path()))?, readsb);
+    holds_no_address(&sandbox, &output)
+}
+
+/// An owner who says the place shown is not right is asked for the coordinates instead, and
+/// readsb, which has its own location, is never offered or touched.
+#[test]
+fn a_place_the_owner_rejects_falls_back_to_the_coordinates() -> Result {
+    let sandbox = locating(
+        "locate-rejected",
+        &[("census", CENSUS), ("nominatim", NOMINATIM), ("epqs", EPQS)],
+        &["n", "37.7", "-122.4", "30"],
+    )?;
+    let readsb = "DECODER_OPTIONS=\"--lat 37.7 --lon -122.4\"\n";
+    sandbox.file("root/etc/default/readsb", readsb)?;
+    let env = install_env(&sandbox, &[("TALLY_ADDRESS", ADDRESS)]);
+    sandbox.ok(&format!("{ON_A_TERMINAL}\n{INSTALL}"), &borrowed(&env))?;
+    let written = sandbox.read("root/etc/default/tally-feed")?;
+    assert!(
+        written.contains("--lat 37.7 --lon -122.4 --alt 30\""),
+        "{written}"
+    );
+    assert_eq!(sandbox.read("root/etc/default/readsb")?, readsb);
+    assert!(!sandbox.log("asked.log").contains("readsb"));
+    Ok(())
+}
+
+/// An automatic update never locates, whatever the environment says: it keeps the location the
+/// install has and asks no service.
+#[test]
+fn an_upgrade_never_locates() -> Result {
+    let sandbox = locating(
+        "locate-upgrade",
+        &[("census", CENSUS), ("nominatim", NOMINATIM), ("epqs", EPQS)],
+        &[],
+    )?;
+    let first = install_env(
+        &sandbox,
+        &[
+            ("TALLY_LAT", "51.5"),
+            ("TALLY_LON", "-0.1"),
+            ("TALLY_ALT", "20"),
+        ],
+    );
+    sandbox.ok(INSTALL, &borrowed(&first))?;
+    let again = install_env(&sandbox, &[("TALLY_ADDRESS", ADDRESS)]);
+    sandbox.ok(
+        &INSTALL.replace("main", "main --upgrade"),
+        &borrowed(&again),
+    )?;
+    let written = sandbox.read("root/etc/default/tally-feed")?;
+    assert!(
+        written.contains("--lat 51.5 --lon -0.1 --alt 20\""),
+        "{written}"
+    );
+    assert_eq!(sandbox.log("services.log"), "");
+    Ok(())
+}
+
+/// The geoid grid the release ships (EGM2008, packaging/geoid) against NGS's GEOID18 at points
+/// across the US (the NGS API, `model=14`, 2026-11-03): within 2 m everywhere, GEOID18's datum
+/// (NAD83, NAVD88) included, and within 0.6 m in the West.
+#[test]
+fn the_geoid_grid_agrees_with_geoid18() -> Result {
+    let sandbox = Sandbox::new("geoid")?;
+    let geoid = sandbox::path_of("TALLY_GEOID")?;
+    for (lat, lon, geoid18, within) in [
+        (37.77, -122.42, -32.541, 0.6),
+        (33.94, -118.40, -35.943, 0.6),
+        (40.76, -111.89, -16.825, 0.6),
+        (39.74, -104.99, -17.113, 0.6),
+        (41.88, -87.63, -33.597, 0.6),
+        (47.61, -122.33, -23.695, 2.0),
+        (25.76, -80.19, -25.541, 2.0),
+    ] {
+        let n: f64 = sandbox
+            .ok(&format!("geoid_of {lat} {lon} < {}", geoid.display()), &[])?
+            .trim()
+            .parse()
+            .map_err(|error| format!("{error}"))?;
+        assert!(
+            (n - geoid18).abs() <= within,
+            "{lat}, {lon}: the grid says {n} m, GEOID18 {geoid18} m"
+        );
+    }
+    Ok(())
+}

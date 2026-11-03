@@ -119,7 +119,9 @@ sign_release() {
 /// The stubs every sandbox has: no docker container, an amd64 Debian, systemd 247 whose service
 /// is always active and which keeps which units are enabled (`$T/enabled-UNIT`), a journal
 /// (`$T/journal`) for the service's start, a `curl` serving the files of `$T/release` and
-/// `$T/latest` as the latest release's tag, and a `cosign` that takes a bundle `SIGN` wrote.
+/// `$T/latest` as the latest release's tag (and the location services' answers in `$T/service`,
+/// logging what it was asked in `services.log` and its arguments in `curl-args.log`), and a
+/// `cosign` that takes a bundle `SIGN` wrote.
 pub const STUBS: &[(&str, &str)] = &[
     (
         "docker",
@@ -174,14 +176,31 @@ esac
     (
         "curl",
         r#"#!/bin/sh
-out=''
+echo "$*" >> "$TEST_DIR/curl-args.log"
+out='' config=''
 while [ $# -gt 1 ]; do
   case "$1" in
     -o) out="$2"; shift ;;
-    -w) shift ;;
+    -w | -A) shift ;;
+    -K) config="$2" ;;
   esac
   shift
 done
+# A URL read from standard input (`-K -`, as the installer asks the location services): answered
+# from $TEST_DIR/service/NAME, by the service it names.
+if [ "$config" = - ]; then
+  url="$(sed -n 's/^url = "\(.*\)"$/\1/p')"
+  echo "$url" >> "$TEST_DIR/services.log"
+  case "$url" in
+    https://geocoding.geo.census.gov/*) name=census ;;
+    https://nominatim.openstreetmap.org/*) name=nominatim ;;
+    https://epqs.nationalmap.gov/*) name=epqs ;;
+    https://api.open-meteo.com/*) name=open-meteo ;;
+    *) exit 22 ;;
+  esac
+  [ -f "$TEST_DIR/service/$name" ] || exit 22
+  exec cat "$TEST_DIR/service/$name"
+fi
 echo "$1" >> "$TEST_DIR/curl.log"
 case "$1" in
   */releases/latest)

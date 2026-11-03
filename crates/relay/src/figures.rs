@@ -32,6 +32,11 @@
 //! receiver heard within `PAIR_WITHIN_MS`, or by an MLAT fix; a receiver that hears it
 //! within `NEAR_MS` of where it was last placed is credited that place.
 //!
+//! Beside the figures, a row keeps what the receiver's own airborne positions say about where it
+//! can be, around the site it claims (`siting`, RFC-0204): the relay's check that the site fits
+//! what the receiver hears ([`Figures::judge_sites`]). The site is relay-only and is never in
+//! anything signed here; what a check says is a distance in steps coarser than the public cell.
+//!
 //! Memory is charged: a receiver's row is made only by a batch of its own, and only when the
 //! budget's `Store::Figures` takes its fixed charge (`PER_RECEIVER_BYTES`, everything a row may
 //! grow to, its share of the aircraft placed and of the positions remembered included). Past it a
@@ -47,8 +52,8 @@ use tally_wire::Signs;
 use tally_wire::batch::Hash;
 use tally_wire::clocks::Judged;
 use tally_wire::{
-    Decoded, FeederFigure, FeederFigures, FeederFiguresContent, MAX_FEEDER_FIGURES, Positions,
-    PublicKey, Region,
+    Decoded, FeederFigure, FeederFigures, FeederFiguresContent, Location, MAX_FEEDER_FIGURES,
+    Positions, PublicKey, Region,
 };
 
 use crate::bounded::Bounded;
@@ -77,9 +82,11 @@ pub const MAX_PER_FEEDER: usize = 512;
 pub const SHARED_PER_FEEDER: usize = 64;
 /// What one receiver's row may hold at most, its share of the shared tables included: the
 /// minutes of the window and the hour after it, its hours, its aircraft, cells and CPR halves at
-/// their caps (each table at the capacity its cap grows it to). Measured, not estimated: the
+/// their caps (each table at the capacity its cap grows it to), and its location check at its
+/// fixed size (`siting::MAX_BYTES`, both its epochs' grids). Measured, not estimated: the
 /// `figures_bytes` test fills a row to every cap under a counting allocator and holds it within
-/// this (about 145 KiB; it was 96 KiB, under what a full row allocates). What each row is charged.
+/// this (about 145 KiB before the location check, which fits in what was left; it was 96 KiB,
+/// under what a full row allocates). What each row is charged.
 pub const ROW_BYTES: usize = 160 * 1024;
 /// What one receiver costs the store at most: its row ([`ROW_BYTES`]) and its slot in its shard's
 /// table of rows, which is charged what it allocates as it grows and is kept within four times
@@ -275,6 +282,10 @@ struct Feeder {
     cells: HashMap<u64, Heard>,
     /// Each aircraft's latest even and odd airborne position.
     cpr: HashMap<u32, [Option<Half>; 2]>,
+    /// What its own positions say of where it can be, around the site it claims (`siting`). Boxed:
+    /// a row's place in its shard's table is planned per connection (`PER_RECEIVER_BYTES`), and
+    /// this costs it a pointer.
+    siting: Box<crate::siting::Heard>,
 }
 
 impl Feeder {
@@ -357,6 +368,15 @@ impl Feeder {
                 .flatten()
                 .any(|half| half.at_ms + PAIR_WITHIN_MS >= now_ms)
         });
+    }
+}
+
+/// A site the location check judges: where `place` says, at its altitude.
+fn site_of(place: Location) -> crate::siting::Site {
+    crate::siting::Site {
+        lat: f64::from(place.lat_e7) / 1e7,
+        lon: f64::from(place.lon_e7) / 1e7,
+        alt_m: Some(place.alt_m),
     }
 }
 
@@ -507,13 +527,45 @@ impl Figures {
         self.observed_since_ms.fetch_min(at_ms, Ordering::Relaxed);
     }
 
-    /// A receiver's description, kept by the hub: its public cell, for its row's range.
-    pub fn described(&self, receiver: &PublicKey, public: Option<Region>) {
+    /// A receiver's description, kept by the hub: its public cell, for its row's range, and the
+    /// site in force with it (relay-only, `place`), for its location check. A description with no
+    /// site in force (one whose site has not come yet) leaves the site the row holds.
+    pub fn described(&self, receiver: &PublicKey, public: Option<Region>, place: Option<Location>) {
         if let Ok(mut shard) = self.shard(receiver).lock()
             && let Some(feeder) = shard.get_mut(receiver)
         {
             feeder.set_public(public);
+            if let Some(place) = place {
+                feeder.siting.set_site(Some(site_of(place)));
+            }
         }
+    }
+
+    /// Every receiver's location check at `now` (`siting::Heard::judge`), by key, with its site's
+    /// generation: one for each row, its own site's, the receiver having heard the aircraft its
+    /// row counts.
+    pub fn judge_sites(&self, now: Judged) -> Vec<(PublicKey, u32, crate::siting::Judgment)> {
+        let mut judged = Vec::new();
+        for shard in self.shards.iter() {
+            let keys: Vec<PublicKey> = match shard.lock() {
+                Ok(rows) => rows.map.keys().copied().collect(),
+                Err(_) => continue,
+            };
+            // Each row's check is copied under its shard's lock and judged after it is let go: the
+            // shard's batches wait on a copy, never on a judgment.
+            for key in keys {
+                let held = shard.lock().ok().and_then(|rows| {
+                    rows.map
+                        .get(&key)
+                        .map(|feeder| (feeder.siting.clone(), feeder.aircraft.len()))
+                });
+                if let Some((siting, aircraft)) = held {
+                    judged.push((key, siting.generation(), siting.judge(now.ms(), aircraft)));
+                }
+            }
+        }
+        judged.sort_unstable_by_key(|(key, _, _)| *key);
+        judged
     }
 
     /// A batch the hub forwarded, decoded once, of a receiver whose public cell is `public`, at
@@ -521,6 +573,19 @@ impl Figures {
     /// ACARS-family message is none of them, and leaves the relay by `--acars-out` alone, so a
     /// batch of them is no activity, no message and no aircraft.
     pub fn batch(&self, decoded: &Decoded, public: Option<Region>, now: Judged) {
+        self.batch_sited(decoded, public, None, now);
+    }
+
+    /// [`Figures::batch`], the receiver's site in force placing it at `point` (its finest cell,
+    /// `Region::point`, as the hub holds it), for its location check: `None` leaves the site its
+    /// row holds as it is.
+    pub fn batch_sited(
+        &self,
+        decoded: &Decoded,
+        public: Option<Region>,
+        point: Option<Region>,
+        now: Judged,
+    ) {
         let at = decoded.wall_ms();
         let products = || {
             decoded
@@ -556,6 +621,7 @@ impl Figures {
                             aircraft: HashMap::new(),
                             cells: HashMap::new(),
                             cpr: HashMap::new(),
+                            siting: Box::default(),
                         },
                     )
                 });
@@ -569,6 +635,14 @@ impl Figures {
                 return;
             };
             feeder.set_public(public.or(feeder.public));
+            if let Some(place) = point.and_then(LatLon::centre_of) {
+                let alt_m = feeder.siting.site().and_then(|site| site.alt_m);
+                feeder.siting.set_site(Some(crate::siting::Site {
+                    lat: place.lat,
+                    lon: place.lon,
+                    alt_m,
+                }));
+            }
             feeder.minutes.insert(at / MINUTE_MS);
             feeder.hour(at).messages += products().count() as u64;
             for observation in products() {
@@ -587,6 +661,10 @@ impl Figures {
                 if let Some(airborne) = modes::airborne_position(data)
                     && let Some(place) = feeder.pair(address, airborne, at)
                 {
+                    // Its own pair, never another's placing or a fix: what this receiver itself
+                    // heard, where, and how high.
+                    let feet = airborne.altitude.map(|altitude| altitude.feet);
+                    feeder.siting.heard(place.lat, place.lon, feet, address, at);
                     placed.push((address, place));
                 } else {
                     heard.push(address);

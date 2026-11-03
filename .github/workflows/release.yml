@@ -137,6 +137,10 @@ jobs:
             packaging/systemd/tally-feed-update.service packaging/systemd/tally-feed-update.timer \
             packaging/seeds dist/
           install -m 0755 packaging/update.sh dist/
+          # The geoid grid the installer turns a ground elevation into a height above the WGS84
+          # ellipsoid with, when it locates a receiver from its address (RFC-0204); gzip -n, so the
+          # same grid gives the same bytes.
+          gzip -9nc packaging/geoid/geoid.txt > dist/geoid.txt.gz
           release="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
           sed "s#^PUBLISHED_RELEASE=\"\"\$#PUBLISHED_RELEASE=\"$release\"#" packaging/install.sh > dist/install.sh
           grep -q "^PUBLISHED_RELEASE=\"$release\"$" dist/install.sh
@@ -152,7 +156,7 @@ jobs:
       # v2.2.3, pinned by commit.
       - uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2
         with:
-          subject-path: 'dist/tally-*-linux, dist/*.service, dist/*.timer, dist/seeds, dist/install.sh, dist/update.sh'
+          subject-path: 'dist/tally-*-linux, dist/*.service, dist/*.timer, dist/seeds, dist/install.sh, dist/update.sh, dist/geoid.txt.gz'
       # The feeder's image is the binaries just signed, copied onto distroless (no RUN), so it
       # needs no emulation for arm64 or arm/v7; the map image installs Debian's packages (a RUN),
       # so its arm64 half runs under QEMU, registered before buildx makes its builder.
