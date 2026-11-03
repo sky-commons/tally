@@ -1,0 +1,39 @@
+# The Tally feeder's automatic update (RFC-0203; /usr/local/lib/tally/update, packaging/update.sh),
+# started by tally-feed-update.timer. It installs a newer release only when its signature is the
+# release workflow's on that release's tag, never an older one, and puts the old feeder back when
+# the new one does not start. Its log: journalctl -u tally-feed-update.
+#
+# It runs as root because installing a release is root's (the binary, the units,
+# /etc/default/tally-feed) and so is restarting the feeder; it gets no more confinement than an
+# installer can live with, since a confinement the next release's installer outgrew would hold
+# every receiver at this release for good. Nothing it downloads is read as root: curl and cosign run
+# in transient units of their own as a throwaway unprivileged user (DynamicUser=), and root runs
+# only the installer whose signature cosign checked.
+#
+# Turned off with `sudo systemctl disable --now tally-feed-update.timer`: the updater then does
+# nothing even when this service is started by hand, and a rerun of install.sh keeps it off.
+
+[Unit]
+Description=Tally feeder: install a newer signed release
+Documentation=https://github.com/sky-commons/tally/blob/main/packaging/README.md#automatic-updates
+After=network-online.target tally-feed.service
+Wants=network-online.target
+ConditionPathExists=/usr/local/lib/tally/update
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/tally/update
+# Downloading and checking a release and waiting for the new feeder to publish, with room to spare.
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=idle
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes

@@ -1,0 +1,19 @@
+# When the Tally feeder checks for a newer release (tally-feed-update.service): once a day, each
+# receiver at a time of its own within the day (FixedRandomDelay=, systemd 247), so the receivers
+# of a release do not all update in the same minute, and at boot if the receiver was off when its
+# time came (Persistent=). `sudo systemctl disable --now tally-feed-update.timer` turns automatic
+# updates off.
+
+[Unit]
+Description=Tally feeder: check for a newer release once a day
+Documentation=https://github.com/sky-commons/tally/blob/main/packaging/README.md#automatic-updates
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=23h
+FixedRandomDelay=yes
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
