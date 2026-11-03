@@ -47,7 +47,7 @@
 #
 # The exact location goes only to Tally relays, inside the feed, for multilateration (MLAT). The
 # feed signs it in a record relays keep to themselves; what any data user reads (the API, the
-# streams, the stats) names only the antenna's public cell, about 5 km across, which is all a
+# streams, the stats) names only the antenna's public cell, about 6 km across, which is all a
 # public map shows. It asks nothing about it and passes no flag for it.
 #
 # Where nothing answers on 127.0.0.1:30005 but an ultrafeeder container runs, the decoder's output
@@ -95,7 +95,7 @@ VERSION="v0.7.2"
 # publishes it, and TALLY_RELEASE overrides it.
 PUBLISHED_RELEASE=""
 # What any public map shows of the location: the feeder's public cell (H3 resolution 6).
-PUBLIC_AREA="~5 km"
+PUBLIC_AREA="~6 km"
 BIN=/usr/local/bin/tally-feed
 KEY=/etc/tally/key
 DEFAULTS=/etc/default/tally-feed
@@ -108,7 +108,7 @@ STATE_PRIVATE=/var/lib/private/tally-feed
 # bullseye has 247).
 SYSTEMD_AT_LEAST=247
 # A station's page, by its public key as base64url without padding.
-STATION_PAGE=https://tally.flightlines.ai/en/station
+STATION_PAGE=https://tally.skycommons.org/feeders
 ISSUES=https://github.com/sky-commons/tally/issues
 IMAGE=ghcr.io/sky-commons/tally-feed
 # How long a started feeder has to say it is publishing before the install calls it failed; an
@@ -1006,7 +1006,7 @@ main() {
   printf '\ntally-feed %s is installed and publishing (systemctl status tally-feed; journalctl -u tally-feed).\n' \
     "$VERSION"
   printf "\nThis receiver's public key, its name on the network:\n\n  %s\n" "$public"
-  printf "\nIts station page, once the network holds its first receptions:\n\n  %s/%s/\n\n" "$STATION_PAGE" "$(base64url "$public")"
+  printf "\nIts station page, once the network holds its first receptions:\n\n  %s/%s\n\n" "$STATION_PAGE" "$(base64url "$public")"
   printf "What it publishes, in open data anyone can read: every reception this receiver's decoders\n"
   printf 'report, signed with that key.\n%s\n' "$(privacy_line)"
   printf 'To change the location, run this again with TALLY_LAT, TALLY_LON and TALLY_ALT.\n\n'

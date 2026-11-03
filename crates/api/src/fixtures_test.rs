@@ -310,46 +310,94 @@ fn numbers(value: &serde_json::Value, into: &mut Vec<f64>) {
     }
 }
 
-/// No public answer that names a station carries its exact place: the relay tells the API its
-/// public cell and nothing finer, and the station answer and the network's, as the API writes
-/// them, hold neither coordinate the receiver is at.
+/// Every `{"lat": .., "lon": ..}` object in `value`, wherever it sits.
+pub(crate) fn places(value: &serde_json::Value, into: &mut Vec<(f64, f64)>) {
+    match value {
+        serde_json::Value::Array(items) => items.iter().for_each(|item| places(item, into)),
+        serde_json::Value::Object(fields) => {
+            if let (Some(lat), Some(lon)) = (
+                fields.get("lat").and_then(serde_json::Value::as_f64),
+                fields.get("lon").and_then(serde_json::Value::as_f64),
+            ) {
+                into.push((lat, lon));
+            }
+            fields.values().for_each(|item| places(item, into));
+        }
+        _ => {}
+    }
+}
+
+/// The station and network answers as one text, every number in them, and every place.
+type Answers = (String, Vec<f64>, Vec<(f64, f64)>);
+
+/// No public answer that names a station carries a place finer than its public cell: the relay
+/// tells the API the cell and nothing finer, and the station answer and the network's, as the API
+/// writes them, are the same for every antenna of one cell, word for word. The one place in them
+/// is the cell's centre, to two decimals.
 #[test]
-fn no_public_answer_carries_a_receivers_exact_place() -> Result<(), String> {
+fn no_public_answer_carries_a_place_finer_than_the_cell() -> Result<(), String> {
+    let answers = |lat: f64, lon: f64| -> Result<Answers, String> {
+        let stations = Stations::from_report(
+            StationsReport {
+                now_ms: NOW_MS,
+                stations: vec![report(cell_at(lat, lon), Some("tally-feed 0.3.1"))],
+            },
+            None,
+        );
+        let station = serde_json::to_value(stations.station(&station_key()).ok_or("no station")?)
+            .map_err(|e| e.to_string())?;
+        let network = serde_json::to_value(stations.network(SourceCounts::default()))
+            .map_err(|e| e.to_string())?;
+        let mut written = Vec::new();
+        numbers(&station, &mut written);
+        numbers(&network, &mut written);
+        let mut placed = Vec::new();
+        places(&station, &mut placed);
+        places(&network, &mut placed);
+        Ok((format!("{station}{network}"), written, placed))
+    };
     let (lat, lon) = (37.512_345_6, -122.251_234_5);
-    let stations = Stations::from_report(
-        StationsReport {
-            now_ms: NOW_MS,
-            stations: vec![report(cell_at(lat, lon), Some("tally-feed 0.3.1"))],
-        },
-        None,
-    );
-    let station = stations.station(&station_key()).ok_or("no station")?;
-    let pin = station.location.ok_or("no pin")?;
-    let mut written = Vec::new();
-    numbers(
-        &serde_json::to_value(&station).map_err(|e| e.to_string())?,
-        &mut written,
-    );
-    numbers(
-        &serde_json::to_value(stations.network(SourceCounts::default()))
-            .map_err(|e| e.to_string())?,
-        &mut written,
-    );
+    let cell = cell_at(lat, lon).ok_or("no cell")?;
+    let index =
+        h3o::CellIndex::try_from(u64::from_str_radix(&cell, 16).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let (text, written, placed) = answers(lat, lon)?;
     for exact in [lat, lon] {
         assert!(!written.contains(&exact), "{exact} served");
     }
-    // Near it: inside its public cell.
-    assert_eq!(cell_at(pin.lat, pin.lon), cell_at(lat, lon), "{pin:?}");
-    // The fixtures say the same of theirs: the place they were made from is not in them.
+    assert_eq!(placed, vec![coarse_centre(&cell)?], "{text}");
+    // Every other antenna of the cell, its corners' way and its centre: the very same answers.
+    let middle = h3o::LatLng::from(index);
+    let mut others = vec![(middle.lat(), middle.lng())];
+    for corner in index.boundary().iter() {
+        others.push((
+            middle.lat() + 0.9 * (corner.lat() - middle.lat()),
+            middle.lng() + 0.9 * (corner.lng() - middle.lng()),
+        ));
+    }
+    for (lat, lon) in others {
+        assert_eq!(cell_at(lat, lon).as_deref(), Some(cell.as_str()));
+        assert_eq!(answers(lat, lon)?.0, text, "an antenna at {lat}, {lon}");
+    }
+    // The fixtures say the same of theirs: the one place in them is their cell's rounded centre.
     for fixture in [fixtures::STATION, fixtures::STATION_OFFLINE] {
         let mut served = Vec::new();
-        numbers(
+        places(
             &serde_json::from_str(fixture).map_err(|e| e.to_string())?,
             &mut served,
         );
-        assert!(!served.contains(&37.5) && !served.contains(&-122.25));
+        let cell = cell_at(37.5, -122.25).ok_or("no cell")?;
+        assert_eq!(served, vec![coarse_centre(&cell)?]);
     }
     Ok(())
+}
+
+/// The one place a public answer may give of a receiver in `cell` (as hex): its centre, rounded.
+fn coarse_centre(cell: &str) -> Result<(f64, f64), String> {
+    let index = h3o::CellIndex::try_from(u64::from_str_radix(cell, 16).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let centre = crate::privacy::centre(index);
+    Ok((centre.lat, centre.lon))
 }
 
 /// The feeder figures and boards the fixtures are: the feeders module's own records (one relay's
