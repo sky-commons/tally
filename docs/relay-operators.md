@@ -60,8 +60,9 @@ public.
 - `tally-relay --stats-listen` shows each receiver's public cell, never its site or altitude, and
   refuses to bind anything but loopback.
 - `tally-api`, the open API a relay operator runs beside the relay (and the site at
-  tally.flightlines.ai reads), places every receiver by its public cell and shows no altitude. It
-  reads no site.
+  tally.skycommons.org reads), places every receiver by its public cell alone: the cell, and its
+  centre rounded to 0.01°, the same for every receiver of the cell. It shows no altitude and reads
+  no site.
 - `tally-feed` publishes only to relays that speak wire version 3, and sends its site only to them.
 - `tally-relay --beast-out` serves every reception's message as plain BEAST, with no receiver's
   counter or signal level: those, against the aircraft positions anyone reads, solve a site, so

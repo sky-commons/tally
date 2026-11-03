@@ -168,8 +168,8 @@ async fn start_relay(
 
 fn location() -> Location {
     Location {
-        lat_e7: 374_100_000,
-        lon_e7: -1_221_000_000,
+        lat_e7: 374_123_457,
+        lon_e7: -1_221_034_568,
         alt_m: 10,
         precision_m: 0,
     }
@@ -457,10 +457,19 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
         ),
         (key.to_base64().as_str(), true, 1, Some("tally-feed test"))
     );
-    // Served at a pin inside its public cell, never the place itself: the relay told the API
-    // the cell and nothing finer.
-    let pin = station.location.ok_or("no pin")?;
-    assert!(pin.lat != 37.41 && pin.lon != -122.1, "{pin:?}");
+    // Served by its public cell and the cell's centre to two decimals, never the place itself:
+    // the relay told the API the cell and nothing finer.
+    let cell = Region::public_cell(&location()).map_err(text)?;
+    assert_eq!(station.cell, Some(format!("{:x}", cell.as_u64())));
+    let pin = station.location.ok_or("no place")?;
+    let centre = h3o::LatLng::from(h3o::CellIndex::try_from(cell.as_u64()).map_err(text)?);
+    assert_eq!(
+        (pin.lat, pin.lon),
+        (
+            (centre.lat() * 100.0).round() / 100.0,
+            (centre.lng() * 100.0).round() / 100.0
+        )
+    );
     let pinned = Region::public_cell(&Location {
         lat_e7: (pin.lat * 1e7).round() as i32,
         lon_e7: (pin.lon * 1e7).round() as i32,
@@ -471,7 +480,7 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
     assert_eq!(pinned, Region::public_cell(&location()).map_err(text)?);
     // The relay's report, which the API reads, names the cell, never a coordinate.
     let report_json = serde_json::to_string(&report).map_err(text)?;
-    assert!(!report_json.contains("37.41") && !report_json.contains("122.1,"));
+    assert!(!report_json.contains("37.412") && !report_json.contains("122.103"));
 
     assert_eq!(station.state, tally_api_types::StationState::Feeding);
     assert!(station.first_seen_at_ms <= station.last_seen_at_ms);
@@ -595,8 +604,65 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
     assert_eq!(figures.area, area);
     assert!(!figures.standing && figures.ranks.is_none());
     let figures_json = serde_json::to_string(&figures).map_err(text)?;
-    assert!(!figures_json.contains("37.41") && !figures_json.contains("-122.1,"));
+    assert!(!figures_json.contains("37.412") && !figures_json.contains("122.103"));
+
+    // Every answer that names a station, as a client reads it: the one receiver place in any of
+    // them is its cell's rounded centre; the only other places are area centres (resolution 3,
+    // the leaderboards'), each the centre of a cell that holds hundreds of public cells. Nothing
+    // finer than the public cell leaves the API.
+    let mut answers = vec![
+        format!("/v1/stations/{}", key.to_base64url()),
+        format!("/v1/stations/{}/stats", key.to_base64url()),
+        "/v1/network".to_owned(),
+        "/v1/me".to_owned(),
+        "/v1/leaderboards".to_owned(),
+    ];
+    if let Some(area) = &figures.area {
+        answers.push(format!("/v1/leaderboards/{area}"));
+    }
+    let area_centre = figures.area.as_deref().and_then(|area| {
+        let area = h3o::CellIndex::try_from(u64::from_str_radix(area, 16).ok()?).ok()?;
+        Some(h3o::LatLng::from(area))
+    });
+    for path in answers {
+        let (status, _, body) = get(&format!("{api}{path}")).await?;
+        if status != StatusCode::OK {
+            continue;
+        }
+        let value: serde_json::Value = json(&body)?;
+        let mut placed = Vec::new();
+        places(&value, &mut placed);
+        for (lat, lon) in placed {
+            let station_place = (lat, lon) == (pin.lat, pin.lon);
+            let area_place = area_centre.is_some_and(|centre| {
+                (lat - centre.lat()).abs() < 1e-6 && (lon - centre.lng()).abs() < 1e-6
+            });
+            assert!(station_place || area_place, "{path} serves {lat}, {lon}");
+        }
+        let written = String::from_utf8_lossy(&body);
+        assert!(
+            !written.contains("37.412") && !written.contains("122.103"),
+            "{path}: {written}"
+        );
+    }
     Ok(())
+}
+
+/// Every `{"lat": .., "lon": ..}` object in `value`, wherever it sits.
+fn places(value: &serde_json::Value, into: &mut Vec<(f64, f64)>) {
+    match value {
+        serde_json::Value::Array(items) => items.iter().for_each(|item| places(item, into)),
+        serde_json::Value::Object(fields) => {
+            if let (Some(lat), Some(lon)) = (
+                fields.get("lat").and_then(serde_json::Value::as_f64),
+                fields.get("lon").and_then(serde_json::Value::as_f64),
+            ) {
+                into.push((lat, lon));
+            }
+            fields.values().for_each(|item| places(item, into));
+        }
+        _ => {}
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

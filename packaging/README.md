@@ -45,7 +45,7 @@ Raspberry Pi OS Bullseye and anything newer).
   - **Who sees the location:** it asks nothing and passes no flag for it. The feed carries the
     exact location only to Tally relays, as MLAT needs, in a record relays never pass to a client.
     Nothing a data user reads (the API, the streams, the stats) contains it: the receiver's public
-    description names only its public cell, about 5 km across, which is all a public map shows.
+    description names only its public cell, about 6 km across, which is all a public map shows.
     The installer says so in one line.
   - **Relays:** from a seed list, the release's `seeds` or the file `TALLY_SEEDS` names, one
     `HOST:PORT=KEY OPERATOR` a line. It stops before installing anything if the list names no
@@ -62,7 +62,7 @@ Raspberry Pi OS Bullseye and anything newer).
     `TALLY_FEED_EXTRA`.
   - **Start:** starts the service and waits up to 20 s for it to be active and log
     `tally-feed: publishing to RELAY`. Only then does it say it is installed, print the public key
-    and the station page, `https://tally.flightlines.ai/en/station/<key>/` (the key as base64url
+    and the station page, `https://tally.skycommons.org/feeders/<key>` (the key as base64url
     without padding), and exit 0. Otherwise it prints the journal's tail and what to do next, and
     exits 1; the feeder keeps trying on its own.
 
@@ -188,12 +188,12 @@ That is all of it: no key to make or paste, and no relay to name.
 - **Location:** `LAT` and `LONG` (or `READSB_LAT` and `READSB_LON`) in degrees, and `ALT` (or
   `READSB_ALT`) as ultrafeeder takes it, `15m` or `45ft` (a bare number is metres). Only Tally
   relays get the position exactly, as MLAT needs; nothing a data user reads contains it, and public
-  surfaces (the map, station pages, the API) show only its public cell, about 5 km across. An
+  surfaces (the map, station pages, the API) show only its public cell, about 6 km across. An
   empty variable counts as unset, so a missing
   `${FEEDER_ALT_M}` leaves `ALT=m`, which the feeder refuses by name rather than guessing 0 m.
 - **Identity:** on the first run the feeder makes its key in the volume
   (`/var/lib/tally-feed/key`), and every start logs the receiver's public key and its station page,
-  `https://tally.flightlines.ai/en/station/<key>/` (`docker logs tally-feed`). Keep the volume: the
+  `https://tally.skycommons.org/feeders/<key>` (`docker logs tally-feed`). Keep the volume: the
   key is the antenna's name for good. A host that keeps secrets in its own configuration sets
   `TALLY_KEY` to the first line of `docker run --rm ghcr.io/sky-commons/tally-feed:0 new-key`
   instead, and then no key file is made.

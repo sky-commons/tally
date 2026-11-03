@@ -5,5 +5,5 @@
 # other operators run join this list as they come; until it names more than one operator, Tally's
 # entry point is one operator's. A relay is listed only while its operator follows the network's
 # rules for relay operators (docs/relay-operators.md): a receiver's exact site stays on relays and
-# never reaches a client; public surfaces show only its public cell, about 5 km across.
+# never reaches a client; public surfaces show only its public cell, about 6 km across.
 relay.tally.flightlines.ai:10900=JHSEe+sJIFnbegZAoEvGzLcBKS1UYzgPBU7jpIuUJ8o= Flightlines
