@@ -294,6 +294,42 @@ where
     .map_err(|_| WireError::Timeout)?
 }
 
+/// As `connect`, saying only the versions `speaking` (its least and its most) in `Hello`, as a
+/// build of that range would: an older feeder, for a test that a relay still answers and uses it
+/// (RFC-0203 §5: a relay accepts every feeder wire version ever released). A range outside the
+/// versions this build speaks, or the wrong way round, is refused before anything is sent.
+pub async fn connect_speaking<S>(
+    stream: S,
+    local: &impl Handshakes,
+    remote: &PublicKey,
+    role: Role,
+    speaking: (u16, u16),
+) -> Result<Session<S>, WireError>
+where
+    S: AsyncRead + AsyncWrite + Send,
+{
+    let (least, most) = speaking;
+    if least < MIN_VERSION || least > most || most > MAX_VERSION {
+        return Err(WireError::Invalid {
+            field: "versions spoken",
+            value: (u64::from(least) << 16) | u64::from(most),
+        });
+    }
+    tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        initiate(
+            stream,
+            handshake_key_of(local),
+            remote,
+            (role, &[]),
+            speaking,
+            &POOL,
+        ),
+    )
+    .await
+    .map_err(|_| WireError::Timeout)?
+}
+
 /// Dials and says `Hello` with the versions `speaking` (this build's own range, except in a
 /// test of how an older initiator is answered), its messages in buffers from `pool` (the
 /// process's, except in a test that counts them).

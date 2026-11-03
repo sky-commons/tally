@@ -614,6 +614,78 @@ async fn a_feeder_publishing_someone_elses_batch_is_cut_off_and_nothing_is_forwa
     Ok(())
 }
 
+/// A feeder of the oldest wire version a relay accepts (`tally_wire::record::MIN_VERSION`, 2, the
+/// only version tally-feed v0.1.0 to v0.4.2 spoke) is welcomed at that version, and what it
+/// publishes reaches the map: the relay's BEAST output, which the map's readsb reads. A relay
+/// accepts every feeder wire version ever released, for good (RFC-0203 §5). Version 1 was retired
+/// before any feeder beyond Flightlines' own ran it, so no relay reads it.
+#[tokio::test]
+async fn a_feeder_of_the_oldest_wire_version_is_welcomed_and_reaches_the_map() -> Result {
+    let relay = relay(
+        Hub::new(8, Deadlines::RELAY)
+            .accepting_relays([tally_mlat_solver::sim::anchoring_relay().public()])
+            .serving_beast(1),
+    )
+    .await?;
+    let mut beast = TcpStream::connect(relay.beast_out).await.map_err(text)?;
+    let receiver = Identity::generate().map_err(text)?;
+    let stream = TcpStream::connect(relay.address).await.map_err(text)?;
+    let oldest = tally_wire::record::MIN_VERSION;
+    assert_eq!(oldest, 2);
+    let mut session = noise::connect_speaking(
+        stream,
+        &receiver,
+        &relay.key,
+        Role::Feeder,
+        (oldest, oldest),
+    )
+    .await
+    .map_err(text)?;
+    assert_eq!(session.version, oldest);
+
+    let sent = frames(20)?;
+    let published = anchored_batch(
+        &receiver,
+        &BatchContent {
+            boot_id: 1,
+            sequence: 0,
+            counter_epoch: 0,
+            wall_ms: tally_feed::source::wall_ms(),
+            dropped: 0,
+            previous: [0; 32],
+            observations: sent.iter().map(Observation::from_beast).collect(),
+        },
+    )
+    .map_err(text)?;
+    session
+        .writer
+        .send(&[Record::Batch(published)])
+        .await
+        .map_err(text)?;
+
+    let mut decoder = Decoder::new();
+    let mut decoded = Vec::new();
+    let mut buffer = vec![0; 64 * 1024];
+    while decoded.len() < sent.len() {
+        let length = beast.read(&mut buffer).await.map_err(text)?;
+        if length == 0 {
+            return Err(format!(
+                "beast-out closed after {} of {} frames",
+                decoded.len(),
+                sent.len()
+            ));
+        }
+        decoder.push(&buffer[..length], |frame| decoded.push(frame));
+    }
+    let client_form = sent
+        .iter()
+        .map(|frame| Frame::new(frame.kind(), 0, 0, frame.message()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(text)?;
+    assert_eq!(decoded, client_form);
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_batch_arriving_twice_is_forwarded_once() -> Result {
     let relay = relay(

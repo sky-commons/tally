@@ -6,8 +6,20 @@ exports_files(
     visibility = ["//crates/relay:__pkg__"],
 )
 
-# The feeder's: //crates/feed:unit holds it to the same read of ClockBound.
+# The feeder's: //crates/feed:unit holds it to the same read of ClockBound; and the updater's
+# (RFC-0203), which //packaging:upgrade_test installs with it.
 exports_files(
     ["tally-feed.service"],
-    visibility = ["//crates/feed:__pkg__"],
+    visibility = [
+        "//crates/feed:__pkg__",
+        "//packaging:__pkg__",
+    ],
+)
+
+exports_files(
+    [
+        "tally-feed-update.service",
+        "tally-feed-update.timer",
+    ],
+    visibility = ["//packaging:__pkg__"],
 )

@@ -30,7 +30,7 @@ use crate::site::ReceiverSite;
 /// retired before any feeder beyond Flightlines' own ran it (adsb.im ships version 2, RFC-0174
 /// §5), so a responder refuses an initiator whose highest version is 1 with
 /// `Goodbye { reason: Version }`, and the forever rule (a relay answers every version a feeder
-/// ever shipped) starts at 2.
+/// ever shipped, RFC-0203 §5) starts at 2.
 pub const MIN_VERSION: u16 = 2;
 /// Version 2 (RFC-0174 §2.2, §2.10): the network records (echo, delivery checks, the provider
 /// directory, sharing, credit, the products), compressed batches, the `Probe` role and 16-bit

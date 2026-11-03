@@ -37,25 +37,53 @@ first receivers feed it. The map and each station's numbers are at https://tally
 ## Run a feeder
 
 On a receiver that runs readsb (a Raspberry Pi image, adsb.im, a plain Debian box), the release's
-installer does all of it: it downloads `tally-feed` for the machine, checks its sha256, finds the
-decoders and the location, makes the key, and starts the service.
+installer does all of it. It downloads `tally-feed` for the machine and checks its sha256 and its
+signature, finds the decoders and the location, makes the key, and starts the service.
 
 ```sh
 curl -fsSL https://github.com/sky-commons/tally/releases/latest/download/install.sh -o /tmp/tally-install.sh
 sudo bash /tmp/tally-install.sh
 ```
 
-It ends by printing your station's page, which says whether it is feeding. Run it again to upgrade
-or to change the location; `--uninstall` removes it and keeps the key (`--uninstall --purge` deletes
-the key too).
+It ends by printing your station's page, which says whether it is feeding, and whether automatic
+updates are on. Run it again to change the location; `--uninstall` removes it and keeps the key
+(`--uninstall --purge` deletes the key too).
+
+### Upgrading
+
+**Automatic updates are on unless you turn them off.** Once a day, at a time of its own,
+`tally-feed-update.timer` checks for a newer release. It installs one only when that release is
+signed by this repository's release workflow on the release's own tag, checked against what your
+last install left on the receiver (RFC-0203 §3). It never installs an older release, and if the
+new feeder does not start, it puts the old one back. It keeps your key, your location, your own
+flags and what the feeder learned. `journalctl -u tally-feed-update` shows what it did. To turn
+updates off:
+
+```sh
+sudo systemctl disable --now tally-feed-update.timer   # later, on an installed receiver
+curl -fsSL https://github.com/sky-commons/tally/releases/latest/download/install.sh -o /tmp/tally-install.sh
+sudo TALLY_AUTO_UPDATE=0 bash /tmp/tally-install.sh     # or when installing
+```
+
+Running the installer again keeps your choice. `sudo systemctl enable --now
+tally-feed-update.timer` turns updates back on. With updates off, run the installer again to
+upgrade. A receiver installed before v0.7.2 has no updater yet: run the installer once and it has
+one.
+
+**No release needs your hands.** Every release makes any change to your files itself, and a test
+fails the build if a release cannot upgrade the installs before it. Relays accept every feeder
+version ever released, so a receiver that missed updates still feeds (RFC-0203 §4, §5).
+Automatic updates cover the standalone install above. A feeder run as a container (adsb.im, a
+compose file) follows its image tag instead (below).
 
 **A feeder needs no time daemon setup**, and a host running
 [AWS ClockBound](https://github.com/aws/clock-bound) is used as a clock reference (RFC-0171 §3.6).
 
-**Upgrade required.** A feeder signs a relay's freshness anchor into every batch (RFC-0171 §3.6), and
-a relay uses no batch without one: a feeder from before anchors is still received and passed on, but
-none of its data reaches the map, MLAT or subscribers. Upgrade relays first (they read both formats),
-then feeders.
+**Upgrade required from before v0.7.0.** A feeder signs a relay's freshness anchor into every
+batch (RFC-0171 §3.6), and a relay uses no batch without one. A feeder from before anchors (v0.6.1
+and earlier) is still received and passed on, but none of its data reaches the map, MLAT or
+subscribers. Upgrade relays first (they read both formats), then feeders. Such feeders have no
+updater, so their owners run the installer again.
 
 As a container (`ghcr.io/sky-commons/tally-feed`, signed like the binaries), see
 [packaging/README.md](packaging/README.md). By hand:

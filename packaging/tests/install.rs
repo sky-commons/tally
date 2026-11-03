@@ -3,30 +3,21 @@
 //! into the script or publishes a seed list beside it, so the documented install stops, saying how
 //! to go on, before it asks for root and with nothing installed.
 //!
-//! The rest source the script (it runs `main` only when run, not sourced) into a sandbox: every
-//! path it reads or writes moved under a temporary directory, the commands it calls (`curl`,
-//! `systemctl`, `journalctl`, `docker`, `dpkg`, `uname`, `getconf`, `chown`) stubbed on `PATH`,
-//! and no terminal. Each test is one behaviour: a rerun's location winning over the last one's and
-//! keeping the owner's own flags, each location source, the altitude it will not guess, the build
-//! the userland (not the kernel) runs, the container route, the wait for "publishing", and
-//! uninstalling with and without the key.
+//! The rest source the script into the sandbox (`sandbox`). Each test is one behaviour: a rerun's
+//! location winning over the last one's and keeping the owner's own flags, each location source,
+//! the altitude it will not guess, the build the userland (not the kernel) runs, the container
+//! route, the wait for "publishing", each file's signature, automatic updates on by default and
+//! the owner's choice kept, uninstalling with and without the key; and the updater (`update.sh`,
+//! RFC-0203): nothing installed from a release whose signature fails, never an older release, an
+//! opted-out receiver left alone, and the old files back when the new release does not start.
+
+mod sandbox;
 
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::path::Path;
+use std::process::Command;
 
-type Result<T = ()> = std::result::Result<T, String>;
-
-fn installer() -> Result<PathBuf> {
-    let path = std::env::var_os("TALLY_INSTALLER")
-        .map(PathBuf::from)
-        .ok_or_else(|| "TALLY_INSTALLER names install.sh (set by the build)".to_owned())?;
-    std::fs::canonicalize(&path).map_err(|error| format!("{}: {error}", path.display()))
-}
-
-fn io<T>(result: std::io::Result<T>) -> Result<T> {
-    result.map_err(|error| error.to_string())
-}
+use sandbox::{INSTALL, RELAY_KEY, Result, Sandbox, borrowed, install_env, installer, io, updater};
 
 /// The installer's refusal (its stderr) run with `env` and `path` first on its PATH; an error if
 /// it did not stop.
@@ -95,222 +86,6 @@ fn a_release_publishing_no_seed_list_says_how_to_pass_one() -> Result {
         "{refusal}"
     );
     says_how_to_pass_them(&refusal)
-}
-
-/// A relay key: 32 bytes of base64.
-const RELAY_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-/// The receiver's public key the fake `tally-feed init` prints, with both of the characters
-/// base64url replaces.
-const PUBLIC: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+/8=";
-
-/// The sourced installer's paths and the parts that touch the machine, moved into `$T`.
-const PRELUDE: &str = r#"
-set -euo pipefail
-source "$TALLY_INSTALLER"
-T="$TEST_DIR"
-R="$T/root"
-BIN="$R/usr/local/bin/tally-feed"
-KEY="$R/etc/tally/key"
-DEFAULTS="$R/etc/default/tally-feed"
-UNIT="$R/etc/systemd/system/tally-feed.service"
-STATE="$R/var/lib/tally-feed"
-STATE_PRIVATE="$R/var/lib/private/tally-feed"
-ADSBIM_ENVS=("$R/opt/adsb/config/.env")
-READSB_DEFAULTS="$R/etc/default/readsb"
-PIAWARE_ENV="$R/var/cache/piaware/location.env"
-DUMP1090_DEFAULTS="$R/etc/default/dump1090-fa"
-FEED_CLIENT_DEFAULTS=("$R/etc/default/adsbexchange" "$R/etc/default/adsbfi")
-WAIT_SECONDS=1
-mkdir -p "$R/usr/local/bin" "$R/etc/default" "$R/etc/systemd/system" "$T/work"
-work="$T/work"
-require_root() { :; }
-have_tty() { false; }
-readsb_arguments() { :; }
-listening() { false; }
-"#;
-
-/// The stubs every sandbox has: no docker container, an amd64 Debian, systemd 247 whose service
-/// is always active, a journal (`$T/journal`) for the service's start, and a `curl` serving the
-/// files of `$T/release`.
-const STUBS: &[(&str, &str)] = &[
-    (
-        "docker",
-        "#!/bin/sh\n[ -f \"$TEST_DIR/docker-$1\" ] && cat \"$TEST_DIR/docker-$1\"\nexit 0\n",
-    ),
-    (
-        "dpkg",
-        "#!/bin/sh\ncat \"$TEST_DIR/dpkg\" 2>/dev/null || echo amd64\n",
-    ),
-    (
-        "uname",
-        "#!/bin/sh\ncat \"$TEST_DIR/uname\" 2>/dev/null || echo x86_64\n",
-    ),
-    (
-        "getconf",
-        "#!/bin/sh\ncat \"$TEST_DIR/getconf\" 2>/dev/null || echo 64\n",
-    ),
-    ("chown", "#!/bin/sh\nexit 0\n"),
-    (
-        "systemctl",
-        "#!/bin/sh\necho \"$*\" >> \"$TEST_DIR/systemctl.log\"\ncase \"$1\" in\n  --version) echo 'systemd 247 (247.3-7+deb11u4)' ;;\n  show) echo 0123456789abcdef ;;\n  is-active) [ ! -f \"$TEST_DIR/inactive\" ] ;;\nesac\n",
-    ),
-    (
-        "journalctl",
-        "#!/bin/sh\ncase \"$*\" in\n  *_SYSTEMD_INVOCATION_ID=*) cat \"$TEST_DIR/journal\" 2>/dev/null ;;\n  *) echo 'the journal tail' ;;\nesac\nexit 0\n",
-    ),
-    (
-        "curl",
-        "#!/bin/sh\nout=''\nwhile [ $# -gt 1 ]; do [ \"$1\" = -o ] && out=\"$2\"; shift; done\nname=\"${1##*/}\"\n[ -f \"$TEST_DIR/release/$name\" ] || exit 22\ncp \"$TEST_DIR/release/$name\" \"$out\"\n",
-    ),
-];
-
-/// A temporary directory holding the stubs, the files a test puts in the machine (under `root`),
-/// and what the installer wrote; removed when dropped.
-struct Sandbox {
-    dir: PathBuf,
-}
-
-impl Sandbox {
-    fn new(name: &str) -> Result<Self> {
-        let dir = std::env::temp_dir().join(format!("tally-{name}-{}", std::process::id()));
-        if dir.exists() {
-            io(std::fs::remove_dir_all(&dir))?;
-        }
-        io(std::fs::create_dir_all(dir.join("stub")))?;
-        let sandbox = Self { dir };
-        for (name, script) in STUBS {
-            sandbox.stub(name, script)?;
-        }
-        Ok(sandbox)
-    }
-
-    /// Writes `text` at `path` under the sandbox, making its directories.
-    fn file(&self, path: &str, text: &str) -> Result {
-        let path = self.dir.join(path);
-        if let Some(parent) = path.parent() {
-            io(std::fs::create_dir_all(parent))?;
-        }
-        io(std::fs::write(path, text))
-    }
-
-    fn stub(&self, name: &str, script: &str) -> Result {
-        let path = self.dir.join("stub").join(name);
-        io(std::fs::write(&path, script))?;
-        io(std::fs::set_permissions(
-            &path,
-            std::fs::Permissions::from_mode(0o755),
-        ))
-    }
-
-    fn read(&self, path: &str) -> Result<String> {
-        io(std::fs::read_to_string(self.dir.join(path)))
-    }
-
-    fn exists(&self, path: &str) -> bool {
-        self.dir.join(path).exists()
-    }
-
-    /// Runs `body` after the prelude, with only `env` of the TALLY_ variables set.
-    fn run(&self, body: &str, env: &[(&str, &str)]) -> Result<Output> {
-        let inherited = std::env::var("PATH").unwrap_or_default();
-        let mut command = Command::new("bash");
-        command
-            .arg("-c")
-            .arg(format!("{PRELUDE}\n{body}"))
-            .env_clear()
-            .env(
-                "PATH",
-                format!("{}:{inherited}", self.dir.join("stub").display()),
-            )
-            .env("TALLY_INSTALLER", installer()?)
-            .env("TEST_DIR", &self.dir);
-        for (name, value) in env {
-            command.env(name, value);
-        }
-        io(command.output())
-    }
-
-    /// `body`'s stdout; an error carrying its stderr if it failed.
-    fn ok(&self, body: &str, env: &[(&str, &str)]) -> Result<String> {
-        let output = self.run(body, env)?;
-        if !output.status.success() {
-            return Err(format!(
-                "it failed: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    }
-
-    /// `body`'s stderr, which must have stopped it.
-    fn stopped(&self, body: &str, env: &[(&str, &str)]) -> Result<String> {
-        let output = self.run(body, env)?;
-        if output.status.success() {
-            return Err(format!(
-                "it did not stop: {}",
-                String::from_utf8_lossy(&output.stdout)
-            ));
-        }
-        Ok(String::from_utf8_lossy(&output.stderr).into_owned())
-    }
-
-    /// The location found, as `LAT LON ALT|WHERE THE LOCATION CAME FROM|WHERE THE ALTITUDE DID`.
-    fn located(&self, env: &[(&str, &str)]) -> Result<String> {
-        let out = self.ok(
-            "discover_location quiet\nprintf '%s %s %s|%s|%s' \"$lat\" \"$lon\" \"$alt\" \"$lat_from\" \"$alt_from\"",
-            env,
-        )?;
-        Ok(out.lines().last().unwrap_or_default().to_owned())
-    }
-
-    /// A release in `release/` (a fake `tally-feed`, the unit, each with its sha256) and a seed
-    /// list, as an install reads them.
-    fn release(&self) -> Result {
-        self.file(
-            "release/tally-feed-x86_64-linux",
-            &format!("#!/bin/sh\n[ \"$1\" = init ] && touch \"$3\" && echo '{PUBLIC}'\nexit 0\n"),
-        )?;
-        self.file("release/tally-feed.service", "[Service]\n")?;
-        self.file(
-            "seeds",
-            &format!("relay.example:10900={RELAY_KEY} Example Operator\n"),
-        )
-    }
-}
-
-impl Drop for Sandbox {
-    fn drop(&mut self) {
-        _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// The whole install, as `main` runs it, with the release's checksums made first.
-const INSTALL: &str = r#"
-for f in "$T"/release/*; do sha256sum "$f" > "$f.sha256"; done
-main
-"#;
-
-fn install_env<'a>(sandbox: &Sandbox, extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, String)> {
-    let mut env = vec![
-        ("TALLY_RELEASE", "https://release.example/r".to_owned()),
-        (
-            "TALLY_SEEDS",
-            sandbox.dir.join("seeds").display().to_string(),
-        ),
-    ];
-    env.extend(
-        extra
-            .iter()
-            .map(|(name, value)| (*name, (*value).to_owned())),
-    );
-    env
-}
-
-fn borrowed<'a>(env: &'a [(&'a str, String)]) -> Vec<(&'a str, &'a str)> {
-    env.iter()
-        .map(|(name, value)| (*name, value.as_str()))
-        .collect()
 }
 
 #[test]
@@ -729,6 +504,10 @@ fn uninstall_keeps_the_key_and_purge_deletes_it() -> Result {
         "root/usr/local/bin/tally-feed",
         "root/etc/default/tally-feed",
         "root/etc/systemd/system/tally-feed.service",
+        "root/etc/systemd/system/tally-feed-update.service",
+        "root/etc/systemd/system/tally-feed-update.timer",
+        "root/usr/local/lib/tally/update",
+        "root/usr/local/lib/tally/installed",
         "root/etc/tally/key",
         "root/var/lib/private/tally-feed/relays",
     ] {
@@ -741,15 +520,20 @@ fn uninstall_keeps_the_key_and_purge_deletes_it() -> Result {
         "root/usr/local/bin/tally-feed",
         "root/etc/default/tally-feed",
         "root/etc/systemd/system/tally-feed.service",
+        "root/etc/systemd/system/tally-feed-update.service",
+        "root/etc/systemd/system/tally-feed-update.timer",
+        "root/usr/local/lib/tally",
         "root/var/lib/private/tally-feed",
     ] {
         assert!(!sandbox.exists(gone), "{gone} is still there");
     }
     let calls = sandbox.read("systemctl.log")?;
-    assert!(
-        calls.contains("disable --now tally-feed.service"),
-        "{calls}"
-    );
+    for call in [
+        "disable --now tally-feed.service",
+        "disable --now tally-feed-update.timer",
+    ] {
+        assert!(calls.contains(call), "{call}: {calls}");
+    }
 
     let output = sandbox.run("main --uninstall --purge", &[])?;
     let err = String::from_utf8_lossy(&output.stderr);
@@ -760,5 +544,361 @@ fn uninstall_keeps_the_key_and_purge_deletes_it() -> Result {
 
     let refusal = sandbox.stopped("main --uninstall --everything", &[])?;
     assert!(refusal.contains("usage"), "{refusal}");
+    Ok(())
+}
+
+/// The journal of a feeder that reads its decoder and publishes.
+const PUBLISHING: &str = "tally-feed: reading 127.0.0.1:30005\ntally-feed: publishing to relay.example:10900 (version 4)\n";
+
+const LOCATION: &[(&str, &str)] = &[
+    ("TALLY_LAT", "51.5"),
+    ("TALLY_LON", "-0.1"),
+    ("TALLY_ALT", "20"),
+];
+
+const TIMER_ENABLED: &str = "enabled-tally-feed-update.timer";
+
+/// Installs the release `sandbox.release()` makes with the installer under test, with `extra` in
+/// the environment and `args` to `main`; its stdout.
+fn install(sandbox: &Sandbox, extra: &[(&str, &str)], args: &str) -> Result<String> {
+    let mut env = LOCATION.to_vec();
+    env.extend_from_slice(extra);
+    let env = install_env(sandbox, &env);
+    sandbox.ok(
+        &INSTALL.replace("main", &format!("main {args}")),
+        &borrowed(&env),
+    )
+}
+
+#[test]
+fn automatic_updates_are_on_by_default_and_the_install_says_how_to_turn_them_off() -> Result {
+    let sandbox = Sandbox::new("auto-on")?;
+    sandbox.release()?;
+    sandbox.file("journal", PUBLISHING)?;
+    let out = install(&sandbox, &[], "")?;
+    assert!(sandbox.exists(TIMER_ENABLED), "{out}");
+    for needed in [
+        "Automatic updates are on (the default)",
+        "sudo systemctl disable --now tally-feed-update.timer",
+        "TALLY_AUTO_UPDATE=0",
+    ] {
+        assert!(out.contains(needed), "{needed:?}: {out}");
+    }
+    for installed in [
+        "root/usr/local/lib/tally/update",
+        "root/etc/systemd/system/tally-feed-update.service",
+        "root/etc/systemd/system/tally-feed-update.timer",
+    ] {
+        assert!(sandbox.exists(installed), "{installed}");
+    }
+    let version = sandbox.ok("printf %s \"$VERSION\"", &[])?;
+    assert_eq!(
+        sandbox.read("root/usr/local/lib/tally/installed")?,
+        format!("{version}\n")
+    );
+    // Every file it installed was checked against the release workflow's signature on its tag.
+    let checked = sandbox.log("cosign.log");
+    for name in [
+        "tally-feed-x86_64-linux",
+        "tally-feed.service",
+        "tally-feed-update.service",
+        "tally-feed-update.timer",
+        "update.sh",
+    ] {
+        assert!(
+            checked.contains(&format!("/{name} --bundle")),
+            "{name}: {checked}"
+        );
+    }
+    assert!(
+        checked.contains(&format!(
+            "--certificate-identity https://github.com/sky-commons/tally/.github/workflows/release.yml@refs/tags/{version} "
+        )),
+        "{checked}"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_owners_choice_about_automatic_updates_survives_a_rerun() -> Result {
+    let sandbox = Sandbox::new("auto-choice")?;
+    sandbox.release()?;
+    sandbox.file("journal", PUBLISHING)?;
+    let out = install(&sandbox, &[("TALLY_AUTO_UPDATE", "0")], "")?;
+    assert!(!sandbox.exists(TIMER_ENABLED));
+    assert!(
+        out.contains("Automatic updates are off (you said so)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("sudo systemctl enable --now tally-feed-update.timer"),
+        "{out}"
+    );
+    // A rerun naming nothing keeps them off.
+    let out = install(&sandbox, &[], "")?;
+    assert!(!sandbox.exists(TIMER_ENABLED));
+    assert!(
+        out.contains("Automatic updates are off (the earlier install)"),
+        "{out}"
+    );
+    // The owner turns them on with systemctl, and a rerun keeps that.
+    sandbox.file(TIMER_ENABLED, "")?;
+    let out = install(&sandbox, &[], "")?;
+    assert!(sandbox.exists(TIMER_ENABLED));
+    assert!(
+        out.contains("Automatic updates are on (the earlier install)"),
+        "{out}"
+    );
+    // And off again the same way, which a rerun keeps too.
+    io(std::fs::remove_file(sandbox.dir.join(TIMER_ENABLED)))?;
+    install(&sandbox, &[], "")?;
+    assert!(!sandbox.exists(TIMER_ENABLED));
+
+    // The flag says the same as TALLY_AUTO_UPDATE=0, and a word it does not know is refused.
+    let fresh = Sandbox::new("auto-flag")?;
+    fresh.release()?;
+    fresh.file("journal", PUBLISHING)?;
+    let out = install(&fresh, &[], "--no-auto-update")?;
+    assert!(!fresh.exists(TIMER_ENABLED), "{out}");
+    let env = install_env(&fresh, &[("TALLY_AUTO_UPDATE", "maybe")]);
+    let refusal = fresh.stopped(INSTALL, &borrowed(&env))?;
+    assert!(refusal.contains("TALLY_AUTO_UPDATE is 1 or 0"), "{refusal}");
+    Ok(())
+}
+
+#[test]
+fn a_release_file_whose_signature_fails_is_not_installed() -> Result {
+    // Signed on another tag than the installer's: the workflow signed some other release.
+    let sandbox = Sandbox::new("unsigned")?;
+    sandbox.release()?;
+    sandbox.file("journal", PUBLISHING)?;
+    let env = install_env(&sandbox, LOCATION);
+    let refusal = sandbox.stopped("sign_release v0.0.1\nmain", &borrowed(&env))?;
+    assert!(
+        refusal.contains("is not signed by the release workflow"),
+        "{refusal}"
+    );
+    assert!(refusal.contains("nothing was installed"), "{refusal}");
+    assert!(!sandbox.exists("root/usr/local/bin/tally-feed"));
+    assert!(!sandbox.exists("root/etc/default/tally-feed"));
+
+    // Changed after it was signed, with a sha256 to match: the sha256 is no signature.
+    let sandbox = Sandbox::new("tampered")?;
+    sandbox.release()?;
+    let refusal = sandbox.stopped(
+        "sign_release \"$VERSION\"\necho 'echo owned' >> \"$T/release/tally-feed-x86_64-linux\"\nsha256sum \"$T/release/tally-feed-x86_64-linux\" > \"$T/release/tally-feed-x86_64-linux.sha256\"\nmain",
+        &borrowed(&env),
+    )?;
+    assert!(
+        refusal.contains("tally-feed-x86_64-linux is not signed"),
+        "{refusal}"
+    );
+    assert!(!sandbox.exists("root/usr/local/bin/tally-feed"));
+    Ok(())
+}
+
+/// The fake feeder of a newer release: the same `init`, a different file.
+const NEW_FEEDER: &str = "#!/bin/sh\n# the newer release\n[ \"$1\" = init ] && touch \"$3\" && echo 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+/8='\nexit 0\n";
+
+/// A receiver installed by the installer under test (automatic updates as `extra` says), with the
+/// owner's own flag, and a newer release `tag` published: the installer under test as that tag,
+/// a new feeder, signed as `signed_on` (the tag, unless a test forges it). Returns the old feeder.
+fn installed_then_released(
+    sandbox: &Sandbox,
+    extra: &[(&str, &str)],
+    tag: &str,
+    signed_on: &str,
+) -> Result<String> {
+    sandbox.release()?;
+    sandbox.file("journal", PUBLISHING)?;
+    install(sandbox, extra, "")?;
+    let defaults = "root/etc/default/tally-feed";
+    let written = sandbox.read(defaults)?.replace(
+        "TALLY_FEED_EXTRA=\"\"",
+        "TALLY_FEED_EXTRA=\"--clock beast\"",
+    );
+    sandbox.file(defaults, &written)?;
+    let old = sandbox.read("root/usr/local/bin/tally-feed")?;
+
+    let script = std::fs::read_to_string(installer()?).map_err(|error| error.to_string())?;
+    let current = script
+        .lines()
+        .find(|line| line.starts_with("VERSION=\""))
+        .ok_or("the installer names no VERSION")?
+        .to_owned();
+    sandbox.file(
+        "release/install.sh",
+        &script.replacen(&current, &format!("VERSION=\"{tag}\""), 1),
+    )?;
+    sandbox.file("release/tally-feed-x86_64-linux", NEW_FEEDER)?;
+    sandbox.file(
+        "release/seeds",
+        &format!("relay.example:10900={RELAY_KEY} Example Operator\n"),
+    )?;
+    sandbox.ok(&format!("sign_release {signed_on}"), &[])?;
+    sandbox.file("latest", tag)?;
+    io(std::fs::remove_file(sandbox.dir.join("systemctl.log")))?;
+    Ok(old)
+}
+
+/// The updater run as the timer runs it: its log (stdout) and whether it succeeded.
+fn update(sandbox: &Sandbox) -> Result<(bool, String)> {
+    let output = sandbox.update_with(
+        &updater()?,
+        "main",
+        &[("TALLY_RELEASE", "https://release.example/new")],
+    )?;
+    Ok((
+        output.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    ))
+}
+
+#[test]
+fn an_update_installs_a_newer_signed_release_and_keeps_the_owners_settings() -> Result {
+    let sandbox = Sandbox::new("update")?;
+    installed_then_released(&sandbox, &[], "v99.0.0", "v99.0.0")?;
+    let (ok, log) = update(&sandbox)?;
+    assert!(ok, "{log}");
+    assert!(log.contains("to v99.0.0"), "{log}");
+    assert_eq!(sandbox.read("root/usr/local/bin/tally-feed")?, NEW_FEEDER);
+    assert_eq!(
+        sandbox.read("root/usr/local/lib/tally/installed")?,
+        "v99.0.0\n"
+    );
+    let written = sandbox.read("root/etc/default/tally-feed")?;
+    assert!(
+        written.contains("TALLY_FEED_EXTRA=\"--clock beast\""),
+        "{written}"
+    );
+    assert!(
+        written.contains("--lat 51.5 --lon -0.1 --alt 20\""),
+        "{written}"
+    );
+    assert!(sandbox.exists(TIMER_ENABLED));
+    assert!(sandbox.exists("root/etc/tally/key"));
+    // Run again, there is nothing newer.
+    let (ok, log) = update(&sandbox)?;
+    assert!(
+        ok && log.contains("up to date: v99.0.0 is installed"),
+        "{log}"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_update_whose_signature_fails_installs_nothing() -> Result {
+    // Signed, but by a release run on another tag than the one it claims to be.
+    let sandbox = Sandbox::new("update-forged")?;
+    let old = installed_then_released(&sandbox, &[], "v99.0.0", "v98.0.0")?;
+    let (ok, log) = update(&sandbox)?;
+    assert!(!ok, "{log}");
+    assert!(log.contains("REFUSED v99.0.0"), "{log}");
+    assert_eq!(sandbox.read("root/usr/local/bin/tally-feed")?, old);
+    assert!(!sandbox.log("systemctl.log").contains("restart"));
+
+    // Its install.sh changed after it was signed.
+    let sandbox = Sandbox::new("update-tampered")?;
+    let old = installed_then_released(&sandbox, &[], "v99.0.0", "v99.0.0")?;
+    let tampered = sandbox.read("release/install.sh")? + "\necho owned\n";
+    sandbox.file("release/install.sh", &tampered)?;
+    let (ok, log) = update(&sandbox)?;
+    assert!(!ok && log.contains("REFUSED v99.0.0"), "{log}");
+    assert_eq!(sandbox.read("root/usr/local/bin/tally-feed")?, old);
+    assert!(!sandbox.log("systemctl.log").contains("restart"));
+    Ok(())
+}
+
+#[test]
+fn an_update_never_installs_an_older_release_or_the_same_one() -> Result {
+    let sandbox = Sandbox::new("update-older")?;
+    let old = installed_then_released(&sandbox, &[], "v0.0.1", "v0.0.1")?;
+    let (ok, log) = update(&sandbox)?;
+    assert!(ok && log.contains("an update never goes back"), "{log}");
+    assert_eq!(sandbox.read("root/usr/local/bin/tally-feed")?, old);
+    assert!(
+        !sandbox.log("curl.log").contains("/download/"),
+        "{}",
+        sandbox.log("curl.log")
+    );
+
+    let version = sandbox.ok("printf %s \"$VERSION\"", &[])?;
+    sandbox.file("latest", &version)?;
+    let (ok, log) = update(&sandbox)?;
+    assert!(ok && log.contains("up to date"), "{log}");
+    assert!(!sandbox.log("curl.log").contains("/download/"));
+    Ok(())
+}
+
+#[test]
+fn an_opted_out_receiver_is_not_updated() -> Result {
+    let sandbox = Sandbox::new("update-off")?;
+    let old = installed_then_released(
+        &sandbox,
+        &[("TALLY_AUTO_UPDATE", "0")],
+        "v99.0.0",
+        "v99.0.0",
+    )?;
+    io(std::fs::remove_file(sandbox.dir.join("curl.log")))?;
+    let (ok, log) = update(&sandbox)?;
+    assert!(ok && log.contains("automatic updates are off"), "{log}");
+    assert_eq!(sandbox.read("root/usr/local/bin/tally-feed")?, old);
+    // It did not even ask for the latest release.
+    assert_eq!(sandbox.log("curl.log"), "");
+    Ok(())
+}
+
+#[test]
+fn a_release_that_does_not_start_is_rolled_back() -> Result {
+    let sandbox = Sandbox::new("update-rollback")?;
+    let old = installed_then_released(&sandbox, &[], "v99.0.0", "v99.0.0")?;
+    let defaults = sandbox.read("root/etc/default/tally-feed")?;
+    let version = sandbox.read("root/usr/local/lib/tally/installed")?;
+    // The new feeder starts but never publishes.
+    sandbox.file("journal", "tally-feed: receiver x\n")?;
+    let (ok, log) = update(&sandbox)?;
+    assert!(!ok, "{log}");
+    assert!(
+        log.contains("ROLLED BACK v99.0.0: its install.sh failed"),
+        "{log}"
+    );
+    assert_eq!(sandbox.read("root/usr/local/bin/tally-feed")?, old);
+    assert_eq!(sandbox.read("root/etc/default/tally-feed")?, defaults);
+    assert_eq!(sandbox.read("root/usr/local/lib/tally/installed")?, version);
+    assert!(sandbox.exists("root/etc/tally/key"));
+    // The old feeder was restarted after the new one was.
+    let calls = sandbox.log("systemctl.log");
+    assert!(
+        calls.trim_end().ends_with("restart tally-feed.service"),
+        "{calls}"
+    );
+
+    // A feeder that is not running once its installer is done is rolled back the same way.
+    let sandbox = Sandbox::new("update-dead")?;
+    let old = installed_then_released(&sandbox, &[], "v99.0.0", "v99.0.0")?;
+    sandbox.stub(
+        "systemctl",
+        &sandbox::STUBS
+            .iter()
+            .find(|(name, _)| *name == "systemctl")
+            .map(|(_, script)| script.replace(
+                "is-active) [ ! -f \"$TEST_DIR/inactive\" ] ;;",
+                "is-active) [ ! -f \"$TEST_DIR/root/usr/local/bin/tally-feed\" ] || ! grep -q newer \"$TEST_DIR/root/usr/local/bin/tally-feed\" || [ -n \"$IN_INSTALLER\" ] ;;",
+            ))
+            .ok_or("no systemctl stub")?,
+    )?;
+    let output = sandbox.update_with(
+        &updater()?,
+        "run_installer() { IN_INSTALLER=1 TALLY_INSTALLER=\"$1\" bash -c \"$TALLY_PRELUDE\"$'\\n''main --upgrade'; }\nmain",
+        &[("TALLY_RELEASE", "https://release.example/new")],
+    )?;
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{log}");
+    assert!(log.contains("tally-feed is not running after it"), "{log}");
+    assert_eq!(sandbox.read("root/usr/local/bin/tally-feed")?, old);
     Ok(())
 }

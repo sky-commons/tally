@@ -26,6 +26,11 @@
   by the raw's own signed wall clocks, never by when anything arrived". It changes §3.3, §3.4,
   §3.6, §3.8.1, §3.8.2, §7 and §10, and RFC-0174 §1, §2.3, §2.4, §2.10, §2.11 and §2.12, and
   RFC-0181's hosted MLAT and its sizing; each place says so.
+- **Amended 2026-11-03 (founder): a feeder is kept current, signed** (RFC-0203). A standalone
+  install updates itself to each newer release that the release workflow signed on its tag,
+  unless the owner turns that off. The feeder binary still never updates itself or takes orders
+  from the network. No release may need the owner's hands, and relays accept every feeder wire
+  version ever released. It changes §3.5 and §7; each place says so.
 
 ## §0 The answer, in one line
 
@@ -321,8 +326,10 @@ changes, it reissues both with one issued time. A description from an older feed
 forward it byte for byte only to version 3 relay and engine peers, and a client is sent no
 description for that receiver.
 
-It must never carry: a remote kill switch, remote configuration or command push, self-update (it
-updates through the owner's package manager, if ever), a single built-in seed or signer, any check
+It must never carry: a remote kill switch, remote configuration or command push, self-update (the
+binary never updates itself; since 2026-11-03 the standalone install's own updater does, opt-out,
+installing only a newer release the release workflow signed on its tag, RFC-0203), a single
+built-in seed or signer, any check
 that fails on an old date (a Pi without a clock battery boots in 1970), a disk buffer (it wears SD
 cards and replays stale data), or a listening port.
 
@@ -1898,7 +1905,10 @@ roughly $200 to $700 a month on budget hosting; today it is one server.
 - **Exact version matching and "unknown kind is an error".** Either one disconnects every frozen
   feeder the day a relay upgrades (critic 3).
 - **A remote kill switch, config push or self-update in the feeder.** The single point of control
-  this network exists to remove.
+  this network exists to remove. Amended 2026-11-03 (RFC-0203): the standalone install updates
+  the feeder, beside it and not inside it. It is opt-out, installs only newer releases the release
+  workflow signed on their own tags, and takes nothing else from the network. The release signer's
+  reach that this gives is the cost RFC-0203 §3 accepts and bounds.
 - **Re-publishing adsb.lol's aggregate into Tally.** Their data, their licence, and a feedback loop.
 - **Adding MLAT summaries** (partitioned information-form sums, merged by addition): not
   idempotent, exact only at one linearization point, double counts shared receiver clocks, larger
