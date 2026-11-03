@@ -19,7 +19,10 @@ Raspberry Pi OS Bullseye and anything newer).
     kernel gets `tally-feed-armv7-linux`. A 32-bit system the release has no build for (ARMv6, a
     Pi 1 or the first Pi Zero; 32-bit x86) is refused with "32-bit systems are not supported yet".
     Each download is checked against the `.sha256` published beside it, which guards a broken
-    download, not a compromised release.
+    download, and against its cosign signature bundle (`.sigstore.json`), which must be the
+    release workflow's on this release's own tag ("Automatic updates", below). cosign itself is
+    downloaded from sigstore/cosign's release and checked against the sha256 the script pins.
+    Nothing of the release is installed until every file of it is checked.
   - **Decoders:** readsb's BEAST output on `127.0.0.1:30005`, and dump978-fa's raw output on
     `127.0.0.1:30978` (added as `--uat`). acars_router's ACARS, VDL2 and HFDL outputs on
     `127.0.0.1:15550`, `15555` and `15556` are never added: message text can carry personal data,
@@ -63,10 +66,14 @@ Raspberry Pi OS Bullseye and anything newer).
     without padding), and exit 0. Otherwise it prints the journal's tail and what to do next, and
     exits 1; the feeder keeps trying on its own.
 
-  Run again, it upgrades the binary and keeps the key. It installs no updater: the feeder never
-  updates itself (RFC-0171 §3.5). `install.sh --uninstall` stops the feeder and removes its unit,
-  binary, what it learned and `/etc/default/tally-feed`, keeping the key, so installing again is
-  the same station; `install.sh --uninstall --purge` deletes the key as well, after saying that
+  - **Automatic updates:** installs the updater, and turns it on unless `TALLY_AUTO_UPDATE=0` or
+    `--no-auto-update` says otherwise, or an earlier install left it off. It ends by saying which,
+    and how to change it ("Automatic updates", below).
+
+  Run again, it upgrades the binary and keeps the key and the owner's choice about updates.
+  `install.sh --uninstall` stops the feeder and its updater and removes their units, the binary,
+  the updater and cosign (`/usr/local/lib/tally`), what the feeder learned and
+  `/etc/default/tally-feed`, keeping the key, so installing again is the same station; `install.sh --uninstall --purge` deletes the key as well, after saying that
   the station's identity is then gone for good (on a terminal it asks you to type `delete`).
 - `systemd/tally-feed.service` runs the feeder as a dynamic user with no listening socket, at most
   64 MB and 20% of one CPU. The key reaches it through `LoadCredential`, so it stays root's; the
@@ -92,13 +99,19 @@ curl -fsSL https://example.org/tally/v0.1.0/install.sh -o /tmp/tally-install.sh
 sudo TALLY_RELEASE=https://example.org/tally/v0.1.0 TALLY_SEEDS=/home/pi/seeds bash /tmp/tally-install.sh
 ```
 
-The installer's tests (`//packaging:install_test`, `tests/install.rs`) source it into a sandbox
-with its paths moved and the commands it calls stubbed, and check each behaviour above.
+The installer's tests (`//packaging:install_test`, `tests/install.rs`) source it and the updater
+into a sandbox with their paths moved and the commands they call stubbed (`tests/sandbox`), and
+check each behaviour above. `//packaging:upgrade_test` (`tests/upgrade.rs`) is the gate that no
+release needs the owner's hands (RFC-0203 §4). It upgrades installs made by the published
+installers of earlier releases (`tests/previous`) and by this build to this build's real feeder,
+and checks that the feeder starts with the key, the settings and the choice about updates it had.
 
 A release therefore carries `install.sh`, `tally-feed-x86_64-linux`, `tally-feed-aarch64-linux`,
 `tally-feed-armv7-linux` (32-bit ARM hard-float: 32-bit Raspberry Pi OS on a Pi 2 or later, and
-the PiAware image; not ARMv6, so not a Pi 1 or the first Pi Zero), `tally-feed.service` and
-`seeds`, each with a `.sha256` whose first field is the file's hash. The seed list is the
+the PiAware image; not ARMv6, so not a Pi 1 or the first Pi Zero), `tally-feed.service`,
+`update.sh`, `tally-feed-update.service`, `tally-feed-update.timer` and `seeds`, each with a
+`.sha256` whose first field is the file's hash and a `.sigstore.json`, the release workflow's
+cosign signature bundle. The seed list is the
 publisher's configuration, not this repository's: each publisher ships the relays it starts
 feeders from, each naming its operator, and checks its list with `--check-seeds`. The feeder
 compiles the same file in (`crates/feed`, `config::SEEDS`), so a feeder started with no
@@ -106,6 +119,44 @@ compiles the same file in (`crates/feed`, `config::SEEDS`), so a feeder started 
 bullseye sysroots (`bazel build -c opt --platforms=//platforms:linux_aarch64
 //crates/feed:tally-feed`, or `linux_armv7`), so they need only glibc 2.25 or newer and no C++
 runtime: any Raspberry Pi OS from Buster on, and any current Linux.
+
+## Automatic updates
+
+`install.sh` installs the updater (RFC-0203): `/usr/local/lib/tally/update` (`update.sh`), run by
+`tally-feed-update.service` from `tally-feed-update.timer`. The timer runs once a day, at a time
+of its own for each receiver (`RandomizedDelaySec=23h`, `FixedRandomDelay=yes`), and at boot if
+the receiver was off at that time. On each run it:
+
+- reads the latest release's tag (where `releases/latest` leads) and stops with `up to date`
+  unless it is newer than the version the last install recorded (`/usr/local/lib/tally/installed`).
+  It never installs an older release;
+- downloads that release's `install.sh` with its `.sigstore.json`, and stops with `REFUSED`,
+  installing nothing, unless `cosign verify-blob` finds it signed with the certificate identity
+  `https://github.com/sky-commons/tally/.github/workflows/release.yml@refs/tags/<that tag>`
+  (exact), the issuer `https://token.actions.githubusercontent.com`, and the workflow's
+  repository, trigger (`push`) and ref (the tag), and unless it says it is that version. The
+  cosign is the one the last install put at `/usr/local/lib/tally/cosign`, pinned by its sha256.
+  The identity is written in the installed updater. Nothing from the new release is trusted, and
+  nothing downloaded is run, before that check;
+- copies every file an install may replace, then runs the checked `install.sh --upgrade`. It
+  checks the release's other files the same way, asks nothing, rewrites what the release needs,
+  restarts the feeder and waits 90 s for it to publish;
+- if the installer fails, or the feeder is not running after it, puts every copied file back,
+  restarts the old feeder, and logs `ROLLED BACK` with the reason. It tries again at the next run.
+
+curl and cosign run as a throwaway unprivileged user, a transient unit with `DynamicUser=yes`,
+no capabilities, and no write access outside a private `/tmp`. Root writes only what they fetched,
+and runs only the installer they checked. Its log is `journalctl -u tally-feed-update`. The
+version a feeder runs is in its signed description (`software`), which a station's stats show.
+
+**Off:** `sudo systemctl disable --now tally-feed-update.timer`, or `TALLY_AUTO_UPDATE=0` (or
+`--no-auto-update`) when installing. While the timer is disabled the updater does nothing, even
+when started by hand, and a rerun of `install.sh` keeps it off. `sudo systemctl enable --now
+tally-feed-update.timer` turns it back on. `sudo systemctl start tally-feed-update.service` runs
+a check now.
+
+Only this standalone install updates itself. A container (below, and adsb.im) follows its image
+tag through its host's own updates.
 
 ## Run it as a container
 

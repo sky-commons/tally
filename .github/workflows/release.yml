@@ -84,6 +84,32 @@ jobs:
               exit 1
             fi
           done
+      # The upgrade test (//packaging:upgrade_test, RFC-0203 §4) starts from the installs of the
+      # releases vendored in packaging/tests/previous: they must be what those releases published,
+      # byte for byte, and the newest of them the release before this one, or the test would gate
+      # an upgrade no receiver makes.
+      - name: the upgrade test starts from the releases before this one
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          previous="$({
+            gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+              --limit 1000 --json tagName --jq '.[].tagName' |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -vxF "$GITHUB_REF_NAME" || true
+            echo "$GITHUB_REF_NAME"
+          } | sort -V | awk -v tag="$GITHUB_REF_NAME" '$0 == tag { print last; exit } { last = $0 }')"
+          [[ -n $previous ]] || { echo "no release before $GITHUB_REF_NAME" >&2; exit 1; }
+          [[ -d packaging/tests/previous/$previous ]] ||
+            { echo "packaging/tests/previous/$previous is missing: vendor $previous's install.sh (and update.sh)" >&2; exit 1; }
+          for dir in packaging/tests/previous/v*; do
+            tag="${dir##*/}"
+            for file in "$dir"/*; do
+              name="${file##*/}"
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$name" --output "/tmp/$tag-$name"
+              cmp "$file" "/tmp/$tag-$name" || { echo "$file is not $tag's published $name" >&2; exit 1; }
+            done
+          done
       # Two test binaries at a time, as ci.yml says why.
       - name: test
         run: bazel test --keep_going --lockfile_mode=error --test_output=errors --local_test_jobs=2 //...
@@ -108,7 +134,9 @@ jobs:
             done
           done
           install -m 0644 packaging/systemd/tally-feed.service packaging/systemd/tally-relay.service \
+            packaging/systemd/tally-feed-update.service packaging/systemd/tally-feed-update.timer \
             packaging/seeds dist/
+          install -m 0755 packaging/update.sh dist/
           release="https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME"
           sed "s#^PUBLISHED_RELEASE=\"\"\$#PUBLISHED_RELEASE=\"$release\"#" packaging/install.sh > dist/install.sh
           grep -q "^PUBLISHED_RELEASE=\"$release\"$" dist/install.sh
@@ -124,7 +152,7 @@ jobs:
       # v2.2.3, pinned by commit.
       - uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2
         with:
-          subject-path: 'dist/tally-*-linux, dist/*.service, dist/seeds, dist/install.sh'
+          subject-path: 'dist/tally-*-linux, dist/*.service, dist/*.timer, dist/seeds, dist/install.sh, dist/update.sh'
       # The feeder's image is the binaries just signed, copied onto distroless (no RUN), so it
       # needs no emulation for arm64 or arm/v7; the map image installs Debian's packages (a RUN),
       # so its arm64 half runs under QEMU, registered before buildx makes its builder.
