@@ -147,7 +147,11 @@ pub const STUBS: &[(&str, &str)] = &[
 echo "$*" >> "$TEST_DIR/systemctl.log"
 case "$1" in
   --version) echo 'systemd 247 (247.3-7+deb11u4)' ;;
-  show) echo 0123456789abcdef ;;
+  show)
+    # A property a test sets ($TEST_DIR/show-NAME, as `systemctl show -p NAME --value`), else the
+    # invocation's id every earlier installer reads.
+    if [ -f "$TEST_DIR/show-$3" ]; then cat "$TEST_DIR/show-$3"; else echo 0123456789abcdef; fi
+    ;;
   is-active) [ ! -f "$TEST_DIR/inactive" ] ;;
   is-enabled)
     shift
@@ -171,7 +175,7 @@ esac
     ),
     (
         "journalctl",
-        "#!/bin/sh\ncase \"$*\" in\n  *_SYSTEMD_INVOCATION_ID=*) cat \"$TEST_DIR/journal\" 2>/dev/null ;;\n  *) echo 'the journal tail' ;;\nesac\nexit 0\n",
+        "#!/bin/sh\necho \"$*\" >> \"$TEST_DIR/journalctl.log\"\ncase \"$*\" in\n  *_SYSTEMD_INVOCATION_ID=* | *'-o cat'*) cat \"$TEST_DIR/journal\" 2>/dev/null ;;\n  *) echo 'the journal tail' ;;\nesac\nexit 0\n",
     ),
     (
         "curl",
@@ -385,9 +389,25 @@ impl Sandbox {
         Ok(out.lines().last().unwrap_or_default().to_owned())
     }
 
-    /// A release in `release/` (a fake `tally-feed`, the units and the updater) and a seed list,
-    /// as an install reads them; `INSTALL` signs it.
+    /// The release's geoid grid (`TALLY_GEOID`, packaging/geoid), gzipped into `release/` as the
+    /// release workflow publishes it.
+    pub fn geoid(&self) -> Result {
+        let geoid = path_of("TALLY_GEOID")?;
+        let gzipped = io(Command::new("gzip").arg("-9nc").arg(&geoid).output())?;
+        if !gzipped.status.success() {
+            return Err(format!("gzip {}: {:?}", geoid.display(), gzipped.status));
+        }
+        io(std::fs::create_dir_all(self.dir.join("release")))?;
+        io(std::fs::write(
+            self.dir.join("release/geoid.txt.gz"),
+            gzipped.stdout,
+        ))
+    }
+
+    /// A release in `release/` (a fake `tally-feed`, the units, the updater and the geoid grid)
+    /// and a seed list, as an install reads them; `INSTALL` signs it.
     pub fn release(&self) -> Result {
+        self.geoid()?;
         self.file(
             "release/tally-feed-x86_64-linux",
             &format!("#!/bin/sh\n[ \"$1\" = init ] && touch \"$3\" && echo '{PUBLIC}'\nexit 0\n"),

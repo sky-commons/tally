@@ -12,6 +12,7 @@
 pub mod acars;
 pub mod config;
 pub mod delivery_check;
+pub mod geoid;
 pub mod health;
 pub mod lines;
 pub mod precision;
@@ -337,7 +338,8 @@ mod tests {
             "--acars-ceiling",
             "20000",
         ];
-        let config::Command::Run(config) = config::parse(args.iter().map(|arg| (*arg).to_owned()))?
+        let config::Command::Run(config, _) =
+            config::parse(args.iter().map(|arg| (*arg).to_owned()))?
         else {
             return Err("not a run".to_owned());
         };

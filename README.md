@@ -97,8 +97,13 @@ As a container (`ghcr.io/sky-commons/tally-feed`, signed like the binaries), see
 
 ```sh
 tally-feed init --key /etc/tally/key            # once: creates the key, prints its public half
-tally-feed --key /etc/tally/key --lat 37.41 --lon -122.10 --alt 12   # the release's relays are built in
+tally-feed --key /etc/tally/key --lat 37.41 --lon -122.10 --alt-msl 12   # the release's relays are built in
 ```
+
+`--alt` is the antenna's height above the WGS84 ellipsoid, which MLAT needs; `--alt-msl` takes
+its height above sea level, what maps, phones and adsb.im give, and converts it with the EGM2008
+geoid grid built into the feeder. The installer takes every altitude as above sea level and
+converts it the same way.
 
 Your receiver's exact location (with its altitude) goes only to relays, because multilateration
 (locating aircraft that do not broadcast a position) needs it exact. It is never in anything a
