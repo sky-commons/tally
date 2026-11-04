@@ -1119,6 +1119,8 @@ container_route() {
     printf 'No altitude was found: fill in ALT_MSL=, the antenna'\''s height above sea level, as 15m or 45ft\n(MLAT needs a real one).\n'
   fi
   printf '%s\n' "$(privacy_line)"
+  printf ':0 is the highest 0.x release: docker compose pull && docker compose up -d (or Watchtower)\n'
+  printf 'moves the feeder to each new one. Name :vX.Y.Z instead to choose when it changes.\n'
   printf 'The feeder makes its key in that volume (keep it: it is the station'\''s name for good), and\n'
   printf 'docker logs tally-feed shows its public key and station page. More, in "Run it as a container":\n'
   printf '  https://github.com/sky-commons/tally/blob/main/packaging/README.md#run-it-as-a-container\n'

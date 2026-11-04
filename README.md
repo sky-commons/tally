@@ -81,7 +81,10 @@ one.
 fails the build if a release cannot upgrade the installs before it. Relays accept every feeder
 version ever released, so a receiver that missed updates still feeds (RFC-0203 §4, §5).
 Automatic updates cover the standalone install above. A feeder run as a container (adsb.im, a
-compose file) follows its image tag instead (below).
+compose file) runs whatever its image tag names: `ghcr.io/sky-commons/tally-feed:0` moves to each
+0.x release, and Watchtower or a `docker compose pull && docker compose up -d` routine keeps the
+feeder on it. Pin `:vX.Y.Z` to choose when it changes
+([packaging/README.md](packaging/README.md#run-it-as-a-container)).
 
 **A feeder needs no time daemon setup**, and a host running
 [AWS ClockBound](https://github.com/aws/clock-bound) is used as a clock reference (RFC-0171 §3.6).
