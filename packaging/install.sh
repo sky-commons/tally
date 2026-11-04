@@ -118,7 +118,7 @@
 #                                    none it deletes the key only with TALLY_PURGE_KEY=yes
 set -euo pipefail
 
-VERSION="v0.7.4"
+VERSION="v0.7.5"
 # Where this release is published, whose `tally-feed` binaries, unit and seed list this script
 # installs. The source names no publisher: the publisher writes its release's address here when it
 # publishes it, and TALLY_RELEASE overrides it.
