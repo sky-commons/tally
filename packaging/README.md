@@ -42,6 +42,18 @@ Raspberry Pi OS Bullseye and anything newer).
     counts as unset (only `TALLY_ALT=0` says 0), and with none found it is asked for on the
     terminal, or, with no terminal, the install stops naming `TALLY_ALT`, having installed
     nothing. A position found nowhere is handled the same way.
+  - **Altitude datum:** every altitude found or given (`TALLY_ALT`, the terminal, adsb.im's
+    `FEEDER_ALT_M`, which it calls "Altitude above mean sealevel", readsb's, a feed client's,
+    ultrafeeder's) is taken as the antenna's height above sea level, and turned into the height
+    above the WGS84 ellipsoid that `tally-feed --alt` is and MLAT needs, by adding the geoid's
+    height there from the release's `geoid.txt.gz` (EGM2008, signed with the release). The block
+    in `/etc/default/tally-feed` holds the converted value and says how it was found. What an
+    earlier run wrote is above the ellipsoid already and is kept exactly, by every rerun and
+    automatic update, while the location is the one it was written for and no `TALLY_ALT` (or
+    address) names another, so no release moves a receiver's altitude by itself. A release
+    before v0.7.5 wrote a sea-level value as it was; a rerun says so and how to have it
+    converted (`TALLY_ALT=` the same value). A height above the ellipsoid you know already (a
+    survey GPS) goes in `TALLY_FEED_EXTRA` as `--alt`.
   - **Location from an address** (RFC-0204), for an owner who does not know the antenna's
     coordinates or its height above the WGS84 ellipsoid: `install.sh --locate` asks for the
     street address (whatever was found before), `TALLY_ADDRESS="..."` gives it with no terminal,
@@ -79,8 +91,12 @@ Raspberry Pi OS Bullseye and anything newer).
   - **Start:** starts the service and waits up to 20 s for it to be active and log
     `tally-feed: publishing to RELAY`. Only then does it say it is installed, print the public key
     and the station page, `https://tally.skycommons.org/feeders/<key>` (the key as base64url
-    without padding), and exit 0. Otherwise it prints the journal's tail and what to do next, and
-    exits 1; the feeder keeps trying on its own.
+    without padding), and exit 0. Otherwise it prints why (a feeder that keeps crashing is
+    called that, with its error, as soon as systemd restarts it: `Restart=always` would count it
+    active), the feeder's log since this run started it, the public key and station page all the
+    same, and what to do next, and exits 1; the feeder keeps trying on its own. A relay it cannot
+    reach is in that log within seconds (`could not reach relay HOST:PORT: why`). readsb's
+    location, when the owner said yes to it, is set before the wait, so it is set either way.
 
   - **Automatic updates:** installs the updater, and turns it on unless `TALLY_AUTO_UPDATE=0` or
     `--no-auto-update` says otherwise, or an earlier install left it off. It ends by saying which,
@@ -90,12 +106,17 @@ Raspberry Pi OS Bullseye and anything newer).
   `install.sh --uninstall` stops the feeder and its updater and removes their units, the binary,
   the updater and cosign (`/usr/local/lib/tally`), what the feeder learned and
   `/etc/default/tally-feed`, keeping the key, so installing again is the same station; `install.sh --uninstall --purge` deletes the key as well, after saying that
-  the station's identity is then gone for good (on a terminal it asks you to type `delete`).
+  the station's identity is then gone for good (on a terminal it asks you to type `delete`; with
+  no terminal it deletes the key only with `TALLY_PURGE_KEY=yes`, and otherwise removes nothing).
 - `systemd/tally-feed.service` runs the feeder as a dynamic user with no listening socket, at most
   64 MB and 20% of one CPU. The key reaches it through `LoadCredential`, so it stays root's; the
   service reads it from `${CREDENTIALS_DIRECTORY}`, which systemd 247 sets (the `%d` specifier for
   it is 248's). `SocketBindDeny=` is 249's: an older systemd skips it with a warning. The
   arguments are `TALLY_FEED_ARGS` then `TALLY_FEED_EXTRA` in `/etc/default/tally-feed`.
+  Where systemd itself runs in a container (Docker, LXC), it cannot hand the credential to the
+  dynamic user (`/run/credentials/tally-feed.service/key: Permission denied`), and the installer
+  says so and points to the container image ("Run it as a container") instead of weakening the
+  unit.
 - `systemd/tally-relay.service` runs a relay the same way, with its key at `/etc/tally/relay.key`
   (`tally-relay keygen > /etc/tally/relay.key`) and its arguments as `TALLY_RELAY_ARGS` in
   `/etc/default/tally-relay`. Its upload cap is `TALLY_RELAY_MAX_UPLOAD` there too; the unit's
@@ -192,7 +213,7 @@ block of environment variables. Beside ultrafeeder, with adsb.im's location vari
       - BEASTHOST=ultrafeeder
       - LAT=${FEEDER_LAT}
       - LONG=${FEEDER_LONG}
-      - ALT=${FEEDER_ALT_M}m
+      - ALT_MSL=${FEEDER_ALT_M}m
     volumes:
       - /opt/adsb/tally-feed:/var/lib/tally-feed
 ```
@@ -201,12 +222,18 @@ That is all of it: no key to make or paste, and no relay to name.
 
 - **Decoder:** `BEASTHOST`, and `BEASTPORT` (default 30005), name readsb's BEAST output, here
   ultrafeeder's on the compose network, so port 30005 need not be published on the host.
-- **Location:** `LAT` and `LONG` (or `READSB_LAT` and `READSB_LON`) in degrees, and `ALT` (or
-  `READSB_ALT`) as ultrafeeder takes it, `15m` or `45ft` (a bare number is metres). Only Tally
-  relays get the position exactly, as MLAT needs; nothing a data user reads contains it, and public
-  surfaces (the map, station pages, the API) show only its public cell, about 6 km across. An
-  empty variable counts as unset, so a missing
-  `${FEEDER_ALT_M}` leaves `ALT=m`, which the feeder refuses by name rather than guessing 0 m.
+- **Location:** `LAT` and `LONG` (or `READSB_LAT` and `READSB_LON`) in degrees, and the
+  altitude, `15m` or `45ft` (a bare number is metres), as one of: `ALT_MSL`, the antenna's height
+  above sea level, which is what adsb.im's `FEEDER_ALT_M` is, turned into the height above the
+  WGS84 ellipsoid with the EGM2008 geoid grid built into the feeder (v0.7.5 and later); or `ALT`
+  (or `READSB_ALT`), the height above the ellipsoid itself, as mlat-client's `--alt` takes it,
+  passed as it is (as it always was). Use `ALT_MSL` unless you know the ellipsoidal height. Only
+  Tally relays get the position exactly, as MLAT needs; nothing a data user reads contains it,
+  and public surfaces (the map, station pages, the API) show only its public cell, about 6 km
+  across. An empty variable counts as unset, so a missing `${FEEDER_ALT_M}` leaves `ALT_MSL=m`,
+  which the feeder refuses by name, saying the variable is unset, rather than guessing 0 m. A
+  feeder with no `LAT` and `LONG`, or with no altitude, runs (it still publishes what it hears)
+  and logs a warning at every start saying what it lacks.
 - **Identity:** on the first run the feeder makes its key in the volume
   (`/var/lib/tally-feed/key`), and every start logs the receiver's public key and its station page,
   `https://tally.skycommons.org/feeders/<key>` (`docker logs tally-feed`). Keep the volume: the

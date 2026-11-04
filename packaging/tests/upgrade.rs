@@ -13,7 +13,9 @@
 //!
 //! After it, the receiver runs the new feeder, which starts with the arguments the upgrade left
 //! (its log names the receiver by the key it had), the key is the one it had, and the location,
-//! the owner's flag and their choice about automatic updates are as they were.
+//! the owner's flag and their choice about automatic updates are as they were. The altitude is
+//! exactly the one the earlier install wrote, though the receiver's adsb.im setup gives the same
+//! place another one, above sea level, which an install converts (v0.7.5): no upgrade moves it.
 
 mod sandbox;
 
@@ -121,6 +123,7 @@ fn release_this_build(sandbox: &Sandbox, tag: &str) -> Result {
     )?;
     sandbox.copy(&path_of("TALLY_FEED")?, "release/tally-feed-x86_64-linux")?;
     sandbox.copy(&updater()?, "release/update.sh")?;
+    sandbox.geoid()?;
     for unit in [
         "tally-feed.service",
         "tally-feed-update.service",
@@ -175,6 +178,8 @@ fn upgrade(from: &Previous, on: bool) -> Result {
     ] {
         sandbox.file(&format!("release/{unit}"), text)?;
     }
+    // Published since v0.7.4; an earlier installer never reads it.
+    sandbox.geoid()?;
     match &from.updater {
         Some(updater) => sandbox.copy(updater, "release/update.sh")?,
         None => sandbox.file("release/update.sh", "#!/bin/sh\n")?,
@@ -200,6 +205,18 @@ fn upgrade(from: &Previous, on: bool) -> Result {
         return Err(format!("{case}: no TALLY_FEED_EXTRA in {written}\n{out}"));
     }
     sandbox.file(defaults, &written)?;
+    // The altitude the earlier install wrote, which every upgrade keeps.
+    let alt = written
+        .lines()
+        .find(|line| line.starts_with("TALLY_FEED_ARGS="))
+        .and_then(|line| line.split(" --alt ").nth(1))
+        .map(|rest| rest.trim_end_matches('"').to_owned())
+        .ok_or_else(|| format!("{case}: no --alt in {written}"))?;
+    // The receiver's adsb.im setup names the same place and its own altitude, above sea level.
+    sandbox.file(
+        "root/opt/adsb/config/.env",
+        "FEEDER_LAT=51.5\nFEEDER_LONG=-0.1\nFEEDER_ALT_M=31\n",
+    )?;
     let had_updater = sandbox.exists("root/usr/local/lib/tally/update");
     let enabled_before = sandbox.exists(TIMER_ENABLED);
 
@@ -234,10 +251,10 @@ fn upgrade(from: &Previous, on: bool) -> Result {
     // Its settings: the location, the owner's flag, one block.
     let written = sandbox.read(defaults)?;
     for kept in [
-        "--lat 51.5 --lon -0.1 --alt 20\"",
-        "TALLY_FEED_EXTRA=\"--clock beast\"",
+        format!("--lat 51.5 --lon -0.1 --alt {alt}\""),
+        "TALLY_FEED_EXTRA=\"--clock beast\"".to_owned(),
     ] {
-        if !written.contains(kept) {
+        if !written.contains(&kept) {
             return Err(format!("{case}: {kept} is gone from {written}"));
         }
     }

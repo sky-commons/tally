@@ -1517,6 +1517,45 @@ struct Publisher {
     pacing: Pacing,
     events: mpsc::Sender<Event>,
     tasks: JoinSet<()>,
+    /// Which relays' failed probes the log was told of before any relay answered ([`Unreached`]).
+    unreached: Arc<Unreached>,
+}
+
+/// Until a probe of any relay first succeeds, each relay a probe could not reach is told to the
+/// log at once, with its address and why, once: the owner of a feeder whose firewall keeps it from
+/// every relay learns so in its first seconds, not only from health's warning ten minutes on
+/// (`health::UNREACHABLE_AFTER`). Once one has answered, a failed probe is the network's ordinary
+/// churn, and the log is not told.
+#[derive(Default)]
+pub struct Unreached {
+    told: Mutex<(bool, HashSet<String>)>,
+}
+
+impl Unreached {
+    /// What the log is told after a round in which `reached` probes succeeded and `failed` did
+    /// not (each an address and why): a line for each relay not told of before, while none has
+    /// ever answered.
+    pub fn after_round(&self, reached: bool, failed: &[(String, String)]) -> Vec<String> {
+        let Ok(mut told) = self.told.lock() else {
+            return Vec::new();
+        };
+        let (answered, addresses) = &mut *told;
+        if *answered || reached {
+            *answered = true;
+            return Vec::new();
+        }
+        failed
+            .iter()
+            .filter(|(address, _)| addresses.insert(address.clone()))
+            .map(|(address, error)| {
+                format!(
+                    "tally-feed: could not reach relay {address}: {error}. It keeps trying, and \
+                     publishes nothing until a relay answers: check that this host may open \
+                     outbound TCP connections to it"
+                )
+            })
+            .collect()
+    }
 }
 
 /// Publishes the feeder's batches for as long as it runs: probes every round, chooses, keeps a
@@ -1547,6 +1586,7 @@ pub async fn run(publishing: Publishing) {
         pacing: publishing.pacing,
         events,
         tasks: JoinSet::new(),
+        unreached: Arc::default(),
     };
     // Rounds come every `ROUND_EVERY`, except while the feeder holds no relay at all: then the
     // next round is the reconnect backoff's (one second, doubling to the round), so a feeder
@@ -1672,16 +1712,24 @@ impl Publisher {
         let clocks = Arc::clone(&self.clocks);
         let events = self.events.clone();
         let prober = self.prober;
+        let unreached = Arc::clone(&self.unreached);
         self.tasks.spawn(async move {
             let mut probes = JoinSet::new();
             for relay in candidates {
-                probes.spawn(prober(relay, identity.clone(), Arc::clone(&clocks)));
+                let address = relay.address.clone();
+                let probing = prober(relay, identity.clone(), Arc::clone(&clocks));
+                probes.spawn(async move { (address, probing.await) });
             }
-            let mut probed = Vec::new();
+            let (mut probed, mut failed) = (Vec::new(), Vec::new());
             while let Some(done) = probes.join_next().await {
-                if let Ok(Ok(result)) = done {
-                    probed.push(result);
+                match done {
+                    Ok((_, Ok(result))) => probed.push(result),
+                    Ok((address, Err(error))) => failed.push((address, error)),
+                    Err(_) => {}
                 }
+            }
+            for line in unreached.after_round(!probed.is_empty(), &failed) {
+                eprintln!("{line}");
             }
             let _ = events.send(Event::Probed(probed)).await;
         });
@@ -2735,6 +2783,49 @@ mod tests {
     /// How long a test waits for the event it asserts before calling it a hang: a guard on a
     /// feeder that never gets there, never a verdict on how fast the machine running the test is.
     const HANG: Duration = Duration::from_secs(120);
+
+    /// A feeder no relay has answered says so for each relay at once, once; once any has answered,
+    /// it says nothing of failed probes again.
+    #[test]
+    fn failed_probes_are_told_until_a_relay_first_answers() {
+        let unreached = Unreached::default();
+        let refused = |address: &str| {
+            (
+                address.to_owned(),
+                "Connection refused (os error 111)".to_owned(),
+            )
+        };
+        let first = unreached.after_round(
+            false,
+            &[refused("a.example:10900"), refused("b.example:10900")],
+        );
+        assert_eq!(first.len(), 2, "{first:?}");
+        assert!(
+            first[0].contains("could not reach relay a.example:10900: Connection refused"),
+            "{first:?}"
+        );
+        assert!(
+            unreached
+                .after_round(false, &[refused("a.example:10900")])
+                .is_empty()
+        );
+        assert_eq!(
+            unreached
+                .after_round(false, &[refused("c.example:10900")])
+                .len(),
+            1
+        );
+        assert!(
+            unreached
+                .after_round(true, &[refused("d.example:10900")])
+                .is_empty()
+        );
+        assert!(
+            unreached
+                .after_round(false, &[refused("e.example:10900")])
+                .is_empty()
+        );
+    }
 
     fn key() -> Result<PublicKey, String> {
         Ok(Identity::generate()

@@ -29,8 +29,11 @@ pub fn seeds() -> Result<Vec<RelayAddress>, String> {
 ///
 /// - `BEASTHOST`, `BEASTPORT` (default 30005): `--source BEASTHOST:BEASTPORT`.
 /// - `LAT` or `READSB_LAT`, `LONG` or `READSB_LON`: `--lat`, `--lon`.
-/// - `ALT` or `READSB_ALT`: `--alt`, a bare number or with `m` or `ft` (`15m`, `45ft`), as
-///   ultrafeeder takes it and hands it to mlat-client.
+/// - `ALT` or `READSB_ALT`: `--alt`, the antenna's height above the WGS84 ellipsoid, a bare
+///   number or with `m` or `ft` (`15m`, `45ft`), as ultrafeeder takes it and hands it to
+///   mlat-client (whose `--alt` is the ellipsoid's).
+/// - `ALT_MSL`: `--alt-msl`, the antenna's height above sea level, as adsb.im's `FEEDER_ALT_M`
+///   gives it, turned into the height above the ellipsoid by the release's geoid grid (`geoid`).
 /// - `TALLY_KEY`: the identity's text, as `--key-env TALLY_KEY`.
 /// - `TALLY_STATE`: `--state`.
 ///
@@ -44,6 +47,7 @@ pub const ENVIRONMENT: &[&str] = &[
     "READSB_LON",
     "ALT",
     "READSB_ALT",
+    "ALT_MSL",
     "TALLY_KEY",
     "TALLY_STATE",
 ];
@@ -62,6 +66,7 @@ usage: tally-feed [--key FILE | --key-env NAME] [options]
        tally-feed health [--state DIR] say whether the feeder running with this state directory
                                        is publishing to a relay and reading its decoder (exit 0)
                                        or not (exit 1), from the status file it keeps there
+       tally-feed --version            print the version
 
   --key FILE             this receiver's identity (keep it: it is the antenna's name forever)
   --key-env NAME         the same identity, read from the environment variable NAME instead of a
@@ -86,10 +91,15 @@ usage: tally-feed [--key FILE | --key-env NAME] [options]
                          (default /var/lib/tally-feed)
   --lat DEG --lon DEG --alt ALT
                          the antenna's position, sent exactly only to Tally relays (MLAT
-                         needs it exact); ALT is the height as mlat-client takes it, a bare
-                         number or with a unit: 34, 34m, 112ft (feet are converted to the
-                         nearest metre). No client is sent it: public surfaces (the map,
-                         station pages, the API) show only its public cell, about 6 km across
+                         needs it exact). ALT is the antenna's height above the WGS84
+                         ellipsoid, not sea level (as mlat-client's --alt), a bare number or
+                         with a unit: 34, 34m, 112ft (feet are converted to the nearest
+                         metre). No client is sent it: public surfaces (the map, station
+                         pages, the API) show only its public cell, about 6 km across
+  --alt-msl ALT          instead of --alt: the antenna's height above mean sea level, which
+                         is what most setups give (adsb.im's FEEDER_ALT_M, a map, a phone),
+                         turned into the height above the ellipsoid with the EGM2008 geoid
+                         grid built in (within 2 m on land)
   --precision M          expert only: round the position to a grid of M-metre cells before
                          anything is signed or sent, so not even relay operators see the exact
                          one (latitude to the nearest M metres from the equator, longitude to
@@ -105,8 +115,9 @@ usage: tally-feed [--key FILE | --key-env NAME] [options]
 
 The environment configures what no flag does, as an sdr-enthusiasts container is configured:
 BEASTHOST and BEASTPORT (default 30005) for --source, LAT (or READSB_LAT), LONG (or READSB_LON)
-and ALT (or READSB_ALT) for the position, TALLY_KEY and TALLY_STATE. A flag always wins;
---precision is a flag only.
+and ALT (or READSB_ALT: above the ellipsoid, as --alt) or ALT_MSL (above sea level, as
+--alt-msl) for the position, TALLY_KEY and TALLY_STATE. A flag always wins; --precision is a
+flag only.
 ";
 
 pub enum Command {
@@ -114,9 +125,14 @@ pub enum Command {
     NewKey,
     /// `health`: judge the status file in this state directory (`health::check`).
     Health(PathBuf),
-    Run(Box<Config>),
+    /// Run the feeder with this configuration, having logged the warnings beside it: what the
+    /// configuration lacks that a feeder still runs without (`warnings`).
+    Run(Box<Config>, Vec<String>),
     Done,
 }
+
+/// The version `--version` prints.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Where the receiver's identity is read from: exactly one of `--key` and `--key-env`. Either holds
 /// the same text, the identity's secret in base64 as `init` writes it and `new-key` prints it.
@@ -214,6 +230,9 @@ pub fn parse_with(
         deflate_level: None,
     };
     let (mut lat, mut lon, mut alt, mut precision) = (None, None, None, None);
+    // An altitude above sea level (`--alt-msl`), turned into one above the ellipsoid once the
+    // position is known.
+    let mut alt_msl: Option<(String, f64)> = None;
     let (mut source, mut state) = (false, false);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -238,6 +257,7 @@ pub fn parse_with(
             "--lat" => lat = Some(degrees(&flag, &value()?, 90.0)?),
             "--lon" => lon = Some(degrees(&flag, &value()?, 180.0)?),
             "--alt" => alt = Some(altitude(&flag, &value()?)?),
+            "--alt-msl" => alt_msl = Some((flag.clone(), metres(&flag, &value()?)?)),
             "--precision" => precision = Some(number(&flag, &value()?)?),
             "--clock" => {
                 let name = value()?;
@@ -247,6 +267,10 @@ pub fn parse_with(
             "--ceiling" => config.ceiling = number(&flag, &value()?)?,
             "-h" | "--help" => {
                 print!("{USAGE}");
+                return Ok(Command::Done);
+            }
+            "-V" | "--version" => {
+                println!("tally-feed {VERSION}");
                 return Ok(Command::Done);
             }
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
@@ -317,10 +341,34 @@ pub fn parse_with(
     {
         lon = Some(degrees(&name, text.trim(), 180.0)?);
     }
-    if alt.is_none()
-        && let Some((name, text)) = either("ALT", "READSB_ALT")
-    {
-        alt = Some(altitude(&name, &text)?);
+    if alt.is_some() && alt_msl.is_some() {
+        return Err(
+            "--alt (above the ellipsoid) and --alt-msl (above sea level) both give the altitude: \
+             give one"
+                .to_owned(),
+        );
+    }
+    if alt.is_none() && alt_msl.is_none() {
+        let ellipsoidal = either("ALT", "READSB_ALT");
+        let sea_level = env("ALT_MSL");
+        match (ellipsoidal, sea_level) {
+            (Some((name, _)), Some(_)) => {
+                return Err(format!(
+                    "{name} (above the ellipsoid) and ALT_MSL (above sea level) both give the \
+                     altitude: give one"
+                ));
+            }
+            (Some((name, text)), None) => {
+                alt = Some(altitude(&name, &env_altitude(&name, &text)?)?)
+            }
+            (None, Some(text)) => {
+                alt_msl = Some((
+                    "ALT_MSL".to_owned(),
+                    metres("ALT_MSL", &env_altitude("ALT_MSL", &text)?)?,
+                ));
+            }
+            (None, None) => {}
+        }
     }
     if key_file.is_none() && key_env.is_none() && env(KEY_VARIABLE).is_some() {
         key_env = Some(KEY_VARIABLE.to_owned());
@@ -337,17 +385,63 @@ pub fn parse_with(
         }
     };
     config.seeds = seeds()?;
+    let mut warnings = Vec::new();
     config.location = match (lat, lon) {
-        (Some(lat_e7), Some(lon_e7)) => Some(Location {
-            lat_e7,
-            lon_e7,
-            alt_m: alt.unwrap_or(0),
-            precision_m: precision.unwrap_or(0),
-        }),
-        (None, None) => None,
+        (Some(lat_e7), Some(lon_e7)) => {
+            if let Some((name, msl)) = alt_msl {
+                alt = Some(above_ellipsoid(&name, msl, lat_e7, lon_e7)?);
+            }
+            if alt.is_none() {
+                warnings.push(
+                    "warning: no altitude (--alt, or ALT or ALT_MSL in a container), so relays \
+                     take the antenna to be at 0 m above the ellipsoid and its MLAT is off by as \
+                     much: give the antenna's height above sea level as ALT_MSL (15m, 45ft) or \
+                     --alt-msl"
+                        .to_owned(),
+                );
+            }
+            Some(Location {
+                lat_e7,
+                lon_e7,
+                alt_m: alt.unwrap_or(0),
+                precision_m: precision.unwrap_or(0),
+            })
+        }
+        (None, None) => {
+            warnings.push(
+                "warning: no position (--lat and --lon, or LAT and LONG in a container), so \
+                 relays can use this receiver for no MLAT and it belongs to no area: it publishes \
+                 what it hears, and nothing places it. Give the antenna's LAT, LONG and ALT_MSL"
+                    .to_owned(),
+            );
+            None
+        }
         _ => return Err("--lat and --lon (LAT and LONG) go together".to_owned()),
     };
-    Ok(Command::Run(Box::new(config)))
+    Ok(Command::Run(Box::new(config), warnings))
+}
+
+/// An environment variable's altitude text, refused by name, saying why, when it is a unit with no
+/// number: what a compose file's `ALT=${FEEDER_ALT_M}m` leaves when the variable is unset.
+fn env_altitude(name: &str, text: &str) -> Result<String, String> {
+    let trimmed = text.trim();
+    if trimmed == "m" || trimmed == "ft" {
+        return Err(format!(
+            "{name} is {trimmed:?}, a unit with no number: the variable the compose file builds \
+             it from (as in {name}=${{FEEDER_ALT_M}}m) is unset or empty. Set the antenna's \
+             altitude (in adsb.im, its setup page) or give it here, as ALT_MSL=15m: its height \
+             above sea level"
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// The height above the WGS84 ellipsoid, whole metres, of an antenna `msl` metres above sea level
+/// at `lat_e7`, `lon_e7`: `msl` plus the geoid's height there (`geoid`).
+fn above_ellipsoid(name: &str, msl: f64, lat_e7: i32, lon_e7: i32) -> Result<i32, String> {
+    let n = crate::geoid::undulation(f64::from(lat_e7) / 1e7, f64::from(lon_e7) / 1e7)
+        .map_err(|error| format!("{name}: {error}"))?;
+    whole_metres(name, &format!("{msl}"), msl + n)
 }
 
 /// Why a retired flag is refused, and what replaces it.
@@ -382,6 +476,11 @@ fn number<T: std::str::FromStr>(flag: &str, text: &str) -> Result<T, String> {
 /// An altitude to whole metres: a bare number or `<n>m` is metres, `<n>ft` is feet, each rounded
 /// to the nearest metre (mlat-client's `--alt` format, so one value serves both).
 fn altitude(flag: &str, text: &str) -> Result<i32, String> {
+    whole_metres(flag, text, metres(flag, text)?)
+}
+
+/// An altitude's metres, unrounded: a bare number or `<n>m` is metres, `<n>ft` is feet.
+fn metres(flag: &str, text: &str) -> Result<f64, String> {
     let (number_text, metres_per_unit) = match text.trim() {
         feet if feet.ends_with("ft") => (&feet[..feet.len() - 2], 0.3048),
         metres if metres.ends_with('m') => (&metres[..metres.len() - 1], 1.0),
@@ -391,7 +490,12 @@ fn altitude(flag: &str, text: &str) -> Result<i32, String> {
         .trim()
         .parse()
         .map_err(|_| format!("{flag}: {text} is not an altitude (34, 34m or 112ft)"))?;
-    let metres = (value * metres_per_unit).round();
+    Ok(value * metres_per_unit)
+}
+
+/// `metres` rounded to the nearest whole metre, refused when it is no altitude at all.
+fn whole_metres(flag: &str, text: &str, metres: f64) -> Result<i32, String> {
+    let metres = metres.round();
     if !metres.is_finite() || metres < f64::from(i32::MIN) || metres > f64::from(i32::MAX) {
         return Err(format!("{flag}: {text} is out of range"));
     }
@@ -413,7 +517,7 @@ mod tests {
 
     fn run(args: &[&str]) -> Result<Config, String> {
         match parse(args.iter().map(|arg| (*arg).to_owned()))? {
-            Command::Run(config) => Ok(*config),
+            Command::Run(config, _) => Ok(*config),
             _ => Err("not a run".to_owned()),
         }
     }
@@ -448,7 +552,7 @@ mod tests {
                 .map(|(_, value)| value.clone())
         };
         match parse_with(args.iter().map(|arg| (*arg).to_owned()), &env)? {
-            Command::Run(config) => Ok(*config),
+            Command::Run(config, _) => Ok(*config),
             _ => Err("not a run".to_owned()),
         }
     }
@@ -786,6 +890,125 @@ mod relay_address_tests {
             (relay.address.as_str(), relay.key),
             ("relay.example:10900", key)
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod datum_tests {
+    use super::*;
+
+    fn parsed(args: &[&str], vars: &[(&str, &str)]) -> Result<(Config, Vec<String>), String> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        let env = move |name: &str| {
+            vars.iter()
+                .find(|(each, _)| each == name)
+                .map(|(_, value)| value.clone())
+        };
+        match parse_with(args.iter().map(|arg| (*arg).to_owned()), &env)? {
+            Command::Run(config, warnings) => Ok((*config, warnings)),
+            _ => Err("not a run".to_owned()),
+        }
+    }
+
+    fn alt_m(config: &Config) -> Result<i32, String> {
+        config
+            .location
+            .map(|location| location.alt_m)
+            .ok_or_else(|| "no location".to_owned())
+    }
+
+    const SAN_FRANCISCO: &[(&str, &str)] = &[("LAT", "37.778536"), ("LONG", "-122.41831")];
+
+    /// adsb.im's altitude is above sea level: ALT_MSL (or --alt-msl) adds the geoid's height there
+    /// (-32.53 m at San Francisco's City Hall), as the installer does. ALT keeps its meaning,
+    /// mlat-client's: above the ellipsoid, as given.
+    #[test]
+    fn sea_level_is_turned_into_height_above_the_ellipsoid() -> Result<(), String> {
+        let mut vars = SAN_FRANCISCO.to_vec();
+        vars.push(("ALT_MSL", "16m"));
+        let (config, warnings) = parsed(&[], &vars)?;
+        assert_eq!((alt_m(&config)?, warnings.len()), (16 - 33, 0));
+        vars.pop();
+        vars.push(("ALT_MSL", "52ft"));
+        assert_eq!(alt_m(&parsed(&[], &vars)?.0)?, -17);
+        vars.pop();
+        vars.push(("ALT", "16m"));
+        assert_eq!(alt_m(&parsed(&[], &vars)?.0)?, 16);
+        let flags = [
+            "--lat",
+            "37.778536",
+            "--lon",
+            "-122.41831",
+            "--alt-msl",
+            "16",
+        ];
+        assert_eq!(alt_m(&parsed(&flags, &[])?.0)?, -17);
+        // A flag wins over the environment, whichever datum either names.
+        assert_eq!(alt_m(&parsed(&flags, &[("ALT", "100")])?.0)?, -17);
+        let mut ellipsoidal = flags;
+        ellipsoidal[4] = "--alt";
+        assert_eq!(alt_m(&parsed(&ellipsoidal, &[("ALT_MSL", "100")])?.0)?, 16);
+        Ok(())
+    }
+
+    #[test]
+    fn two_altitudes_are_refused() {
+        let mut vars = SAN_FRANCISCO.to_vec();
+        vars.extend([("ALT", "16m"), ("ALT_MSL", "16m")]);
+        assert!(parsed(&[], &vars).is_err_and(|why| why.contains("give one")));
+        let flags = ["--lat", "1", "--lon", "2", "--alt", "3", "--alt-msl", "3"];
+        assert!(parsed(&flags, &[]).is_err_and(|why| why.contains("give one")));
+    }
+
+    /// `ALT=${FEEDER_ALT_M}m` with the variable unset is refused, saying so, never taken for 0.
+    #[test]
+    fn a_unit_with_no_number_says_the_variable_is_unset() {
+        for name in ["ALT", "READSB_ALT", "ALT_MSL"] {
+            for unit in ["m", "ft", " m "] {
+                let mut vars = SAN_FRANCISCO.to_vec();
+                vars.push((name, unit));
+                assert!(
+                    parsed(&[], &vars).is_err_and(|why| why.starts_with(name)
+                        && why.contains("unset or empty")
+                        && why.contains("ALT_MSL=")),
+                    "{name}={unit}"
+                );
+            }
+        }
+    }
+
+    /// A container with no position, or no altitude, still runs (no release may stop a running
+    /// feeder), and says what it lacks.
+    #[test]
+    fn a_missing_position_or_altitude_is_warned_of() -> Result<(), String> {
+        let (config, warnings) = parsed(&[], &[("BEASTHOST", "ultrafeeder")])?;
+        assert!(config.location.is_none());
+        assert!(
+            warnings.len() == 1 && warnings[0].contains("no position"),
+            "{warnings:?}"
+        );
+        let (config, warnings) = parsed(&[], SAN_FRANCISCO)?;
+        assert_eq!(alt_m(&config)?, 0);
+        assert!(
+            warnings.len() == 1 && warnings[0].contains("no altitude"),
+            "{warnings:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn version_is_a_command() -> Result<(), String> {
+        for flag in ["--version", "-V"] {
+            assert!(matches!(
+                parse([flag.to_owned()].into_iter())?,
+                Command::Done
+            ));
+        }
+        assert!(!VERSION.is_empty());
         Ok(())
     }
 }
