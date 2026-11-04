@@ -17,7 +17,9 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Command;
 
-use sandbox::{INSTALL, RELAY_KEY, Result, Sandbox, borrowed, install_env, installer, io, updater};
+use sandbox::{
+    INSTALL, PUBLIC, RELAY_KEY, Result, Sandbox, borrowed, install_env, installer, io, updater,
+};
 
 /// The installer's refusal (its stderr) run with `env` and `path` first on its PATH; an error if
 /// it did not stop.
@@ -124,7 +126,7 @@ fn a_rerun_rewrites_its_own_block_and_keeps_the_owners_flags() -> Result {
     sandbox.ok(INSTALL, &borrowed(&second))?;
     let written = sandbox.read(defaults)?;
     assert!(
-        written.contains("--lat 48.25 --lon 11.5 --alt 500\""),
+        written.contains("--lat 48.25 --lon 11.5 --alt 546\""),
         "{written}"
     );
     assert!(!written.contains("51.5"), "{written}");
@@ -144,7 +146,7 @@ fn a_rerun_rewrites_its_own_block_and_keeps_the_owners_flags() -> Result {
     sandbox.ok(INSTALL, &borrowed(&third))?;
     let written = sandbox.read(defaults)?;
     assert!(
-        written.contains("--lat 48.25 --lon 11.5 --alt 500\""),
+        written.contains("--lat 48.25 --lon 11.5 --alt 546\""),
         "{written}"
     );
     Ok(())
@@ -388,7 +390,7 @@ fn an_install_waits_for_publishing_and_prints_the_station_page() -> Result {
     let written = sandbox.read("root/etc/default/tally-feed")?;
     assert!(
         written.contains(&format!(
-            "TALLY_FEED_ARGS=\"--relay relay.example:10900={RELAY_KEY} --lat 51.5 --lon -0.1 --alt 20\""
+            "TALLY_FEED_ARGS=\"--relay relay.example:10900={RELAY_KEY} --lat 51.5 --lon -0.1 --alt 66\""
         )),
         "{written}"
     );
@@ -427,7 +429,7 @@ fn an_install_names_each_acars_router_output_it_finds_and_adds_none() -> Result 
     let written = sandbox.read("root/etc/default/tally-feed")?;
     assert!(
         written.contains(&format!(
-            "TALLY_FEED_ARGS=\"--relay relay.example:10900={RELAY_KEY} --lat 51.5 --lon -0.1 --alt 20\""
+            "TALLY_FEED_ARGS=\"--relay relay.example:10900={RELAY_KEY} --lat 51.5 --lon -0.1 --alt 66\""
         )),
         "{written}"
     );
@@ -487,7 +489,7 @@ fn an_ultrafeeder_container_with_no_host_beast_gets_the_compose_route() -> Resul
         "- BEASTHOST=ultrafeeder",
         "- LAT=47.6",
         "- LONG=-122.3",
-        "- ALT=120m",
+        "- ALT_MSL=120m",
         "Your exact location goes only to Tally relays, for MLAT.",
     ] {
         assert!(out.contains(needed), "{needed:?}: {out}");
@@ -535,7 +537,14 @@ fn uninstall_keeps_the_key_and_purge_deletes_it() -> Result {
         assert!(calls.contains(call), "{call}: {calls}");
     }
 
-    let output = sandbox.run("main --uninstall --purge", &[])?;
+    // With no terminal to type delete on, the key goes only when TALLY_PURGE_KEY=yes says so.
+    let refusal = sandbox.stopped("main --uninstall --purge", &[])?;
+    assert!(
+        refusal.contains("TALLY_PURGE_KEY=yes") && refusal.contains("Nothing was removed"),
+        "{refusal}"
+    );
+    assert!(sandbox.exists("root/etc/tally/key"));
+    let output = sandbox.run("main --uninstall --purge", &[("TALLY_PURGE_KEY", "yes")])?;
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{err}");
     assert!(err.contains("gone for good"), "{err}");
@@ -776,7 +785,7 @@ fn an_update_installs_a_newer_signed_release_and_keeps_the_owners_settings() -> 
         "{written}"
     );
     assert!(
-        written.contains("--lat 51.5 --lon -0.1 --alt 20\""),
+        written.contains("--lat 51.5 --lon -0.1 --alt 66\""),
         "{written}"
     );
     assert!(sandbox.exists(TIMER_ENABLED));
@@ -928,12 +937,6 @@ fn locating(name: &str, answers: &[(&str, &str)], typed: &[&str]) -> Result<Sand
     for (service, answer) in answers {
         sandbox.file(&format!("service/{service}"), answer)?;
     }
-    let geoid = sandbox::path_of("TALLY_GEOID")?;
-    let gzipped = io(Command::new("gzip").arg("-9nc").arg(&geoid).output())?;
-    io(std::fs::write(
-        sandbox.dir.join("release/geoid.txt.gz"),
-        gzipped.stdout,
-    ))?;
     sandbox.file("typed", &format!("{}\n", typed.join("\n")))?;
     Ok(sandbox)
 }
@@ -1158,7 +1161,7 @@ fn a_place_the_owner_rejects_falls_back_to_the_coordinates() -> Result {
     sandbox.ok(&format!("{ON_A_TERMINAL}\n{INSTALL}"), &borrowed(&env))?;
     let written = sandbox.read("root/etc/default/tally-feed")?;
     assert!(
-        written.contains("--lat 37.7 --lon -122.4 --alt 30\""),
+        written.contains("--lat 37.7 --lon -122.4 --alt -3\""),
         "{written}"
     );
     assert_eq!(sandbox.read("root/etc/default/readsb")?, readsb);
@@ -1191,7 +1194,7 @@ fn an_upgrade_never_locates() -> Result {
     )?;
     let written = sandbox.read("root/etc/default/tally-feed")?;
     assert!(
-        written.contains("--lat 51.5 --lon -0.1 --alt 20\""),
+        written.contains("--lat 51.5 --lon -0.1 --alt 66\""),
         "{written}"
     );
     assert_eq!(sandbox.log("services.log"), "");
@@ -1224,5 +1227,207 @@ fn the_geoid_grid_agrees_with_geoid18() -> Result {
             "{lat}, {lon}: the grid says {n} m, GEOID18 {geoid18} m"
         );
     }
+    Ok(())
+}
+
+// The altitude's datum. Every altitude an owner types or a receiver's setup holds is above sea
+// level (adsb.im's FEEDER_ALT_M is "Altitude above mean sealevel"); the feeder's --alt is above the
+// WGS84 ellipsoid. The installer converts with the release's geoid grid, and keeps what an earlier
+// run wrote exactly.
+
+const ADSBIM: &str = "FEEDER_LAT=51.4775\nFEEDER_LONG=-0.4614\nFEEDER_ALT_M=25\n";
+
+/// As `install`, with only `extra` of the location variables.
+fn install_naming(sandbox: &Sandbox, extra: &[(&str, &str)], args: &str) -> Result<String> {
+    let env = install_env(sandbox, extra);
+    sandbox.ok(
+        &INSTALL.replace("main", &format!("main {args}")),
+        &borrowed(&env),
+    )
+}
+
+/// adsb.im's 25 m above sea level at Heathrow is 25 m plus the geoid's 46.68 m there above the
+/// ellipsoid: the block holds 72 and says how it was found.
+#[test]
+fn a_sea_level_altitude_is_turned_into_height_above_the_ellipsoid() -> Result {
+    let sandbox = Sandbox::new("datum")?;
+    sandbox.release()?;
+    sandbox.file("journal", PUBLISHING)?;
+    sandbox.file("root/opt/adsb/config/.env", ADSBIM)?;
+    let out = install_naming(&sandbox, &[], "")?;
+    let written = sandbox.read("root/etc/default/tally-feed")?;
+    assert!(
+        written.contains("--lat 51.4775 --lon -0.4614 --alt 72\""),
+        "{written}"
+    );
+    for said in [&written, &out] {
+        assert!(
+            said.contains("25 m above sea level, and the geoid there, 46.68 m (EGM2008): metres above the WGS84 ellipsoid"),
+            "{said}"
+        );
+    }
+    // The grid it read is checked against its signature with the rest of the release.
+    assert!(out.contains("geoid.txt.gz"), "{out}");
+    Ok(())
+}
+
+/// A rerun, and an automatic update, keep the altitude the earlier run wrote, exactly, while the
+/// location is the same: a sea-level source read again does not move it, and the block goes on
+/// saying where it came from. What the owner names (TALLY_ALT), or a new location, replaces it.
+#[test]
+fn a_rerun_keeps_the_saved_altitude_until_the_owner_names_another() -> Result {
+    let sandbox = Sandbox::new("keep-alt")?;
+    sandbox.release()?;
+    sandbox.file("journal", PUBLISHING)?;
+    let defaults = "root/etc/default/tally-feed";
+    // What v0.7.4 wrote from adsb.im: its sea-level 25, as it was, taken as above the ellipsoid.
+    sandbox.file(
+        defaults,
+        &format!(
+            "# BEGIN install.sh: rewritten on every run of install.sh\n# Location from /opt/adsb/config/.env (FEEDER_LAT, FEEDER_LONG, FEEDER_ALT_M), altitude from /opt/adsb/config/.env (FEEDER_LAT, FEEDER_LONG, FEEDER_ALT_M).\nTALLY_FEED_ARGS=\"--relay relay.example:10900={RELAY_KEY} --lat 51.4775 --lon -0.4614 --alt 25\"\n# END install.sh\nTALLY_FEED_EXTRA=\"\"\n"
+        ),
+    )?;
+    sandbox.file("root/opt/adsb/config/.env", ADSBIM)?;
+    for args in ["", "--upgrade"] {
+        let out = install_naming(&sandbox, &[], args)?;
+        let written = sandbox.read(defaults)?;
+        assert!(
+            written.contains("--lat 51.4775 --lon -0.4614 --alt 25\""),
+            "{args}: {written}"
+        );
+        assert!(
+            written.contains("altitude from the earlier install, which had it from /opt/adsb/config/.env (FEEDER_LAT, FEEDER_LONG, FEEDER_ALT_M)."),
+            "{args}: {written}"
+        );
+        // It says how to have it converted, and converts nothing by itself.
+        assert!(
+            out.contains("run this again with TALLY_ALT=25"),
+            "{args}: {out}"
+        );
+    }
+    // The owner names it: converted.
+    install_naming(&sandbox, &[("TALLY_ALT", "25")], "")?;
+    let written = sandbox.read(defaults)?;
+    assert!(written.contains("--alt 72\""), "{written}");
+    // Converted once, it is kept from then on, and said to be above the ellipsoid already.
+    let out = install_naming(&sandbox, &[], "--upgrade")?;
+    let written = sandbox.read(defaults)?;
+    assert!(written.contains("--alt 72\""), "{written}");
+    assert!(!out.contains("run this again with TALLY_ALT"), "{out}");
+    assert!(
+        written.contains("which had it from TALLY_ALT, 25 m above sea level, and the geoid there, 46.68 m (EGM2008): metres above the WGS84 ellipsoid."),
+        "{written}"
+    );
+    // A new place is a new altitude: adsb.im's, converted there.
+    sandbox.file(
+        "root/opt/adsb/config/.env",
+        "FEEDER_LAT=37.778536\nFEEDER_LONG=-122.41831\nFEEDER_ALT_M=16\n",
+    )?;
+    install_naming(&sandbox, &[], "")?;
+    let written = sandbox.read(defaults)?;
+    assert!(
+        written.contains("--lat 37.778536 --lon -122.41831 --alt -17\""),
+        "{written}"
+    );
+    Ok(())
+}
+
+/// Every message that asks for an altitude asks for the height above sea level.
+#[test]
+fn the_altitude_asked_for_is_above_sea_level() -> Result {
+    let sandbox = Sandbox::new("ask-msl")?;
+    let env = [("TALLY_LAT", "51.5"), ("TALLY_LON", "-0.1")];
+    let refusal = sandbox.stopped("discover_location ask", &env)?;
+    assert!(
+        refusal.contains("TALLY_ALT=25") && refusal.contains("height above sea level"),
+        "{refusal}"
+    );
+    let asked = sandbox.ok(
+        "have_tty() { :; }\nask() { echo \"$1\" >> \"$T/asked.log\"; echo 20; }\ndiscover_location ask\necho \"$alt|$alt_datum\"",
+        &env,
+    )?;
+    assert!(asked.ends_with("20|sea\n"), "{asked}");
+    assert!(
+        sandbox
+            .log("asked.log")
+            .contains("Antenna altitude above sea level"),
+        "{}",
+        sandbox.log("asked.log")
+    );
+    Ok(())
+}
+
+/// A feeder that keeps crashing (Restart=always counts it active between its restarts) is called
+/// that, at once, with its error; LoadCredential's failure under systemd in a container gets a
+/// pointer to the container image. The key and the station page are printed all the same, and
+/// only this run's log is shown.
+#[test]
+fn a_crashing_feeder_is_said_to_crash_with_its_error() -> Result {
+    let sandbox = Sandbox::new("crash")?;
+    sandbox.release()?;
+    sandbox.file(
+        "journal",
+        "tally-feed: /run/credentials/tally-feed.service/key: Permission denied (os error 13)\n",
+    )?;
+    sandbox.file("show-NRestarts", "2\n")?;
+    sandbox.file("show-SubState", "auto-restart\n")?;
+    sandbox.file("show-ExecMainStatus", "1\n")?;
+    let env = install_env(&sandbox, LOCATION);
+    let output = sandbox.run(INSTALL, &borrowed(&env))?;
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{err}");
+    for needed in [
+        "tally-feed keeps crashing: it exited with status 1",
+        "  tally-feed: /run/credentials/tally-feed.service/key: Permission denied (os error 13)",
+        "inside a container",
+        "#run-it-as-a-container",
+        PUBLIC,
+        "https://tally.skycommons.org/feeders/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-_8",
+    ] {
+        assert!(err.contains(needed), "{needed:?}: {err}");
+    }
+    assert!(!err.contains("has not reached a relay"), "{err}");
+    let journal = sandbox.log("journalctl.log");
+    assert!(
+        journal
+            .lines()
+            .all(|call| call.contains("--since @") || call.contains("_SYSTEMD_INVOCATION_ID=")),
+        "{journal}"
+    );
+    Ok(())
+}
+
+/// A feeder that runs but reaches no relay is installed: its key and station page are printed,
+/// and readsb's location, which the owner said yes to, is set all the same.
+#[test]
+fn a_feeder_reaching_no_relay_still_gets_its_key_page_and_readsb_location() -> Result {
+    let sandbox = locating(
+        "locate-unreached",
+        &[("census", CENSUS), ("nominatim", NOMINATIM), ("epqs", EPQS)],
+        &[ADDRESS, "y", "2", "y"],
+    )?;
+    sandbox.file(
+        "journal",
+        "tally-feed: reading 127.0.0.1:30005\ntally-feed: could not reach relay relay.example:10900: Connection refused (os error 111).\n",
+    )?;
+    let readsb = "DECODER_OPTIONS=\"--max-range 500\"\n";
+    sandbox.file("root/etc/default/readsb", readsb)?;
+    let env = install_env(&sandbox, &[]);
+    let output = sandbox.run(&format!("{ON_A_TERMINAL}\n{INSTALL}"), &borrowed(&env))?;
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{err}");
+    for needed in [
+        "has not reached a relay",
+        PUBLIC,
+        "https://tally.skycommons.org/feeders/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-_8",
+    ] {
+        assert!(err.contains(needed), "{needed:?}: {err}");
+    }
+    let readsb_now = sandbox.read("root/etc/default/readsb")?;
+    assert!(
+        readsb_now
+            .contains("DECODER_OPTIONS=\"--max-range 500 --lat 37.778536 --lon -122.418310\""),
+        "{readsb_now}"
+    );
     Ok(())
 }

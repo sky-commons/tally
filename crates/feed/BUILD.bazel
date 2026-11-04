@@ -18,8 +18,11 @@ rust_library(
         ["src/**/*.rs"],
         exclude = ["src/main.rs"],
     ),
-    # The release's seed list, compiled in (`config::SEEDS`).
-    compile_data = ["//packaging:seeds"],
+    # The release's seed list, compiled in (`config::SEEDS`), and its geoid grid (`geoid`).
+    compile_data = [
+        "//packaging:geoid/geoid.txt",
+        "//packaging:seeds",
+    ],
     crate_name = "tally_feed",
     edition = "2024",
     lint_config = ":cargo_lints",

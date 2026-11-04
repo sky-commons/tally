@@ -14,7 +14,12 @@ fn main() {
         // and before the runtime starts a thread (`privilege`).
         let run_as = env(privilege::RUN_AS);
         match &command {
-            Command::Run(config) => privilege::become_user(run_as.as_deref(), &config.state_dir)?,
+            Command::Run(config, warnings) => {
+                privilege::become_user(run_as.as_deref(), &config.state_dir)?;
+                for warning in warnings {
+                    eprintln!("tally-feed: {warning}");
+                }
+            }
             Command::Init(path) => {
                 if let Some(parent) = path
                     .parent()
@@ -44,7 +49,7 @@ fn execute(command: Command) -> Result<(), String> {
             println!("{verdict}");
             Ok(())
         }
-        Command::Run(config) => tokio::runtime::Builder::new_multi_thread()
+        Command::Run(config, _) => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|error| error.to_string())?

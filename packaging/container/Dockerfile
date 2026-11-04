@@ -6,8 +6,9 @@
 # builds on an amd64 runner with no emulation.
 #
 # It is configured as the sdr-enthusiasts images are, by one block of environment variables
-# (BEASTHOST, LAT, LONG, ALT; `tally-feed --help` lists them all), and any
-# `command:` is the feeder's own flags, which win over the environment. The relays to start from
+# (BEASTHOST, LAT, LONG, and ALT_MSL above sea level or ALT above the ellipsoid; `tally-feed
+# --help` lists them all), and any `command:` is the feeder's own flags, which win over the
+# environment. The relays to start from
 # are compiled into the binary (packaging/seeds). The identity is made on the first run in the
 # volume, /var/lib/tally-feed/key, and the log names it and its station page; TALLY_KEY (the
 # text `new-key` prints on its first line) is used instead when it is set.
