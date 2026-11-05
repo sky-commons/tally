@@ -486,6 +486,7 @@ fn an_ultrafeeder_container_with_no_host_beast_gets_the_compose_route() -> Resul
     for needed in [
         "Nothing was installed",
         "image: ghcr.io/sky-commons/tally-feed:0",
+        "docker compose pull && docker compose up -d",
         "- BEASTHOST=ultrafeeder",
         "- LAT=47.6",
         "- LONG=-122.3",

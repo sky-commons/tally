@@ -11,7 +11,8 @@
 # release (tally-feed-image.txt and the notes), so a host that pins the image by digest pins what
 # this release built. Both tags name the one digest, so the one signature and attestation cover
 # both; the major tag moves to each new release of its major, which is what a compose file that
-# names it follows. The map bundle (packaging/map/Dockerfile, RFC-0187 §1) is built, pushed to
+# names it follows, and never backwards: a release below the highest of its major (a patch on an
+# older line) pushes only its own tag. The map bundle (packaging/map/Dockerfile, RFC-0187 §1) is built, pushed to
 # ghcr.io/sky-commons/tally-map:<tag>, signed, attested and named (tally-map-image.txt) the same
 # way.
 #
@@ -173,17 +174,31 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
       # The image's tags: the release's own, and its major's (`0` for v0.x.y), which follows the
-      # newest release of that major.
+      # highest release of that major and never moves backwards: a release below it (a patch on an
+      # older line) is pushed under its own tag alone.
       - id: tags
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           major="${version%%.*}"
           [[ "$major" =~ ^[0-9]+$ ]]
+          highest="$({
+            gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+              --limit 1000 --json tagName --jq '.[].tagName' |
+              grep -E "^v$major\.[0-9]+\.[0-9]+\$" || true
+            echo "$GITHUB_REF_NAME"
+          } | sort -V | tail -n 1)"
+          tags="$IMAGE:$GITHUB_REF_NAME"
+          if [[ "$highest" == "$GITHUB_REF_NAME" ]]; then
+            tags+=$'\n'"$IMAGE:$major"
+          else
+            echo "::notice::$highest is a higher $major.x release: $IMAGE:$major stays on it"
+          fi
           {
             echo 'list<<TAGS'
-            echo "$IMAGE:$GITHUB_REF_NAME"
-            echo "$IMAGE:$major"
+            echo "$tags"
             echo 'TAGS'
             echo "major=$major"
           } >> "$GITHUB_OUTPUT"

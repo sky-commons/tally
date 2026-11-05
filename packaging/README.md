@@ -192,17 +192,25 @@ when started by hand, and a rerun of `install.sh` keeps it off. `sudo systemctl 
 tally-feed-update.timer` turns it back on. `sudo systemctl start tally-feed-update.service` runs
 a check now.
 
-Only this standalone install updates itself. A container (below, and adsb.im) follows its image
-tag through its host's own updates.
+Only this standalone install updates itself. A container (below, and adsb.im) runs whatever its
+image tag names: `:0` moves to each 0.x release, so a host that pulls it again stays current.
 
 ## Run it as a container
 
 A host that runs each feeder as a container, such as adsb.im or an sdr-enthusiasts compose file
-(amd64, arm64 and 32-bit arm/v7), runs the release's image: `ghcr.io/sky-commons/tally-feed:0`
-follows every 0.x release, and `:vX.Y.Z` (or the `@sha256:` digest `tally-feed-image.txt` names)
-pins one (`container/Dockerfile`). It is the same `tally-feed` binary the release publishes, on
-distroless with no shell, and it is configured the way the sdr-enthusiasts images are, by one
-block of environment variables. Beside ultrafeeder, with adsb.im's location variables:
+(amd64, arm64 and 32-bit arm/v7), runs the release's image (`container/Dockerfile`):
+
+- **`ghcr.io/sky-commons/tally-feed:0`** names the highest 0.x release. It moves when a release is
+  published, never back to an older one, so a host that pulls it again stays current: run
+  Watchtower beside it, or `docker compose pull && docker compose up -d` from cron (daily is
+  plenty). This is the tag to use unless you have a reason not to.
+- **`:vX.Y.Z`** (or the `@sha256:` digest `tally-feed-image.txt` names) pins one release, for a
+  host that chooses when its feeder changes: edit the tag to upgrade. Relays accept every feeder
+  version ever released, so a pinned feeder keeps feeding.
+
+It is the same `tally-feed` binary the release publishes, on distroless with no shell, and it is
+configured the way the sdr-enthusiasts images are, by one block of environment variables. Beside
+ultrafeeder, with adsb.im's location variables:
 
 ```yaml
   tally-feed:
