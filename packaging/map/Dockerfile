@@ -12,9 +12,9 @@
 # release passes its own dist/, the signed binaries; packaging/tests/map.sh one Bazel just built.
 #
 # Every input is pinned: the Debian base by digest, Debian's packages by a snapshot of the archive
-# (and of its security updates) at one date and readsb, nginx, its Lua module, lua-cjson and tini
-# by version in it, tar1090 by commit and the tarball's sha256, and the aircraft database's sources
-# by commit and sha256.
+# (and of its security updates) at one date, readsb, nginx, its Lua module, lua-cjson and tini by
+# version in it and every package they pull in by version in a lock (debian-*.lock), tar1090 by
+# commit and the tarball's sha256, and the aircraft database's sources by commit and sha256.
 
 # Debian 13 (trixie), slim, pinned by the digest of its multi-arch index
 # (`docker buildx imagetools inspect debian:trixie-slim`, 2026-10-05); the tag says which image the
@@ -51,6 +51,8 @@ ARG LUA_CJSON_VERSION=2.1.0+dfsg-2.2+b2
 ARG PYTHON_PIL_VERSION=11.1.0-5+deb13u4
 ARG PYTHON_REQUESTS_VERSION=2.32.3+dfsg-5+deb13u1
 ARG CA_CERTIFICATES_VERSION=20250419
+# Python 3, Debian 13's, which the web stage makes the database with (aircraft_db.py).
+ARG PYTHON3_VERSION=3.13.5-1
 
 # komoot's staticmap (Apache-2.0), github.com/komoot/staticmap, the wheel PyPI publishes of 0.5.7,
 # unmodified.
@@ -60,6 +62,10 @@ ARG STATICMAP_SHA256=f4ffc40ee4502b92e91045e0df85a46a2fd68483b4e7e404a6b545fd739
 # Debian's archive and its security updates as snapshot.debian.org kept them at this instant, so
 # every package above stays installable at its version after Debian moves on. A snapshot's
 # Release files are past their Valid-Until, which is expected of a snapshot and nothing else.
+# debian-install.sh checks each stage's install against its lock (debian-web.lock,
+# debian-map.lock: the pins and all they pull in), and when the snapshot is down installs exactly
+# that lock from Debian's mirrors, which have each version for as long as it is its suite's
+# current one, or fails.
 ARG DEBIAN_SNAPSHOT=20261005T000000Z
 
 # Docker names the architecture amd64 or arm64, the release x86_64 or aarch64: a stage each, and
@@ -78,6 +84,7 @@ FROM collect-${TARGETARCH} AS collect
 # on the build's own platform, with no emulation.
 FROM --platform=$BUILDPLATFORM ${DEBIAN} AS web
 ARG DEBIAN_SNAPSHOT
+ARG PYTHON3_VERSION
 ARG TAR1090_COMMIT
 ARG TAR1090_SHA256
 ARG MICTRONICS_COMMIT
@@ -85,11 +92,9 @@ ARG MICTRONICS_OLD_SHA256
 ARG MICTRONICS_NEW_SHA256
 ARG OURAIRPORTS_COMMIT
 ARG OURAIRPORTS_SHA256
-COPY --chmod=0755 debian-snapshot.sh /usr/local/bin/debian-snapshot
-RUN debian-snapshot "$DEBIAN_SNAPSHOT" \
-  && apt-get update \
-  && apt-get install -y --no-install-recommends python3 \
-  && rm -rf /var/lib/apt/lists/*
+COPY --chmod=0755 debian-install.sh /usr/local/bin/debian-install
+COPY debian-web.lock /tmp/debian-web.lock
+RUN debian-install "$DEBIAN_SNAPSHOT" /tmp/debian-web.lock "python3=${PYTHON3_VERSION}"
 
 ADD --checksum=sha256:${TAR1090_SHA256} \
   https://github.com/wiedehopf/tar1090/archive/${TAR1090_COMMIT}.tar.gz /src/tar1090.tar.gz
@@ -158,15 +163,14 @@ ARG OURAIRPORTS_COMMIT
 
 # readsb's package makes the system user readsb, which runs both processes. tini is PID 1 and
 # hands signals to the entrypoint, which stops both.
-COPY --chmod=0755 debian-snapshot.sh /usr/local/bin/debian-snapshot
-RUN debian-snapshot "$DEBIAN_SNAPSHOT" \
-  && apt-get update \
-  && apt-get install -y --no-install-recommends \
+COPY --chmod=0755 debian-install.sh /usr/local/bin/debian-install
+COPY debian-map.lock /tmp/debian-map.lock
+RUN debian-install "$DEBIAN_SNAPSHOT" /tmp/debian-map.lock \
     "readsb=${READSB_VERSION}" "nginx=${NGINX_VERSION}" "tini=${TINI_VERSION}" \
     "libnginx-mod-http-lua=${NGINX_LUA_VERSION}" "lua-cjson=${LUA_CJSON_VERSION}" \
     "python3-pil=${PYTHON_PIL_VERSION}" "python3-requests=${PYTHON_REQUESTS_VERSION}" \
     "ca-certificates=${CA_CERTIFICATES_VERSION}" \
-  && rm -rf /var/lib/apt/lists/* /etc/nginx/sites-enabled/* /usr/local/bin/debian-snapshot \
+  && rm -rf /etc/nginx/sites-enabled/* /usr/local/bin/debian-install /tmp/debian-map.lock \
   && install -d -o readsb /run/readsb /run/tally-map /var/globe_history /var/globe_history/archive \
     /var/cache/tally-map
 

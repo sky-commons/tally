@@ -369,7 +369,8 @@ All of it unmodified, each from a pinned source (`Dockerfile` names every pin):
   `0.19.0-3+b8`, Debian 13's packages (BSD-2-Clause; BSD-2-Clause, MIT and BSD-3-Clause; MIT;
   MIT). Every Debian package comes from snapshot.debian.org as it was at `20261005T000000Z`
   (`DEBIAN_SNAPSHOT` in the `Dockerfile`, with its security updates), so each stays installable at
-  its version.
+  its version; when the snapshot is down, the same versions from Debian's mirrors
+  (`debian-install.sh`), or no image.
 - **Python 3**, **Pillow** `11.1.0-5+deb13u4`, **requests** `2.32.3+dfsg-5+deb13u1` and
   **ca-certificates** `20250419`, Debian 13's packages (PSF-2.0; MIT-CMU; Apache-2.0; MPL-2.0), and
   **staticmap** 0.5.7, [komoot/staticmap](https://github.com/komoot/staticmap), Apache-2.0, the
