@@ -51,7 +51,7 @@ Raspberry Pi OS Bullseye and anything newer).
     earlier run wrote is above the ellipsoid already and is kept exactly, by every rerun and
     automatic update, while the location is the one it was written for and no `TALLY_ALT` (or
     address) names another, so no release moves a receiver's altitude by itself. A release
-    before v0.7.6 wrote a sea-level value as it was; a rerun says so and how to have it
+    before v0.7.7 wrote a sea-level value as it was; a rerun says so and how to have it
     converted (`TALLY_ALT=` the same value). A height above the ellipsoid you know already (a
     survey GPS) goes in `TALLY_FEED_EXTRA` as `--alt`.
   - **Location from an address** (RFC-0204), for an owner who does not know the antenna's
@@ -233,7 +233,7 @@ That is all of it: no key to make or paste, and no relay to name.
 - **Location:** `LAT` and `LONG` (or `READSB_LAT` and `READSB_LON`) in degrees, and the
   altitude, `15m` or `45ft` (a bare number is metres), as one of: `ALT_MSL`, the antenna's height
   above sea level, which is what adsb.im's `FEEDER_ALT_M` is, turned into the height above the
-  WGS84 ellipsoid with the EGM2008 geoid grid built into the feeder (v0.7.6 and later); or `ALT`
+  WGS84 ellipsoid with the EGM2008 geoid grid built into the feeder (v0.7.7 and later); or `ALT`
   (or `READSB_ALT`), the height above the ellipsoid itself, as mlat-client's `--alt` takes it,
   passed as it is (as it always was). Use `ALT_MSL` unless you know the ellipsoidal height. Only
   Tally relays get the position exactly, as MLAT needs; nothing a data user reads contains it,

@@ -158,7 +158,7 @@ only as its cell narrows nothing to finer than the cell.
 - Whether to tell the owner directly (the feeder could log the relay's verdict). Today only the
   station page says it.
 
-## §7 Amendment, 2026-11-04 (v0.7.5): every altitude given is above sea level
+## §7 Amendment, 2026-11-04 (first published in v0.7.7; v0.7.5 and v0.7.6 were tagged but never published): every altitude given is above sea level
 
 A fresh-eyes walkthrough found the datum mixed. `--alt` is the height above the WGS84 ellipsoid
 (mlat-client's too), but everything a hobbyist or their setup gives is above sea level: adsb.im's
@@ -172,7 +172,7 @@ London. Decided:
   sea level, and the geoid there, -32.53 m (EGM2008): metres above the WGS84 ellipsoid").
 - **Upgrades still migrate nothing.** What an earlier run wrote is kept exactly, by every rerun
   and automatic update, while the location is the one it was written for and no `TALLY_ALT` or
-  address names another; its provenance line is carried along. A pre-v0.7.5 value from a
+  address names another; its provenance line is carried along. A pre-v0.7.7 value from a
   sea-level source is left as it was, with a note saying how to convert it (`TALLY_ALT=` the
   same value): converting it unasked would move a working receiver's altitude by itself.
   `//packaging:upgrade_test` holds this with an adsb.im setup on the box naming another altitude.
