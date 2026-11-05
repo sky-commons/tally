@@ -1,0 +1,19 @@
+# Every Debian package the map image's `web` stage installs (packaging/map/Dockerfile), the pinned
+# ones and all they depend on, at the versions DEBIAN_SNAPSHOT has, for amd64 and arm64 alike.
+# debian-install.sh checks the install against this list, and installs exactly this list from
+# Debian's mirrors when the snapshot is down. A pin or the snapshot moves, this list moves: the
+# build that fails prints the new one.
+libexpat1=2.8.3-1~deb13u1
+libffi8=3.4.8-2
+libncursesw6=6.5+20250216-2
+libpython3-stdlib=3.13.5-1
+libpython3.13-minimal=3.13.5-2+deb13u5
+libpython3.13-stdlib=3.13.5-2+deb13u5
+libreadline8t64=8.2-6
+media-types=13.0.0
+netbase=6.5
+python3-minimal=3.13.5-1
+python3.13-minimal=3.13.5-2+deb13u5
+python3.13=3.13.5-2+deb13u5
+python3=3.13.5-1
+readline-common=8.2-6

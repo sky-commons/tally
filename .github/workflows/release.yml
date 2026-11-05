@@ -6,15 +6,17 @@
 # bundle (.sigstore.json, the identity this workflow on this repository's tag) and the build's
 # provenance attestation. It then pushes the feeder's container image
 # (packaging/container/Dockerfile), for amd64, arm64 and arm/v7, built from those same binaries, to
-# ghcr.io/sky-commons/tally-feed:<tag> and to its major tag (:0 for every 0.x release, :1 for 1.x),
-# signs its digest the same way, attests its provenance in the registry, and names the digest in the
-# release (tally-feed-image.txt and the notes), so a host that pins the image by digest pins what
-# this release built. Both tags name the one digest, so the one signature and attestation cover
-# both; the major tag moves to each new release of its major, which is what a compose file that
-# names it follows, and never backwards: a release below the highest of its major (a patch on an
-# older line) pushes only its own tag. The map bundle (packaging/map/Dockerfile, RFC-0187 §1) is built, pushed to
-# ghcr.io/sky-commons/tally-map:<tag>, signed, attested and named (tally-map-image.txt) the same
-# way.
+# ghcr.io/sky-commons/tally-feed:<tag>, signs its digest the same way, attests its provenance in the
+# registry, and names the digest in the release (tally-feed-image.txt and the notes), so a host that
+# pins the image by digest pins what this release built. The map bundle (packaging/map/Dockerfile,
+# RFC-0187 §1) is built, pushed to ghcr.io/sky-commons/tally-map:<tag>, signed, attested and named
+# (tally-map-image.txt) the same way.
+#
+# Last, once the release is published with every asset, the feeder image's major tag (:0 for every
+# 0.x release, :1 for 1.x) is moved to the same digest, so the one signature and attestation cover
+# both. The major tag moves to each new release of its major, which is what a compose file that
+# names it follows, never to a release that failed before it was published, and never backwards: a
+# release below the highest of its major (a patch on an older line) leaves it where it is.
 #
 # Check a download:
 #   sha256sum -c tally-feed-aarch64-linux.sha256
@@ -173,9 +175,9 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      # The image's tags: the release's own, and its major's (`0` for v0.x.y), which follows the
-      # highest release of that major and never moves backwards: a release below it (a patch on an
-      # older line) is pushed under its own tag alone.
+      # The major tag (`0` for v0.x.y) follows the highest release of that major and never moves
+      # backwards: a release below it (a patch on an older line) leaves it alone. It is moved by the
+      # last step, after the release is published.
       - id: tags
         env:
           GH_TOKEN: ${{ github.token }}
@@ -190,17 +192,15 @@ jobs:
               grep -E "^v$major\.[0-9]+\.[0-9]+\$" || true
             echo "$GITHUB_REF_NAME"
           } | sort -V | tail -n 1)"
-          tags="$IMAGE:$GITHUB_REF_NAME"
+          move=""
           if [[ "$highest" == "$GITHUB_REF_NAME" ]]; then
-            tags+=$'\n'"$IMAGE:$major"
+            move="$IMAGE:$major"
           else
             echo "::notice::$highest is a higher $major.x release: $IMAGE:$major stays on it"
           fi
           {
-            echo 'list<<TAGS'
-            echo "$tags"
-            echo 'TAGS'
             echo "major=$major"
+            echo "move=$move"
           } >> "$GITHUB_OUTPUT"
       # v7.4.0, pinned by commit. BuildKit's own provenance is off: the image's provenance is the
       # attestation below, the same kind and identity as the binaries'.
@@ -212,7 +212,7 @@ jobs:
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           provenance: false
-          tags: ${{ steps.tags.outputs.list }}
+          tags: ${{ env.IMAGE }}:${{ github.ref_name }}
       # Signed by digest, never by tag: a tag can be moved, the digest is what was built. The
       # digest is written beside the binaries, checksummed and signed like them.
       - name: sign the image
@@ -271,3 +271,17 @@ jobs:
           image="$(cat dist/tally-feed-image.txt)"
           map_pinned="$(cat dist/tally-map-image.txt)"
           gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes "Tally $GITHUB_REF_NAME. Install a feeder with \`curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/install.sh | sudo bash\`, or run it as a container: \`$image\` (\`$IMAGE:$GITHUB_REF_NAME\`, or \`$IMAGE:$MAJOR\` to follow every $MAJOR.x release). The map, to run beside a relay: \`$map_pinned\` (\`$MAP_IMAGE:$GITHUB_REF_NAME\`)." dist/*
+      # Only now, the release published with every asset, does the major tag move: to the digest
+      # the release names, the manifest list copied as it is, so the tag's digest is that digest.
+      - name: move the major tag
+        if: steps.tags.outputs.move != ''
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+          MOVE: ${{ steps.tags.outputs.move }}
+        run: |
+          set -euo pipefail
+          [[ "$(cat dist/tally-feed-image.txt)" == "$IMAGE@$DIGEST" ]]
+          docker buildx imagetools create --tag "$MOVE" "$IMAGE@$DIGEST"
+          moved="sha256:$(docker buildx imagetools inspect --raw "$MOVE" | sha256sum | cut -d' ' -f1)"
+          [[ "$moved" == "$DIGEST" ]] || { echo "$MOVE is $moved, not $DIGEST" >&2; exit 1; }
+          echo "$MOVE is $DIGEST"
