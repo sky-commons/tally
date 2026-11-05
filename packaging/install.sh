@@ -118,7 +118,7 @@
 #                                    none it deletes the key only with TALLY_PURGE_KEY=yes
 set -euo pipefail
 
-VERSION="v0.7.5"
+VERSION="v0.7.6"
 # Where this release is published, whose `tally-feed` binaries, unit and seed list this script
 # installs. The source names no publisher: the publisher writes its release's address here when it
 # publishes it, and TALLY_RELEASE overrides it.
@@ -599,7 +599,7 @@ saved_altitude_record() {
 # Keeps the altitude an earlier run wrote, exactly, when the location settled is the one it wrote
 # it for and the owner named no other (TALLY_ALT): it is above the ellipsoid already, as that run
 # found or converted it, where a source read again could give it otherwise (a sea-level one, which a
-# release before v0.7.5 wrote as it was). So neither a rerun nor an automatic update moves the
+# release before v0.7.6 wrote as it was). So neither a rerun nor an automatic update moves the
 # altitude by itself. The block goes on saying where that run had it from (alt_record).
 keep_saved_altitude() {
   [[ -z ${TALLY_ALT:-} && -n $lat ]] || return 0
@@ -617,7 +617,7 @@ keep_saved_altitude() {
     "the earlier install"*) alt_record="$record" ;;
     *) alt_record="the earlier install, which had it from $record" ;;
   esac
-  # A release before v0.7.5 wrote a sea-level altitude as it was; the owner is told how to have it
+  # A release before v0.7.6 wrote a sea-level altitude as it was; the owner is told how to have it
   # converted, and nothing is changed by itself.
   if [[ $alt_record != *ellipsoid* ]]; then
     say "note: the altitude $alt m is kept as the earlier install wrote it, as the height above the WGS84 ellipsoid (from ${record:-it}). If it is the antenna's height above sea level, as most setups give, run this again with TALLY_ALT=$alt and it is converted."
