@@ -15,7 +15,7 @@
 //! (its log names the receiver by the key it had), the key is the one it had, and the location,
 //! the owner's flag and their choice about automatic updates are as they were. The altitude is
 //! exactly the one the earlier install wrote, though the receiver's adsb.im setup gives the same
-//! place another one, above sea level, which an install converts (v0.7.5): no upgrade moves it.
+//! place another one, above sea level, which an install converts (v0.7.6): no upgrade moves it.
 
 mod sandbox;
 
