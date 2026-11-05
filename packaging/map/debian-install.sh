@@ -4,7 +4,7 @@
 # security updates, in place of the base image's live mirrors; and checks that what it installed,
 # the pins and every package they pulled in, is LOCK, to the version.
 #
-#   debian-install 20261005T000000Z debian-map.lock readsb=3.14.1630+git20240609.adc080d-1 ...
+#   debian-install 20261105T000000Z debian-map.lock readsb=3.14.1630+git20240609.adc080d-1 ...
 #
 # snapshot.debian.org is one service and is sometimes down for hours (503 "No healthy backends",
 # 504s), so apt retries each file with a growing delay and asks it for one file at a time; and if
@@ -41,15 +41,20 @@ for pin in "$@"; do
 done
 
 conf=/etc/apt/apt.conf.d/80debian-install
-cat >"$conf" <<'CONF'
-Acquire::Retries "6";
+# One file at a time, each retried with a delay that doubles up to MAXIMUM seconds: RETRIES and
+# MAXIMUM are the snapshot's (10, 300: a file can wait out some 13 minutes of 503s and 504s), and
+# the mirrors' (6, 60).
+apt_conf() {
+	cat >"$conf" <<CONF
+Acquire::Retries "$1";
 Acquire::Retries::Delay "true";
-Acquire::Retries::Delay::Maximum "60";
+Acquire::Retries::Delay::Maximum "$2";
 Acquire::http::Timeout "60";
 Acquire::Queue-Mode "access";
 Acquire::http::Pipeline-Depth "1";
 APT::Update::Error-Mode "any";
 CONF
+}
 
 snapshot() {
 	cat >/etc/apt/sources.list.d/debian.sources <<SOURCES
@@ -95,9 +100,11 @@ installed() { dpkg-query -W -f '${db:Status-Status} ${Package}=${Version}\n' | s
 before="$(installed)"
 rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*
 snapshot
+apt_conf 10 300
 if ! install_from "$@"; then
 	echo "debian-install: snapshot.debian.org/$instant failed; $lock from Debian's mirrors" >&2
 	mirrors
+	apt_conf 6 60
 	# shellcheck disable=SC2086 # one word per package=version
 	install_from $locked
 	# What the pins pulled in, marked so, as the snapshot's install marks it.

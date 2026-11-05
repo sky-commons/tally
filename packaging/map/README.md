@@ -364,15 +364,16 @@ All of it unmodified, each from a pinned source (`Dockerfile` names every pin):
   GPL-2.0-or-later or GPL-3.0-or-later (`/usr/share/doc/readsb/copyright` in the image). Its
   source, the exact source package this binary was built from, kept for good by Debian's snapshot
   archive: [snapshot.debian.org/package/readsb/3.14.1630+git20240609.adc080d-1](https://snapshot.debian.org/package/readsb/3.14.1630%2Bgit20240609.adc080d-1/).
-- **nginx** `1.26.3-3+deb13u9`, its Lua module `libnginx-mod-http-lua` `1:0.10.28-2` (with LuaJIT,
+- **nginx** `1.26.3-3+deb13u10`, its Lua module `libnginx-mod-http-lua` `1:0.10.28-2` (with LuaJIT,
   lua-resty-core, lua-resty-lrucache and the NDK), **lua-cjson** `2.1.0+dfsg-2.2+b2` and **tini**
   `0.19.0-3+b8`, Debian 13's packages (BSD-2-Clause; BSD-2-Clause, MIT and BSD-3-Clause; MIT;
-  MIT). Every Debian package comes from snapshot.debian.org as it was at `20261005T000000Z`
+  MIT). Every Debian package comes from snapshot.debian.org as it was at `20261105T000000Z`
   (`DEBIAN_SNAPSHOT` in the `Dockerfile`, with its security updates), so each stays installable at
   its version; when the snapshot is down, the same versions from Debian's mirrors
   (`debian-install.sh`), or no image.
 - **Python 3**, **Pillow** `11.1.0-5+deb13u4`, **requests** `2.32.3+dfsg-5+deb13u1` and
-  **ca-certificates** `20250419`, Debian 13's packages (PSF-2.0; MIT-CMU; Apache-2.0; MPL-2.0), and
+  **ca-certificates** `20250419+deb13u1`, Debian 13's packages (PSF-2.0; MIT-CMU; Apache-2.0;
+  MPL-2.0), and
   **staticmap** 0.5.7, [komoot/staticmap](https://github.com/komoot/staticmap), Apache-2.0, the
   wheel PyPI publishes, checked by its sha256, unmodified (its licence in
   `/usr/local/lib/tally-map/LICENSE-staticmap`).

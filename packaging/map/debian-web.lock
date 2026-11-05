@@ -3,7 +3,7 @@
 # debian-install.sh checks the install against this list, and installs exactly this list from
 # Debian's mirrors when the snapshot is down. A pin or the snapshot moves, this list moves: the
 # build that fails prints the new one.
-libexpat1=2.8.3-1~deb13u1
+libexpat1=2.9.0-1~deb13u1
 libffi8=3.4.8-2
 libncursesw6=6.5+20250216-2
 libpython3-stdlib=3.13.5-1
