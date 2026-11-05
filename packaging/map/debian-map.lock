@@ -4,16 +4,16 @@
 # from Debian's mirrors when the snapshot is down. A pin or the snapshot moves, this list moves:
 # the build that fails prints the new one.
 adduser=3.152
-ca-certificates=20250419
+ca-certificates=20250419+deb13u1
 iproute2=6.15.0-1
 libatomic1=14.2.0-19
 libbpf1=1:1.5.0-3
-libbrotli1=1.1.0-2+b7
+libbrotli1=1.1.0-2+deb13u1
 libcap2-bin=1:2.75-10+deb13u1+b3
 libcom-err2=1.47.2-3+b12
 libdeflate0=1.23-2
 libelf1t64=0.192-4
-libexpat1=2.8.3-1~deb13u1
+libexpat1=2.9.0-1~deb13u1
 libffi8=3.4.8-2
 libfreetype6=2.13.3+dfsg-1+deb13u1
 libfribidi0=1.0.16-1
@@ -61,8 +61,8 @@ lua-resty-core=0.1.31-1
 lua-resty-lrucache=0.15-2
 media-types=13.0.0
 netbase=6.5
-nginx-common=1.26.3-3+deb13u9
-nginx=1.26.3-3+deb13u9
+nginx-common=1.26.3-3+deb13u10
+nginx=1.26.3-3+deb13u10
 openssl=3.5.7-1~deb13u3
 python3-certifi=2025.1.31+ds-1
 python3-chardet=5.2.0+dfsg-2

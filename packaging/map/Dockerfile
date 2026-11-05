@@ -41,7 +41,7 @@ ARG OURAIRPORTS_SHA256=0499dbd88de2fc735ac5c09f59796ccc3af544e17ffda807f793c0c6f
 # readsb as Debian 13 packages it (source package readsb, from github.com/adsbfi/readsb, a
 # fork of wiedehopf's readsb; GPL-3.0-or-later among its options, see its copyright file).
 ARG READSB_VERSION=3.14.1630+git20240609.adc080d-1
-ARG NGINX_VERSION=1.26.3-3+deb13u9
+ARG NGINX_VERSION=1.26.3-3+deb13u10
 ARG TINI_VERSION=0.19.0-3+b8
 # nginx's Lua module and Lua's JSON, Debian 13's packages, for the link previews (preview.lua).
 ARG NGINX_LUA_VERSION=1:0.10.28-2
@@ -50,7 +50,7 @@ ARG LUA_CJSON_VERSION=2.1.0+dfsg-2.2+b2
 # the certificates nginx checks OpenStreetMap's tile server by.
 ARG PYTHON_PIL_VERSION=11.1.0-5+deb13u4
 ARG PYTHON_REQUESTS_VERSION=2.32.3+dfsg-5+deb13u1
-ARG CA_CERTIFICATES_VERSION=20250419
+ARG CA_CERTIFICATES_VERSION=20250419+deb13u1
 # Python 3, Debian 13's, which the web stage makes the database with (aircraft_db.py).
 ARG PYTHON3_VERSION=3.13.5-1
 
@@ -66,7 +66,7 @@ ARG STATICMAP_SHA256=f4ffc40ee4502b92e91045e0df85a46a2fd68483b4e7e404a6b545fd739
 # debian-map.lock: the pins and all they pull in), and when the snapshot is down installs exactly
 # that lock from Debian's mirrors, which have each version for as long as it is its suite's
 # current one, or fails.
-ARG DEBIAN_SNAPSHOT=20261005T000000Z
+ARG DEBIAN_SNAPSHOT=20261105T000000Z
 
 # Docker names the architecture amd64 or arm64, the release x86_64 or aarch64: a stage each, and
 # `FROM collect-${TARGETARCH}` picks one (packaging/container/Dockerfile says why).
