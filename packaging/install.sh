@@ -1531,7 +1531,7 @@ main() {
   printf "\nThis receiver's public key, its name on the network:\n\n  %s\n" "$public"
   printf "\nIts station page, once the network holds its first receptions:\n\n  %s/%s\n\n" "$STATION_PAGE" "$(base64url "$public")"
   printf "What it publishes, in open data anyone can read: every reception this receiver's decoders\n"
-  printf 'report, signed with that key.\n%s\n' "$(privacy_line)"
+  printf 'report, signed with that key.\n'
   printf 'To change the location, run this again with --locate (it asks for the address), or with\n'
   printf 'TALLY_LAT, TALLY_LON and TALLY_ALT.\n\n'
   auto_update_lines
