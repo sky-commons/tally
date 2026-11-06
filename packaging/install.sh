@@ -1327,6 +1327,10 @@ uninstall() {
   fi
   if [[ -f $UPDATE_TIMER ]]; then
     systemctl disable --now "$TIMER" >/dev/null 2>&1 || true
+    # The timer is Persistent=, so systemd keeps its last run in a stamp under
+    # /var/lib/systemd/timers; `clean --what=state` is systemd's own way to remove it
+    # (systemd.timer(5)), while the unit is still loaded.
+    systemctl clean --what=state "$TIMER" >/dev/null 2>&1 || true
   fi
   if [[ -f $UNIT ]]; then
     systemctl disable --now tally-feed.service >/dev/null 2>&1 || true

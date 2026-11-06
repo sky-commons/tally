@@ -537,6 +537,8 @@ fn uninstall_keeps_the_key_and_purge_deletes_it() -> Result {
     for call in [
         "disable --now tally-feed.service",
         "disable --now tally-feed-update.timer",
+        // Its Persistent= stamp under /var/lib/systemd/timers goes with it.
+        "clean --what=state tally-feed-update.timer",
     ] {
         assert!(calls.contains(call), "{call}: {calls}");
     }
