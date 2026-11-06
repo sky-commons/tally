@@ -18,7 +18,8 @@ use std::path::Path;
 use std::process::Command;
 
 use sandbox::{
-    INSTALL, PUBLIC, RELAY_KEY, Result, Sandbox, borrowed, install_env, installer, io, updater,
+    INSTALL, PUBLIC, RELAY_KEY, Result, Sandbox, borrowed, install_env, installer, io, succeeded,
+    updater,
 };
 
 /// The installer's refusal (its stderr) run with `env` and `path` first on its PATH; an error if
@@ -370,10 +371,12 @@ fn an_install_waits_for_publishing_and_prints_the_station_page() -> Result {
             ("TALLY_ALT", "20"),
         ],
     );
-    let out = sandbox.ok(
+    let output = sandbox.run(
         &format!("listening() {{ [[ $2 == 30005 ]]; }}\n{INSTALL}"),
         &borrowed(&env),
     )?;
+    let err = String::from_utf8_lossy(&output.stderr).into_owned();
+    let out = succeeded(output)?;
     assert!(out.contains("installed and publishing"), "{out}");
     assert!(
         out.contains(
@@ -381,12 +384,12 @@ fn an_install_waits_for_publishing_and_prints_the_station_page() -> Result {
         ),
         "{out}"
     );
-    // Exact to the relays alone, and only the public cell anywhere else, said in one line; no
-    // flag for it.
-    assert!(
-        out.contains("Your exact location goes only to Tally relays, for MLAT. Nothing a data user reads contains it; public maps show only the ~6 km area."),
-        "{out}"
-    );
+    // Exact to the relays alone, and only the public cell anywhere else, said in one line, once,
+    // beside the location it found and before anything is installed; no flag for it.
+    let said = format!("{err}{out}")
+        .matches("Your exact location goes only to Tally relays, for MLAT. Nothing a data user reads contains it; public maps show only the ~6 km area.")
+        .count();
+    assert_eq!(said, 1, "{err}{out}");
     let written = sandbox.read("root/etc/default/tally-feed")?;
     assert!(
         written.contains(&format!(
