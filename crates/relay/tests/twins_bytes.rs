@@ -3,8 +3,9 @@
 //! link (RFC-0174 §2.4, decision D5), each the largest positions record, filled past the links
 //! planned by more links than that, each sending record after record, so a link's next record
 //! takes the place of its last and a link past the plan lets the least recently active one go,
-//! counted. Measured by an allocator that counts every byte asked of it, in one test so nothing
-//! else in the binary allocates while it measures.
+//! counted. Measured by an allocator that counts every byte this thread asks for
+//! (`tally_counting::Counting`), so nothing another thread allocates, libtest's own among them, is
+//! counted.
 
 #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 
@@ -15,7 +16,7 @@ use tally_relay::models::Models;
 use tally_wire::{Identity, Positions};
 
 #[global_allocator]
-static GLOBAL: tally_counting::CountingAll = tally_counting::CountingAll;
+static GLOBAL: tally_counting::Counting = tally_counting::Counting;
 
 /// The most the twins' plan may be above what they hold at rest, filled: each record planned at
 /// the largest positions record, held at its own bytes a little below it, and the links' table
@@ -104,8 +105,8 @@ fn filled(
         .map(|(link, sequence)| Ok((link, record(link, sequence, count, receptions)?)))
         .collect::<Result<Vec<_>, String>>()?;
     let models = Arc::new(Models::new());
-    let mark = tally_counting::CountingAll::peak_base();
-    let base = tally_counting::CountingAll::live();
+    let mark = tally_counting::Counting::peak_base();
+    let base = tally_counting::Counting::live();
     let rest;
     let report;
     {
@@ -113,10 +114,10 @@ fn filled(
         for (link, positions) in &made {
             checks.raw(positions, *link);
         }
-        rest = usize::try_from(tally_counting::CountingAll::since(base)).unwrap_or(usize::MAX);
+        rest = usize::try_from(tally_counting::Counting::since(base)).unwrap_or(usize::MAX);
         report = checks.report();
     }
-    let peak = usize::try_from(tally_counting::CountingAll::peak_since(mark)).unwrap_or(0);
+    let peak = usize::try_from(tally_counting::Counting::peak_since(mark)).unwrap_or(0);
     Ok((peak, rest, report))
 }
 

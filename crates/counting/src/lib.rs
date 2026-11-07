@@ -1,8 +1,10 @@
 //! Allocators for tests that count what has been allocated and not yet freed, so a test can hold
 //! a store's charge to what its structures really allocate: [`Counting`] counts each thread's
-//! own (tests run on many threads at once), [`CountingAll`] the whole process's (a test binary
-//! with one test, measuring what a structure allocates whichever thread allocates it). A crate's
-//! test binary installs one (`#[global_allocator]`).
+//! own, so no other thread disturbs it (tests running at once, and libtest's own threads, which
+//! allocate beside a test); [`CountingAll`] the whole process's, for a structure that allocates
+//! on threads of its own, in a test binary that runs without libtest's harness (`harness =
+//! false`), so no thread but the test's allocates. A crate's test binary installs one
+//! (`#[global_allocator]`).
 //!
 //! Test support only: Bazel marks it `testonly` and Cargo takes it as a dev-dependency, so no
 //! production build reaches it. It is the one `unsafe` code a test of the crates that hold a key
@@ -21,6 +23,7 @@ pub struct Counting;
 thread_local! {
     static LIVE: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
     static PEAK: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    static ALLOCATIONS: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
 }
 
 impl Counting {
@@ -48,6 +51,15 @@ impl Counting {
         PEAK.try_with(std::cell::Cell::get).unwrap_or(base) - base
     }
 
+    /// How many allocations this thread holds and has not yet freed, since it started.
+    pub fn allocations() -> isize {
+        ALLOCATIONS.try_with(std::cell::Cell::get).unwrap_or(0)
+    }
+
+    fn allocated(allocations: isize) {
+        let _ = ALLOCATIONS.try_with(|held| held.set(held.get() + allocations));
+    }
+
     fn count(bytes: isize) {
         let _ = LIVE.try_with(|live| {
             let now = live.get() + bytes;
@@ -62,18 +74,21 @@ impl Counting {
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         Self::count(layout.size() as isize);
+        Self::allocated(1);
         // SAFETY: the caller's contract is the system allocator's.
         unsafe { std::alloc::System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         Self::count(layout.size() as isize);
+        Self::allocated(1);
         // SAFETY: the caller's contract is the system allocator's.
         unsafe { std::alloc::System.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
         Self::count(-(layout.size() as isize));
+        Self::allocated(-1);
         // SAFETY: the caller's contract is the system allocator's.
         unsafe { std::alloc::System.dealloc(ptr, layout) }
     }
@@ -87,9 +102,11 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 
 /// An allocator that counts what the whole process has allocated and not yet freed, the most at
 /// once ([`CountingAll::peak_since`]) and the allocations live ([`CountingAll::allocations`]):
-/// for a test binary that runs one test, so nothing else allocates while it measures
-/// (`tally_wire`'s `footprint_bytes`, the relay's `figures_bytes`, the solver's `held_bytes`).
-/// The system's, with counters the process shares.
+/// for a structure that allocates on threads of its own (the relay's `tables_bytes`: standing's
+/// thread), measured in a test binary built without libtest's harness (`harness = false`). Under
+/// the harness its main thread allocates while a test runs, and a count of the whole process
+/// takes those bytes too (sky-commons/tally#71); a structure built and measured on one thread is
+/// [`Counting`]'s. The system's, with counters the process shares.
 pub struct CountingAll;
 
 static ALL_LIVE: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);

@@ -51,7 +51,7 @@ rust_test(
 )
 
 # What `footprint` says each collection allocates is what it allocates, measured by an allocator
-# that counts every byte, the only test in its binary so nothing else allocates while it measures.
+# counting the test's own thread.
 rust_test(
     name = "footprint_bytes",
     size = "small",

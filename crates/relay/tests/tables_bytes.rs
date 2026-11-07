@@ -8,8 +8,10 @@
 //! honest worst case its plan is derived from. And the measured lines those plans are drawn from:
 //! what an area's model holds for each of its receivers, decoded over its wire bytes, and its
 //! memos (`an_areas_model_is_within_its_bytes_per_receiver`).
-//! Measured by an allocator that counts every byte asked of it, in one test so nothing else in
-//! the binary allocates while it measures.
+//! Measured by an allocator that counts every byte the process asks for (`tally_counting::
+//! CountingAll`), since standing's tables allocate on a thread of their own; so the binary runs
+//! without libtest's harness (`harness = false`, `main` below), whose own threads would allocate
+//! beside it (sky-commons/tally#71).
 
 #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 
@@ -756,7 +758,11 @@ fn standing_at_its_worst(model: &Decoded) -> Result<(), String> {
     Ok(())
 }
 
-#[test]
+/// The one measurement, run by `main` rather than libtest's harness (the module's header says why).
+fn main() -> Result<(), String> {
+    the_tables_the_relay_is_sent_into_allocate_no_more_than_they_are_charged()
+}
+
 fn the_tables_the_relay_is_sent_into_allocate_no_more_than_they_are_charged() -> Result<(), String>
 {
     // The products' remembered tables, each churned past its cap by twice it (so each makes its

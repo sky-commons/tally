@@ -4,8 +4,9 @@
 //! `Stations::planned_bytes` says at most, at every instant (its pages, the list of them, and its
 //! table of slots made anew beside the old one, never let grow on its own), and within twice of
 //! it; a smaller figure gives back what it held past it.
-//! Measured by an allocator that counts every byte asked of it, the only test in this binary so
-//! nothing else allocates while it measures.
+//! Measured by an allocator that counts every byte this thread asks for
+//! (`tally_counting::Counting`), so nothing another thread allocates, libtest's own among them, is
+//! counted.
 
 #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 
@@ -16,7 +17,7 @@ use tally_wire::Identity;
 use tally_wire::clocks::recorded;
 
 #[global_allocator]
-static GLOBAL: tally_counting::CountingAll = tally_counting::CountingAll;
+static GLOBAL: tally_counting::Counting = tally_counting::Counting;
 
 #[test]
 fn the_station_rows_at_the_figure_allocate_what_is_planned() {
@@ -51,8 +52,8 @@ fn the_station_rows_at_the_figure_allocate_what_is_planned() {
                 Identity::from_seed(seed).public()
             })
             .collect();
-        let base = tally_counting::CountingAll::live();
-        let mark = tally_counting::CountingAll::peak_base();
+        let base = tally_counting::Counting::live();
+        let mark = tally_counting::Counting::peak_base();
         let mut stations = Stations::new(capacity);
         for (n, key) in keys.iter().enumerate() {
             let at = recorded::mono(1_000 + n as u64);
@@ -63,8 +64,8 @@ fn the_station_rows_at_the_figure_allocate_what_is_planned() {
             }
         }
         assert_eq!(stations.len(), capacity);
-        let held = usize::try_from(tally_counting::CountingAll::since(base)).unwrap_or(0);
-        let peak = usize::try_from(tally_counting::CountingAll::peak_since(mark)).unwrap_or(0);
+        let held = usize::try_from(tally_counting::Counting::since(base)).unwrap_or(0);
+        let peak = usize::try_from(tally_counting::Counting::peak_since(mark)).unwrap_or(0);
         let planned = Stations::planned_bytes(capacity);
         assert!(
             peak <= planned,
@@ -79,14 +80,14 @@ fn the_station_rows_at_the_figure_allocate_what_is_planned() {
         // A smaller figure forgets past it and gives back what it held.
         stations.set_capacity(capacity.div_ceil(2));
         assert_eq!(stations.len(), capacity.div_ceil(2));
-        let after = usize::try_from(tally_counting::CountingAll::since(base)).unwrap_or(0);
+        let after = usize::try_from(tally_counting::Counting::since(base)).unwrap_or(0);
         assert!(
             after <= Stations::planned_bytes(capacity.div_ceil(2)),
             "{capacity} rows halved: {after} held"
         );
         drop(stations);
         assert_eq!(
-            tally_counting::CountingAll::since(base),
+            tally_counting::Counting::since(base),
             0,
             "{capacity} rows outlived their table"
         );
