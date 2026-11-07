@@ -68,6 +68,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/aircraft", get(aircraft))
         .route(stream::PATH, get(stream::open))
         .route("/v1/network", get(network))
+        .route("/v1/stations", get(stations))
         .route("/v1/stations/{key}", get(station))
         .route("/v1/stations/{key}/stats", get(feeder))
         .route("/v1/leaderboards", get(leaderboards))
@@ -191,6 +192,17 @@ async fn station(State(app): State<Arc<App>>, Path(key): Path<String>) -> Respon
     match stations.station(&key) {
         Some(station) => axum::Json(station).into_response(),
         None => refuse(StatusCode::NOT_FOUND, "no such station"),
+    }
+}
+
+/// Every station the relay knows, by key (`Stations::list`).
+async fn stations(State(app): State<Arc<App>>) -> Response {
+    match app.snapshot.stations(Instant::now()) {
+        Some(stations) => axum::Json(stations.list()).into_response(),
+        None => refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stations are not known yet",
+        ),
     }
 }
 

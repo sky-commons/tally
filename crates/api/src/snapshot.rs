@@ -12,8 +12,8 @@ use tally_relay::stations::{StationReport, StationsReport};
 use tally_wire::PublicKey;
 
 use tally_api_types::{
-    Aircraft, LocationCheck, LocationCheckState, MeResponse, MeStation, Network, PositionSource,
-    SourceCounts, Station, StationState,
+    Aircraft, ListedStation, LocationCheck, LocationCheckState, MeResponse, MeStation, Network,
+    PositionSource, SourceCounts, Station, StationList, StationState,
 };
 
 use crate::feeders::Board;
@@ -118,6 +118,26 @@ impl Stations {
             software: report.software.clone(),
             location_check: report.location_check.map(location_check),
         })
+    }
+
+    /// Every station the relay reports, by key, each with its state: what `station` answers for,
+    /// listed.
+    pub fn list(&self) -> StationList {
+        let mut keys: Vec<&PublicKey> = self.by_key.keys().collect();
+        keys.sort_unstable();
+        StationList {
+            now_ms: self.now_ms,
+            stations: keys
+                .into_iter()
+                .filter_map(|key| {
+                    let report = self.by_key.get(key)?;
+                    Some(ListedStation {
+                        key: report.key.clone(),
+                        state: state_of(report),
+                    })
+                })
+                .collect(),
+        }
     }
 
     /// The stations connected now from `client`'s host, by key. A host is what the relay counts a

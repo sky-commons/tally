@@ -361,6 +361,8 @@ it: the figures simply go empty.
   Run readsb with `--write-json-every 0.2` so its answer is as fresh as the stream's
 - `GET /v1/network`: receivers, their message rate, and `aircraft` (readsb's positioned aircraft
   and those only Tally MLAT places) with `aircraft_by_source` summing to it
+- `GET /v1/stations`: every station the relay knows, each `key` and `state` (`feeding`, `silent`
+  or `offline`), by key
 - `GET /v1/stations/KEY` (the key as base64url without padding), `GET /v1/stations/KEY/stats`
 - `GET /v1/leaderboards`, `GET /v1/leaderboards/AREA`: every area with a feeder, its `receivers`
   beside the `ranked` among them, and an area's feeders without standing as `unranked`
