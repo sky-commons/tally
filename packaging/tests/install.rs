@@ -380,7 +380,7 @@ fn an_install_waits_for_publishing_and_prints_the_station_page() -> Result {
     assert!(out.contains("installed and publishing"), "{out}");
     assert!(
         out.contains(
-            "https://tally.skycommons.org/feeders/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-_8\n"
+            "https://tally.skycommons.org/feeders/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-_8/\n"
         ),
         "{out}"
     );
@@ -1388,7 +1388,7 @@ fn a_crashing_feeder_is_said_to_crash_with_its_error() -> Result {
         "inside a container",
         "#run-it-as-a-container",
         PUBLIC,
-        "https://tally.skycommons.org/feeders/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-_8",
+        "https://tally.skycommons.org/feeders/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-_8/",
     ] {
         assert!(err.contains(needed), "{needed:?}: {err}");
     }
@@ -1425,7 +1425,7 @@ fn a_feeder_reaching_no_relay_still_gets_its_key_page_and_readsb_location() -> R
     for needed in [
         "has not reached a relay",
         PUBLIC,
-        "https://tally.skycommons.org/feeders/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-_8",
+        "https://tally.skycommons.org/feeders/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA-_8/",
     ] {
         assert!(err.contains(needed), "{needed:?}: {err}");
     }

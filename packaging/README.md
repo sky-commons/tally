@@ -90,7 +90,7 @@ Raspberry Pi OS Bullseye and anything newer).
     `TALLY_FEED_EXTRA`.
   - **Start:** starts the service and waits up to 20 s for it to be active and log
     `tally-feed: publishing to RELAY`. Only then does it say it is installed, print the public key
-    and the station page, `https://tally.skycommons.org/feeders/<key>` (the key as base64url
+    and the station page, `https://tally.skycommons.org/feeders/<key>/` (the key as base64url
     without padding), and exit 0. Otherwise it prints why (a feeder that keeps crashing is
     called that, with its error, as soon as systemd restarts it: `Restart=always` would count it
     active), the feeder's log since this run started it, the public key and station page all the
@@ -244,7 +244,7 @@ That is all of it: no key to make or paste, and no relay to name.
   and logs a warning at every start saying what it lacks.
 - **Identity:** on the first run the feeder makes its key in the volume
   (`/var/lib/tally-feed/key`), and every start logs the receiver's public key and its station page,
-  `https://tally.skycommons.org/feeders/<key>` (`docker logs tally-feed`). Keep the volume: the
+  `https://tally.skycommons.org/feeders/<key>/` (`docker logs tally-feed`). Keep the volume: the
   key is the antenna's name for good. A host that keeps secrets in its own configuration sets
   `TALLY_KEY` to the first line of `docker run --rm ghcr.io/sky-commons/tally-feed:0 new-key`
   instead, and then no key file is made.

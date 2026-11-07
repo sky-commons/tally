@@ -46,9 +46,10 @@ static COUNTING: tally_counting::Counting = tally_counting::Counting;
 /// A station's page on the Tally site, by its key as a URL carries it (base64url, no padding).
 pub const STATION_PAGE: &str = "https://tally.skycommons.org/feeders/";
 
-/// Where `public`'s numbers are shown: its station page.
+/// Where `public`'s numbers are shown: its station page, at the page's own address (with the
+/// trailing slash; without it, the site answers with a redirect to it).
 pub fn station_link(public: &tally_wire::PublicKey) -> String {
-    format!("{STATION_PAGE}{}", public.to_base64url())
+    format!("{STATION_PAGE}{}/", public.to_base64url())
 }
 
 pub fn init(path: &std::path::Path) -> Result<(), String> {
@@ -432,7 +433,10 @@ mod tests {
             .map_err(|error| error.to_string())?
             .public();
         let link = station_link(&public);
-        let key = link.strip_prefix(STATION_PAGE).ok_or(link.clone())?;
+        let key = link
+            .strip_prefix(STATION_PAGE)
+            .and_then(|rest| rest.strip_suffix('/'))
+            .ok_or(link.clone())?;
         assert!(!key.contains(['+', '/', '=']), "{link}");
         assert_eq!(
             tally_wire::PublicKey::from_base64url(key).map_err(|error| error.to_string())?,
