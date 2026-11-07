@@ -249,8 +249,7 @@ rust_test(
 )
 
 # A feeder figures row at every cap allocates no more than the charge it takes
-# (`figures::PER_RECEIVER_BYTES`), measured by a counting allocator: its own binary, so nothing
-# else allocates while it measures.
+# (`figures::PER_RECEIVER_BYTES`), measured by an allocator counting the test's own thread.
 rust_test(
     name = "figures_bytes",
     size = "small",
@@ -266,8 +265,7 @@ rust_test(
 )
 
 # A shard's station rows at its share of the receiver figure allocate no more than they are
-# charged (`stations::planned_bytes`), measured by a counting allocator: its own binary, so nothing
-# else allocates while it measures.
+# charged (`stations::planned_bytes`), measured by an allocator counting the test's own thread.
 rust_test(
     name = "stations_bytes",
     size = "medium",  # 25 s on a loaded 32-core host, 2026-10-30
@@ -283,11 +281,13 @@ rust_test(
 
 # The tables that grow with what the relay is sent (the products' remembered tables, the world
 # gatherers' fixes, standing's and the positions checks') allocate no more than they are charged,
-# measured by a counting allocator: its own binary, so nothing else allocates while it measures.
+# measured by an allocator counting the whole process (standing's tables allocate on a thread of
+# their own), so the binary runs without libtest's harness, whose threads would allocate beside it.
 rust_test(
     name = "tables_bytes",
     size = "medium",  # 49 s on a loaded 32-core host, 2026-10-30: the step and the models are measured too
     srcs = ["tests/tables_bytes.rs"],
+    use_libtest_harness = False,
     edition = "2024",
     lint_config = ":cargo_lints",
     deps = [
@@ -301,8 +301,7 @@ rust_test(
 
 # The positions checks' twins (RFC-0181, "The positions checks") allocate no more than their
 # store is charged: one raw record a link, each the largest positions record, filled past the
-# links planned, measured by a counting allocator: its own binary, so nothing else allocates while
-# it measures.
+# links planned, measured by an allocator counting the test's own thread.
 rust_test(
     name = "twins_bytes",
     size = "small",

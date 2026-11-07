@@ -38,5 +38,11 @@ tally-feed = { path = "../feed" }
 # `test-util` pauses time, so a deadline test waits no real seconds.
 tokio = { workspace = true, features = ["test-util"] }
 
+# Run without libtest's harness: it counts the whole process's allocations, and the harness's own
+# threads would allocate beside it (tests/tables_bytes.rs).
+[[test]]
+name = "tables_bytes"
+harness = false
+
 [lints]
 workspace = true

@@ -1,19 +1,20 @@
 //! A holder of raw reports the bytes it really allocated (RFC-0181 §5 and invariant 8): admission is
 //! sized on `Arrived::bytes`, so it must count what is in memory, never an estimate below it.
-//! Measured by an allocator that counts every byte asked of it, the only test in this binary so
-//! nothing else allocates while it measures.
+//! Measured by an allocator that counts every byte this thread asks for
+//! (`tally_counting::Counting`), so nothing another thread allocates, libtest's own among them, is
+//! counted.
 
 use tally_mlat_solver::arrived::{Arrived, Limits, SLICE_MS};
 use tally_mlat_solver::sim::{self, Scenario};
 
-/// The system's allocator, counting the bytes live and the allocations.
+/// The system's allocator, counting this thread's bytes live and its allocations.
 #[global_allocator]
-static GLOBAL: tally_counting::CountingAll = tally_counting::CountingAll;
+static GLOBAL: tally_counting::Counting = tally_counting::Counting;
 
 fn live() -> (isize, isize) {
     (
-        tally_counting::CountingAll::live(),
-        tally_counting::CountingAll::allocations(),
+        tally_counting::Counting::live(),
+        tally_counting::Counting::allocations(),
     )
 }
 

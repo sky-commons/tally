@@ -50,8 +50,7 @@ rust_test(
 )
 
 # The pool's byte accounting (`arrived::Arrived`) against an allocator that counts every byte
-# (RFC-0181 §5): a binary of its own, since a counting allocator is global and nothing else may
-# allocate while it measures.
+# (RFC-0181 §5), counting the test's own thread.
 rust_test(
     name = "arrived_bytes",
     size = "small",

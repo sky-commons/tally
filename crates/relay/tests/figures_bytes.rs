@@ -1,7 +1,8 @@
 //! A receiver's feeder figures row costs no more than the charge it takes (`figures::
 //! PER_RECEIVER_BYTES`, RFC-0181 "Memory is charged once"): the store is sized on the charge, so it
 //! must cover what a row at every cap really allocates. Measured by an allocator that counts every
-//! byte asked of it, the only test in this binary so nothing else allocates while it measures.
+//! byte this thread asks for (`tally_counting::Counting`), so nothing another thread allocates, libtest's own among them, is
+//! counted.
 
 #![allow(clippy::disallowed_methods, reason = "a test's scripted readings")]
 use tally_mlat_solver::modes;
@@ -10,7 +11,7 @@ use tally_wire::clocks::recorded::{aligned, judged};
 use tally_wire::{Batch, BatchContent, Decoded, Identity, Location, Observation, Region};
 
 #[global_allocator]
-static GLOBAL: tally_counting::CountingAll = tally_counting::CountingAll;
+static GLOBAL: tally_counting::Counting = tally_counting::Counting;
 
 const HOUR_MS: u64 = tally_wire::FIGURES_BUCKET_MS;
 const T: u64 = 497_561 * HOUR_MS;
@@ -115,7 +116,7 @@ fn a_full_row_costs_no_more_than_its_charge() {
             Vec::new(),
         ));
     }
-    let before = tally_counting::CountingAll::live();
+    let before = tally_counting::Counting::live();
     for decoded in &batches {
         figures.batch_sited(
             decoded,
@@ -124,7 +125,7 @@ fn a_full_row_costs_no_more_than_its_charge() {
             judged(decoded.wall_ms()),
         );
     }
-    let row = tally_counting::CountingAll::live() - before;
+    let row = tally_counting::Counting::live() - before;
     assert_eq!(figures.rows(), 1);
     eprintln!("a full row: {row} bytes of {PER_RECEIVER_BYTES} charged");
     assert!(

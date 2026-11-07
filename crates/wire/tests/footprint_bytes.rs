@@ -1,8 +1,9 @@
 //! What `tally_wire::footprint` says a collection allocates is what it allocates (RFC-0181
 //! "Memory is charged once"): every store charges its maps, sets, vectors and deques by it, and a
-//! store is sized on its charge. Measured by an allocator that counts every byte asked of it, as
-//! each collection grows, churns and shrinks: a vector or deque and a hash map exactly, a B-tree
-//! at most. The only test in this binary, so nothing else allocates while it measures.
+//! store is sized on its charge. Measured by an allocator that counts every byte this thread asks
+//! for (`tally_counting::Counting`), as each collection grows, churns and shrinks: a vector or
+//! deque and a hash map exactly, a B-tree at most. No other thread's bytes are counted, libtest's
+//! own among them.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -10,24 +11,24 @@ use tally_wire::footprint::{
     Deque, Table, Tree, btree, btree_planned, exact, shared_bytes, table_per_entry, vec,
 };
 
-use tally_counting::CountingAll;
+use tally_counting::Counting;
 
 #[global_allocator]
-static GLOBAL: CountingAll = CountingAll;
+static GLOBAL: Counting = Counting;
 
 /// Starts a measure of the peak: the bytes live now.
 fn peak_mark() -> isize {
-    CountingAll::peak_base()
+    Counting::peak_base()
 }
 
 /// The most live at once since `mark` (a [`peak_mark`]), above it.
 fn peak_since(mark: isize) -> usize {
-    usize::try_from(CountingAll::peak_since(mark)).unwrap_or(0)
+    usize::try_from(Counting::peak_since(mark)).unwrap_or(0)
 }
 
 /// The bytes allocated since `base`.
 fn since(base: isize) -> usize {
-    usize::try_from(CountingAll::since(base)).unwrap_or(0)
+    usize::try_from(Counting::since(base)).unwrap_or(0)
 }
 
 /// A small generator that allocates nothing (splitmix64).
@@ -93,7 +94,7 @@ impl<const N: usize> Value for [u8; N] {
 /// shrunk now and then. Its table is what `Table` says throughout, and no insert grows it by more
 /// than `Table::growth` foretold.
 fn hash_map<const N: usize, V: Value>(mix: &mut Mix, removed: &mut Vec<[u8; N]>) {
-    let base = CountingAll::live();
+    let base = Counting::live();
     let mut map: HashMap<[u8; N], V> = HashMap::new();
     let mut table = Table::default();
     let mut next = 0u64;
@@ -141,7 +142,7 @@ fn hash_map<const N: usize, V: Value>(mix: &mut Mix, removed: &mut Vec<[u8; N]>)
 /// A map kept within four times its entries (`Table::kept`) as it churns: what it allocates is
 /// what `Table` says, and never more than `table_per_entry` of four for each entry it holds.
 fn kept_map<const N: usize, V: Value>(mix: &mut Mix, removed: &mut Vec<[u8; N]>) {
-    let base = CountingAll::live();
+    let base = Counting::live();
     let mut map: HashMap<[u8; N], V> = HashMap::new();
     let mut table = Table::default();
     let mut next = 0u64;
@@ -198,7 +199,7 @@ fn kept_map<const N: usize, V: Value>(mix: &mut Mix, removed: &mut Vec<[u8; N]>)
 /// hashbrown makes them with its least buckets (sixteen for one byte), whatever their capacity is
 /// kept within, and `table_per_entry` still holds them.
 fn small_map<const N: usize, V: Value>(per: usize) {
-    let base = CountingAll::live();
+    let base = Counting::live();
     let per_entry = table_per_entry::<[u8; N], V>(per);
     let most = if N == 1 { 200 } else { 40 };
     for len in 1..=most {
@@ -224,7 +225,7 @@ fn small_map<const N: usize, V: Value>(per: usize) {
 /// A B-tree of `N`-byte keys to `V`, churned in random and in rising order: it never allocates
 /// more than `btree` of its length, nor than its plan.
 fn btree_map<const N: usize, V: Value>(mix: &mut Mix, removed: &mut Vec<[u8; N]>) {
-    let base = CountingAll::live();
+    let base = Counting::live();
     let mut map: BTreeMap<[u8; N], V> = BTreeMap::new();
     let mut next = 0u64;
     let mut most = 0usize;
@@ -275,7 +276,7 @@ fn btree_map<const N: usize, V: Value>(mix: &mut Mix, removed: &mut Vec<[u8; N]>
 /// A `Tree` churned as the B-tree above: within what it says it allocates, and nothing once
 /// emptied, however it was emptied.
 fn tree<const N: usize, V: Value>(mix: &mut Mix, removed: &mut Vec<[u8; N]>) {
-    let base = CountingAll::live();
+    let base = Counting::live();
     let mut map: Tree<[u8; N], V> = Tree::new();
     for round in 0..200u64 {
         for _ in 0..mix.below(1_500) {
@@ -310,7 +311,7 @@ fn tree<const N: usize, V: Value>(mix: &mut Mix, removed: &mut Vec<[u8; N]>) {
 /// A `Tree` split as a store splits one (what is due taken off): each half within what it says
 /// it allocates, and nothing once both are gone.
 fn split_tree<const N: usize, V: Value>(mix: &mut Mix) {
-    let base = CountingAll::live();
+    let base = Counting::live();
     let mut map: Tree<[u8; N], V> = Tree::new();
     for round in 0..100u64 {
         for _ in 0..mix.below(1_000) {
@@ -342,7 +343,7 @@ fn split_tree<const N: usize, V: Value>(mix: &mut Mix) {
 /// than its length keeps ([`Deque::bytes_at_most`]) after anything that lets entries go, grown by
 /// exactly what [`Deque::growth`] said, and nothing once cleared or taken.
 fn churned_deque<T: Value, const L: usize>(mix: &mut Mix) {
-    let base = CountingAll::live();
+    let base = Counting::live();
     let mut deque: Deque<T, L> = Deque::new();
     let check = |deque: &Deque<T, L>, shrunk: bool| {
         assert_eq!(since(base), deque.bytes(), "deque of {}", deque.len());
@@ -457,7 +458,7 @@ fn every_collection_allocates_what_its_footprint_says() -> Result<(), String> {
     let mut removed40: Vec<[u8; 40]> = Vec::with_capacity(4_096);
 
     // A vector and a deque: their capacity, as they grow, churn and shrink.
-    let base = CountingAll::live();
+    let base = Counting::live();
     let mut list: Vec<(u64, [u8; 32])> = Vec::new();
     let mut deque: VecDeque<(u32, u32)> = VecDeque::new();
     for round in 0..2_000u64 {
@@ -530,7 +531,7 @@ fn every_collection_allocates_what_its_footprint_says() -> Result<(), String> {
     signed_batches_allocate_what_they_say().map_err(|error| error.to_string())?;
 
     // Bytes made exact, then cloned and sliced as a piece's are.
-    let base = CountingAll::live();
+    let base = Counting::live();
     for len in [1usize, 40, 1_000, 65_536] {
         let mut encoded = Vec::new();
         for n in 0..len {
@@ -629,7 +630,7 @@ fn records_allocate_what_they_say() -> Result<(), Box<dyn std::error::Error>> {
     }
     drop(records);
     for bytes in &encoded {
-        let base = CountingAll::live();
+        let base = Counting::live();
         let (record, _) = Record::decode(bytes, tally_wire::record::MAX_VERSION)?;
         let record = record.ok_or_else(|| "a record this build reads".to_owned())?;
         let kept = since(base);
@@ -694,7 +695,7 @@ fn signed_batches_allocate_what_they_say() -> Result<(), tally_wire::WireError> 
             }),
         ];
         for (how, sign) in signers {
-            let base = CountingAll::live();
+            let base = Counting::live();
             let batch = sign()?;
             let kept = since(base);
             assert!(
