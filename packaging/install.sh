@@ -136,7 +136,8 @@ STATE_PRIVATE=/var/lib/private/tally-feed
 # The unit's LoadCredential= and $CREDENTIALS_DIRECTORY need this systemd or later (Debian
 # bullseye has 247).
 SYSTEMD_AT_LEAST=247
-# A station's page, by its public key as base64url without padding.
+# A station's page, by its public key as base64url without padding and a trailing slash, the
+# page's own address (without it, the site answers with a redirect to it).
 STATION_PAGE=https://tally.skycommons.org/feeders
 ISSUES=https://github.com/sky-commons/tally/issues
 IMAGE=ghcr.io/sky-commons/tally-feed
@@ -1295,7 +1296,7 @@ not_publishing() {
   say "Its log since this run started it:" >&2
   run_log -n 40 >&2
   printf "\nThis receiver's public key, its name on the network:\n\n  %s\n" "$public" >&2
-  printf "\nIts station page, once the network holds its first receptions:\n\n  %s/%s\n" "$STATION_PAGE" "$(base64url "$public")" >&2
+  printf "\nIts station page, once the network holds its first receptions:\n\n  %s/%s/\n" "$STATION_PAGE" "$(base64url "$public")" >&2
   if [[ -n $crashed ]]; then
     printf '\nNext: fix what its error says and run this again, or open an issue with the lines above:\n%s\n\n' "$ISSUES" >&2
   else
@@ -1533,7 +1534,7 @@ main() {
   printf '\ntally-feed %s is installed and publishing (systemctl status tally-feed; journalctl -u tally-feed).\n' \
     "$VERSION"
   printf "\nThis receiver's public key, its name on the network:\n\n  %s\n" "$public"
-  printf "\nIts station page, once the network holds its first receptions:\n\n  %s/%s\n\n" "$STATION_PAGE" "$(base64url "$public")"
+  printf "\nIts station page, once the network holds its first receptions:\n\n  %s/%s/\n\n" "$STATION_PAGE" "$(base64url "$public")"
   printf "What it publishes, in open data anyone can read: every reception this receiver's decoders\n"
   printf 'report, signed with that key.\n'
   printf 'To change the location, run this again with --locate (it asks for the address), or with\n'
