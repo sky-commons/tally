@@ -306,6 +306,7 @@ fn the_network_and_station_answers_are_the_fixtures() -> Result<(), String> {
         &offline.station(&station_key()).ok_or("no station")?,
         fixtures::STATION_OFFLINE,
     )?;
+    same(&located.list(), fixtures::STATIONS)?;
     let home: std::net::IpAddr = "203.0.113.7".parse().map_err(|_| "not an address")?;
     same(&located.mine(Some(home)), fixtures::ME)
 }

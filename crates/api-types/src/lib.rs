@@ -252,6 +252,25 @@ pub enum LocationCheckState {
     Wrong,
 }
 
+/// `GET /v1/stations`: every station the relay knows, each by key and what it is doing, so a
+/// client can list them (the site prerenders a page for each). Each one's details are its own
+/// `GET /v1/stations/{key}`; nothing here places a station.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StationList {
+    /// When the relay reported them: Unix milliseconds on the API's clock.
+    pub now_ms: u64,
+    /// By key, as `key` sorts.
+    pub stations: Vec<ListedStation>,
+}
+
+/// One station of `GET /v1/stations`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ListedStation {
+    /// The receiver's public key as tally prints it (standard base64).
+    pub key: String,
+    pub state: StationState,
+}
+
 /// `GET /v1/me`: the stations connected now from the asking client's own host (its IPv4 address or
 /// IPv6 /64), as the relay saw it (an "am I feeding" check); empty when none is. Never any other station, and
 /// never cached, since it depends on who asks.
@@ -500,6 +519,8 @@ pub mod fixtures {
     /// `GET /v1/stations/{key}`: a located station whose place the relay's location check holds
     /// wrong by about 45 km (RFC-0204).
     pub const STATION_MISPLACED: &str = include_str!("../testdata/station_misplaced.json");
+    /// `GET /v1/stations`: the one station the relay knows, feeding.
+    pub const STATIONS: &str = include_str!("../testdata/stations.json");
     /// The key the station fixtures name, as base64url without padding (the path's form).
     pub const STATION_KEY_URL: &str = "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw";
     /// `GET /v1/me`: the one station of the asking client's address.
@@ -554,6 +575,7 @@ mod tests {
         whole::<Leaderboards>(fixtures::LEADERBOARDS)?;
         whole::<Leaderboard>(fixtures::LEADERBOARD)?;
         whole::<Leaderboard>(fixtures::LEADERBOARD_UNRANKED)?;
+        whole::<StationList>(fixtures::STATIONS)?;
         whole::<MeResponse>(fixtures::ME)?;
         whole::<Vec<Route>>(fixtures::ROUTESET)?;
         whole::<RouteSetRequest>(fixtures::ROUTESET_REQUEST)

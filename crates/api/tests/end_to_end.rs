@@ -488,6 +488,20 @@ async fn the_api_serves_aircraft_the_network_and_a_station_from_readsb_and_a_rea
     assert_eq!(header(&headers, &ACCESS_CONTROL_ALLOW_ORIGIN), SITE);
     assert_eq!(header(&headers, &CACHE_CONTROL), "public, max-age=15");
 
+    // Listed among every station the relay knows, by its key and state, and nothing placed.
+    let (_, listed) =
+        until::<tally_api_types::StationList>(&format!("{api}/v1/stations"), |list| {
+            !list.stations.is_empty()
+        })
+        .await?;
+    assert_eq!(
+        listed.stations,
+        vec![tally_api_types::ListedStation {
+            key: key.to_base64(),
+            state: tally_api_types::StationState::Feeding,
+        }]
+    );
+
     // A key the relay does not know, and a path that is not a key.
     let stranger = Identity::generate().map_err(text)?.public();
     let (status, headers, _) =
