@@ -46,6 +46,17 @@
 # The altitude is never assumed: when no source holds one, it is asked for on the terminal, and
 # with no terminal the install stops naming TALLY_ALT.
 #
+# Every altitude the owner gives (TALLY_ALT, the terminal) or a receiver's setup holds is taken as
+# the antenna's height above sea level, which is what they all give (adsb.im's FEEDER_ALT_M is
+# "Altitude above mean sealevel"), and turned into the height above the WGS84 ellipsoid that
+# tally-feed's --alt is and MLAT needs, by adding the geoid's height there from geoid.txt.gz, the
+# release's EGM2008 grid (below). The block in /etc/default/tally-feed holds the converted value and
+# says how it was found. What an earlier run wrote is above the ellipsoid already, and it is kept
+# exactly, on every rerun and automatic update, while the location is the one it was written for
+# and the owner names no other altitude (TALLY_ALT, or an address): no release moves a receiver's
+# altitude by itself. An owner who knows the antenna's height above the ellipsoid (from a survey
+# GPS, say) gives it as --alt in TALLY_FEED_EXTRA, which wins.
+#
 # Or it finds the location from an address (RFC-0204): with --locate, with TALLY_ADDRESS="...", or
 # when no source holds one and the owner gives an address on the terminal. The address is geocoded
 # by the US Census geocoder (US addresses) and OpenStreetMap's Nominatim (elsewhere, and as the
@@ -103,14 +114,15 @@
 #                                    what it learned and /etc/default/tally-feed; keeps the key, so a
 #                                    later install is the same station
 #   install.sh --uninstall --purge   the same, and deletes the key: the station's identity is gone
-#                                    for good
+#                                    for good. On a terminal it asks you to type delete; with
+#                                    none it deletes the key only with TALLY_PURGE_KEY=yes
 set -euo pipefail
 
-VERSION="v0.7.4"
+VERSION="v0.7.8"
 # Where this release is published, whose `tally-feed` binaries, unit and seed list this script
 # installs. The source names no publisher: the publisher writes its release's address here when it
 # publishes it, and TALLY_RELEASE overrides it.
-PUBLISHED_RELEASE="https://github.com/sky-commons/tally/releases/download/v0.7.4"
+PUBLISHED_RELEASE="https://github.com/sky-commons/tally/releases/download/v0.7.8"
 # What any public map shows of the location: the feeder's public cell (H3 resolution 6).
 PUBLIC_AREA="~6 km"
 BIN=/usr/local/bin/tally-feed
@@ -494,7 +506,8 @@ previous_arguments() {
 }
 
 # Each location source sets cand_lat, cand_lon and cand_alt (any may be empty) and cand_from, which
-# names where they were read (cand_alt_from, if set, names where the altitude was).
+# names where they were read (cand_alt_from, if set, names where the altitude was). An altitude is
+# above sea level, unless cand_alt_datum says ellipsoid: only what an earlier run wrote is.
 from_env() {
   if [[ -n ${TALLY_LAT:-} || -n ${TALLY_LON:-} ]] && [[ -z ${TALLY_LAT:-} || -z ${TALLY_LON:-} ]]; then
     stop "TALLY_LAT and TALLY_LON go together; nothing was installed"
@@ -573,10 +586,47 @@ from_previous() {
   [[ -n $args ]] || return 0
   cand_lat="$(flag_value --lat <<<"$args")" cand_lon="$(flag_value --lon <<<"$args")"
   cand_alt="$(flag_value --alt <<<"$args")" cand_from="the earlier install ($DEFAULTS)"
+  cand_alt_datum=ellipsoid
 }
 
-# Takes the candidate's location if none is settled yet and its altitude likewise. A discovered
-# altitude of 0 is taken for "not set", as an unset one often reads; only TALLY_ALT can say 0.
+# Where an earlier run said its altitude came from: the end of the block's "# Location from ...,
+# altitude from ...." line, or nothing.
+saved_altitude_record() {
+  [[ -r $DEFAULTS ]] || return 0
+  sed -n 's/^# Location from .*, altitude from \(.*\)\.$/\1/p' "$DEFAULTS" | tail -n 1
+}
+
+# Keeps the altitude an earlier run wrote, exactly, when the location settled is the one it wrote
+# it for and the owner named no other (TALLY_ALT): it is above the ellipsoid already, as that run
+# found or converted it, where a source read again could give it otherwise (a sea-level one, which a
+# release before v0.7.7 wrote as it was). So neither a rerun nor an automatic update moves the
+# altitude by itself. The block goes on saying where that run had it from (alt_record).
+keep_saved_altitude() {
+  [[ -z ${TALLY_ALT:-} && -n $lat ]] || return 0
+  local args saved record
+  args="$(previous_arguments)"
+  [[ -n $args ]] || return 0
+  [[ $(flag_value --lat <<<"$args") == "$lat" && $(flag_value --lon <<<"$args") == "$lon" ]] || return 0
+  saved="$(flag_value --alt <<<"$args")"
+  saved="$(metres "$saved")" || saved=""
+  [[ -n $saved ]] || return 0
+  alt="$saved" alt_datum=ellipsoid alt_from="the earlier install ($DEFAULTS)"
+  record="$(saved_altitude_record)"
+  case "$record" in
+    "") alt_record="the earlier install" ;;
+    "the earlier install"*) alt_record="$record" ;;
+    *) alt_record="the earlier install, which had it from $record" ;;
+  esac
+  # A release before v0.7.7 wrote a sea-level altitude as it was; the owner is told how to have it
+  # converted, and nothing is changed by itself.
+  if [[ $alt_record != *ellipsoid* ]]; then
+    say "note: the altitude $alt m is kept as the earlier install wrote it, as the height above the WGS84 ellipsoid (from ${record:-it}). If it is the antenna's height above sea level, as most setups give, run this again with TALLY_ALT=$alt and it is converted."
+  fi
+}
+
+# Takes the candidate's location if none is settled yet and its altitude likewise (alt_datum
+# saying whether it is above sea level or the ellipsoid). A discovered altitude of 0 is taken for
+# "not set", as an unset one often reads; only TALLY_ALT can say 0.
 consider() {
   if [[ -z $lat && -n $cand_lat && -n $cand_lon ]]; then
     if within "$cand_lat" 90 && within "$cand_lon" 180; then
@@ -593,7 +643,7 @@ consider() {
     elif [[ $m == 0 && $from != TALLY_ALT ]]; then
       say "ignoring the altitude 0 in $from: it is what an unset altitude reads as"
     else
-      alt="$m" alt_from="$from"
+      alt="$m" alt_from="$from" alt_datum="${cand_alt_datum:-sea}"
     fi
   fi
 }
@@ -727,6 +777,50 @@ END {
 }'
 }
 
+# N at LAT LON, metres, into geoid_n, from the release's geoid grid: downloaded once a run, checked
+# against its sha256 here and against its signature with the release's other files (`signed`)
+# before anything is installed. False, saying why in `why`, when it cannot be read.
+geoid_height() {
+  geoid_n=""
+  if [[ -z ${geoid_ready:-} ]]; then
+    if ! command -v gzip >/dev/null; then
+      why="gzip, which reads it, is not installed"
+      return 1
+    fi
+    if ! fetch "$release/$GEOID" "$work/$GEOID" || ! fetch "$release/$GEOID.sha256" "$work/$GEOID.sha256"; then
+      why="it could not be downloaded from $release"
+      return 1
+    fi
+    local want
+    want="$(awk 'NR == 1 { print $1 }' "$work/$GEOID.sha256")"
+    if [[ -z $want || $want != "$(sha256_of "$work/$GEOID")" ]]; then
+      why="it does not match its sha256"
+      return 1
+    fi
+    fetched+=("$GEOID")
+    geoid_ready=1
+  fi
+  if ! geoid_n="$(gzip -dc "$work/$GEOID" | geoid_of "$1" "$2")" || [[ -z $geoid_n ]]; then
+    why="it gives no geoid height at $1, $2"
+    geoid_n=""
+    return 1
+  fi
+}
+
+# Turns an altitude above sea level into the height above the WGS84 ellipsoid that --alt is, with
+# the geoid's height there (`geoid_height`): alt is then whole metres above the ellipsoid, and
+# alt_from says how it was found. Stops, having installed nothing, without the grid.
+settle_altitude() {
+  [[ $alt_datum == ellipsoid ]] && return 0
+  geoid_height "$lat" "$lon" ||
+    stop "could not read the release's geoid grid ($GEOID), which turns the antenna's height above sea level into the height above the WGS84 ellipsoid that MLAT needs: $why. Nothing was installed."
+  local msl="$alt"
+  alt="$(awk -v a="$msl" -v n="$geoid_n" 'BEGIN { printf "%.0f", a + n }')"
+  alt=$((alt + 0))
+  alt_from="$alt_from, $msl m above sea level, and the geoid there, $geoid_n m (EGM2008): metres above the WGS84 ellipsoid"
+  alt_datum=ellipsoid
+}
+
 # The antenna's height above the ground, metres: TALLY_ANTENNA (window, upstairs, roof or metres),
 # else asked on the terminal, else a window's. Sets antenna and antenna_from.
 antenna_height() {
@@ -763,7 +857,7 @@ address_line() {
 # the owner says it is not right; a location found with no elevation leaves alt for the questions.
 locate_address() {
   local address="$1" query census="" osm="" cc="-" olat olon apart us="" ground="" ground_from=""
-  local n answer geoid_sha
+  local n answer
   why=""
   say "$(address_line)"
   query="$(printf '%s' "$address" | urlencode)"
@@ -825,22 +919,14 @@ locate_address() {
     say "no elevation service answered for $lat, $lon; the altitude is asked for instead"
     return 0
   fi
-  # The geoid grid, checked against its sha256 here and against its signature with the release's
-  # other files (`signed`), before anything is installed.
-  if ! command -v gzip >/dev/null || ! fetch "$release/$GEOID" "$work/$GEOID" ||
-    ! fetch "$release/$GEOID.sha256" "$work/$GEOID.sha256"; then
-    say "could not read the release's geoid grid ($GEOID); the altitude is asked for instead"
+  if ! geoid_height "$lat" "$lon"; then
+    say "could not read the release's geoid grid ($GEOID): $why; the altitude is asked for instead"
     return 0
   fi
-  geoid_sha="$(awk 'NR == 1 { print $1 }' "$work/$GEOID.sha256")"
-  if [[ -z $geoid_sha || $geoid_sha != "$(sha256_of "$work/$GEOID")" ]] ||
-    ! n="$(gzip -dc "$work/$GEOID" | geoid_of "$lat" "$lon")" || [[ -z $n ]]; then
-    say "the release's geoid grid ($GEOID) does not match its sha256; the altitude is asked for instead"
-    return 0
-  fi
-  fetched+=("$GEOID")
+  n="$geoid_n"
   antenna_height
   alt="$(awk -v g="$ground" -v a="$antenna" -v n="$n" 'BEGIN { printf "%.0f", g + a + n }')"
+  alt=$((alt + 0)) alt_datum=ellipsoid
   alt_from="the ground, $(awk -v g="$ground" 'BEGIN { printf "%.1f", g }') m ($ground_from), the antenna, $antenna m above it ($antenna_from), and the geoid, $n m (EGM2008): metres above the WGS84 ellipsoid"
 }
 
@@ -894,7 +980,7 @@ set_readsb_location() {
 # address is asked for first.
 discover_location() {
   local mode="$1" source address="" sources=(env adsbim readsb piaware dump1090 feed_clients ultrafeeder previous)
-  lat="" lon="" alt="" lat_from="" alt_from="" located_by_address=""
+  lat="" lon="" alt="" lat_from="" alt_from="" located_by_address="" alt_datum="" alt_record=""
   local locating=""
   if [[ $mode == ask && ( -n ${TALLY_ADDRESS:-} || -n ${locate:-} ) ]]; then
     if [[ -n ${TALLY_LAT:-} || -n ${TALLY_LON:-} ]]; then
@@ -903,10 +989,11 @@ discover_location() {
     locating=1 address="${TALLY_ADDRESS:-}" sources=(env)
   fi
   for source in "${sources[@]}"; do
-    cand_lat="" cand_lon="" cand_alt="" cand_from="" cand_alt_from=""
+    cand_lat="" cand_lon="" cand_alt="" cand_from="" cand_alt_from="" cand_alt_datum=""
     "from_$source"
     consider
   done
+  [[ -n $locating ]] || keep_saved_altitude
   [[ $mode == ask ]] || return 0
 
   if [[ -z $lat && -z $locating ]] && have_tty; then
@@ -918,26 +1005,26 @@ discover_location() {
     address="$(ask "The antenna's street address:")"
   fi
   if [[ -n $locating ]] && ! locate_address "$address"; then
-    have_tty || stop "could not find the location from the address: $why. Name it instead and run this again: $(run_again "TALLY_LAT=51.4775 TALLY_LON=-0.4614 TALLY_ALT=25") (TALLY_ALT in metres above the WGS84 ellipsoid). Nothing was installed."
+    have_tty || stop "could not find the location from the address: $why. Name it instead and run this again: $(run_again "TALLY_LAT=51.4775 TALLY_LON=-0.4614 TALLY_ALT=25") (TALLY_ALT: the antenna's height above sea level, in metres or with ft). Nothing was installed."
     say "could not find the location from the address: $why. Type the coordinates instead."
   fi
   address=""
 
   if [[ -z $lat ]]; then
-    have_tty || stop "found no receiver location (in TALLY_LAT and TALLY_LON, adsb.im, readsb, PiAware, dump1090-fa, a feed client or an ultrafeeder container). Name it and run this again: $(run_again "TALLY_LAT=51.4775 TALLY_LON=-0.4614 TALLY_ALT=25") (TALLY_ALT in metres, or with ft). Nothing was installed."
+    have_tty || stop "found no receiver location (in TALLY_LAT and TALLY_LON, adsb.im, readsb, PiAware, dump1090-fa, a feed client or an ultrafeeder container). Name it and run this again: $(run_again "TALLY_LAT=51.4775 TALLY_LON=-0.4614 TALLY_ALT=25") (TALLY_ALT: the antenna's height above sea level, in metres or with ft). Nothing was installed."
     say "found no receiver location; multilateration needs the antenna's own."
     until within "$lat" 90; do lat="$(ask "Antenna latitude, decimal degrees (e.g. 51.4775):")"; done
     until within "$lon" 180; do lon="$(ask "Antenna longitude, decimal degrees, west negative (e.g. -0.4614):")"; done
     lat_from="the terminal"
   fi
   if [[ -z $alt ]]; then
-    have_tty || stop "found the location ($lat, $lon from $lat_from) but no altitude, and multilateration needs a real one. Name it and run this again: $(run_again TALLY_ALT=25) (metres above the WGS84 ellipsoid, or with ft; sea level is what most setups give). Nothing was installed."
+    have_tty || stop "found the location ($lat, $lon from $lat_from) but no altitude, and multilateration needs a real one. Name it and run this again: $(run_again TALLY_ALT=25) (the antenna's height above sea level, in metres or with ft; this script turns it into the height above the WGS84 ellipsoid that MLAT needs). Nothing was installed."
     local answer=""
     until [[ -n $alt ]]; do
-      answer="$(ask "Antenna altitude, metres above the WGS84 ellipsoid (or e.g. 80ft):")"
+      answer="$(ask "Antenna altitude above sea level, metres (or e.g. 80ft):")"
       alt="$(metres "$answer")" || alt=""
     done
-    alt_from="the terminal"
+    alt_from="the terminal" alt_datum=sea
   fi
 }
 
@@ -1012,7 +1099,11 @@ container_route() {
   printf '      - BEASTHOST=%s\n' "$name"
   printf '      - LAT=%s\n' "${lat:-LATITUDE}"
   printf '      - LONG=%s\n' "${lon:-LONGITUDE}"
-  printf '      - ALT=%s\n' "${alt:+${alt}m}"
+  if [[ -n $alt && $alt_datum == ellipsoid ]]; then
+    printf '      - ALT=%sm\n' "$alt"
+  else
+    printf '      - ALT_MSL=%s\n' "${alt:+${alt}m}"
+  fi
   printf '    volumes:\n'
   printf '      - %s:/var/lib/tally-feed\n\n' "$volume"
   if [[ -n $lat ]]; then
@@ -1020,12 +1111,16 @@ container_route() {
   else
     printf 'No location was found: fill in LATITUDE and LONGITUDE (degrees). '
   fi
-  if [[ -n $alt ]]; then
-    printf 'The altitude is %s m, from %s.\n' "$alt" "$alt_from"
+  if [[ -n $alt && $alt_datum == ellipsoid ]]; then
+    printf 'The altitude is %s m above the WGS84 ellipsoid, from %s.\n' "$alt" "$alt_from"
+  elif [[ -n $alt ]]; then
+    printf 'The altitude is %s m above sea level, from %s; the feeder adds the geoid'\''s height there.\n' "$alt" "$alt_from"
   else
-    printf 'No altitude was found: fill in ALT=, the antenna'\''s, as 15m or 45ft (MLAT needs a real one).\n'
+    printf 'No altitude was found: fill in ALT_MSL=, the antenna'\''s height above sea level, as 15m or 45ft\n(MLAT needs a real one).\n'
   fi
   printf '%s\n' "$(privacy_line)"
+  printf ':0 is the highest 0.x release: docker compose pull && docker compose up -d (or Watchtower)\n'
+  printf 'moves the feeder to each new one. Name :vX.Y.Z instead to choose when it changes.\n'
   printf 'The feeder makes its key in that volume (keep it: it is the station'\''s name for good), and\n'
   printf 'docker logs tally-feed shows its public key and station page. More, in "Run it as a container":\n'
   printf '  https://github.com/sky-commons/tally/blob/main/packaging/README.md#run-it-as-a-container\n'
@@ -1040,7 +1135,7 @@ write_defaults() {
   {
     printf '%s\n' "$MARK_BEGIN"
     printf '# with what it found: run it again to change them (TALLY_LAT, TALLY_LON, TALLY_ALT).\n'
-    printf '# Location from %s, altitude from %s.\n' "$lat_from" "$alt_from"
+    printf '# Location from %s, altitude from %s.\n' "$lat_from" "${alt_record:-$alt_from}"
     printf '# The relays come from the seed list %s, each run by:\n' "$seeds_from"
     local n
     for n in "${!seed_relays[@]}"; do
@@ -1119,12 +1214,48 @@ legacy_extra() {
   printf '%s' "${out[*]}"
 }
 
+# A property of tally-feed.service, as systemctl show gives it (nothing if it cannot).
+unit_property() {
+  systemctl show -p "$1" --value tally-feed.service 2>/dev/null || true
+}
+
+# How many times systemd has restarted tally-feed (Restart=always) since this run started it: 0 if
+# it cannot say.
+restarts_since_start() {
+  local count
+  count="$(unit_property NRestarts)"
+  [[ $count =~ ^[0-9]+$ ]] || count=0
+  printf '%s' $((count > restarts_before ? count - restarts_before : 0))
+}
+
+# Has the feeder this run started exited, to be restarted (Restart=always) or given up on? A unit
+# that keeps crashing still counts as active between its restarts, so is-active alone would call it
+# running. Sets exit_status and restarted.
+crashing() {
+  local state
+  state="$(unit_property SubState)"
+  exit_status="$(unit_property ExecMainStatus)"
+  restarted="$(restarts_since_start)"
+  ((restarted > 0)) || [[ $state == auto-restart || $state == failed ]]
+}
+
+# This run's log of tally-feed: every start of it since this run restarted it (started_at), which a
+# crash restarts with new invocations. ARGS go to journalctl.
+run_log() {
+  journalctl -u tally-feed.service --since "@$started_at" --no-pager "$@" 2>/dev/null || true
+}
+
 # Waits up to WAIT_SECONDS for the started feeder to be active and say it is publishing (its
-# "tally-feed: publishing to RELAY" line), reading only this start's journal. Sets log.
+# "tally-feed: publishing to RELAY" line), reading only this start's journal. Sets log, and crashed
+# when it gave up because the feeder keeps exiting.
 wait_until_publishing() {
   local deadline=$((SECONDS + WAIT_SECONDS)) invocation
-  log=""
+  log="" crashed=""
   while :; do
+    if crashing; then
+      crashed=1
+      return 1
+    fi
     if systemctl is-active --quiet tally-feed.service; then
       invocation="$(systemctl show -p InvocationID --value tally-feed.service 2>/dev/null || true)"
       if [[ -n $invocation ]]; then
@@ -1135,6 +1266,45 @@ wait_until_publishing() {
     ((SECONDS < deadline)) || return 1
     sleep 1
   done
+}
+
+# Says, on stderr, why the feeder this run started is not publishing: it keeps crashing (with its
+# error), it did not start, or it runs but reached no relay; then its log since this run started it,
+# its key and station page (it is installed either way), and what to do next.
+not_publishing() {
+  local error
+  printf '\n' >&2
+  if [[ -n $crashed ]]; then
+    error="$(run_log -o cat | grep '^tally-feed: ' | tail -n 1)"
+    local how=""
+    [[ $exit_status =~ ^[1-9][0-9]*$ ]] && how+=" with status $exit_status"
+    ((restarted > 0)) && how+=", and systemd has restarted it $restarted times,"
+    say "tally-feed keeps crashing: it exited$how since this run started it. Its error:" >&2
+    say "  ${error:-(none logged)}" >&2
+    if [[ $error == *"/run/credentials/"*"Permission denied"* ]]; then
+      local where=""
+      where="$(systemd-detect-virt --container 2>/dev/null || true)"
+      [[ $where == none ]] && where=""
+      say "That is systemd unable to hand the key to the feeder's unprivileged user (LoadCredential= with DynamicUser=), as when systemd runs inside a container (Docker, LXC)${where:+, which this is ($where)}. Run the feeder's container image instead, beside your decoder's (https://github.com/sky-commons/tally/blob/main/packaging/README.md#run-it-as-a-container), or install on the host." >&2
+    fi
+  elif systemctl is-active --quiet tally-feed.service; then
+    say "tally-feed is running but has not reached a relay in ${WAIT_SECONDS} s." >&2
+  else
+    say "tally-feed did not start." >&2
+  fi
+  say "Its log since this run started it:" >&2
+  run_log -n 40 >&2
+  printf "\nThis receiver's public key, its name on the network:\n\n  %s\n" "$public" >&2
+  printf "\nIts station page, once the network holds its first receptions:\n\n  %s/%s\n" "$STATION_PAGE" "$(base64url "$public")" >&2
+  if [[ -n $crashed ]]; then
+    printf '\nNext: fix what its error says and run this again, or open an issue with the lines above:\n%s\n\n' "$ISSUES" >&2
+  else
+    printf '\nNext: tally-feed keeps trying on its own. Watch it with journalctl -u tally-feed -f; it is\n' >&2
+    printf 'feeding once it says "publishing to". If it never does, the lines above say why (a\n' >&2
+    printf 'firewall blocking outbound TCP to %s, say). Fix that and run this again,\n' "${seed_relays[*]%%=*}" >&2
+    printf 'or open an issue with those lines: %s\n\n' "$ISSUES" >&2
+  fi
+  auto_update_lines >&2
 }
 
 uninstall() {
@@ -1149,10 +1319,18 @@ uninstall() {
     if have_tty; then
       answer="$(ask "Type delete to delete it:")"
       [[ $answer == delete ]] || stop "nothing was removed"
+    elif [[ ${TALLY_PURGE_KEY:-} != yes ]]; then
+      # With no terminal to confirm on, the owner confirms by naming it: a script that meant only
+      # --uninstall, or a pasted line, never deletes an identity unasked.
+      stop "with no terminal to confirm on, --purge deletes the key only with TALLY_PURGE_KEY=yes: $(run_again TALLY_PURGE_KEY=yes) --uninstall --purge. Nothing was removed."
     fi
   fi
   if [[ -f $UPDATE_TIMER ]]; then
     systemctl disable --now "$TIMER" >/dev/null 2>&1 || true
+    # The timer is Persistent=, so systemd keeps its last run in a stamp under
+    # /var/lib/systemd/timers; `clean --what=state` is systemd's own way to remove it
+    # (systemd.timer(5)), while the unit is still loaded.
+    systemctl clean --what=state "$TIMER" >/dev/null 2>&1 || true
   fi
   if [[ -f $UNIT ]]; then
     systemctl disable --now tally-feed.service >/dev/null 2>&1 || true
@@ -1271,6 +1449,7 @@ main() {
 
   # Every question is asked, and every refusal made, before anything is installed.
   discover_location ask
+  settle_altitude
   offer_readsb_location
   say "location $lat, $lon from $lat_from"
   say "altitude $alt m from $alt_from"
@@ -1333,36 +1512,30 @@ main() {
   else
     systemctl disable --now "$TIMER" >/dev/null 2>&1 || true
   fi
+  # What the owner said yes to is done now, before the wait: a feeder that does not publish yet is
+  # installed all the same, and keeps trying.
+  set_readsb_location
+  started_at="$(date +%s)"
   systemctl restart tally-feed.service
+  restarts_before=0
+  restarts_before="$(restarts_since_start)"
 
   say "started tally-feed; waiting up to ${WAIT_SECONDS} s for it to publish"
   if ! wait_until_publishing; then
-    printf '\n' >&2
-    if systemctl is-active --quiet tally-feed.service; then
-      say "tally-feed is running but has not reached a relay in ${WAIT_SECONDS} s. Its log:" >&2
-    else
-      say "tally-feed did not start. Its log:" >&2
-    fi
-    journalctl -u tally-feed.service -n 30 --no-pager >&2 || true
-    printf '\nNext: tally-feed keeps trying on its own. Watch it with journalctl -u tally-feed -f; it is\n' >&2
-    printf 'feeding once it says "publishing to". If it never does, the lines above say why (a\n' >&2
-    printf 'firewall blocking outbound TCP to %s, say). Fix that and run this again,\n' "${seed_relays[*]%%=*}" >&2
-    printf 'or open an issue with those lines: %s\n\n' "$ISSUES" >&2
-    auto_update_lines >&2
+    not_publishing
     exit 1
   fi
   if ! grep -q '^tally-feed: reading ' <<<"$log"; then
     say "note: it has not read 127.0.0.1:30005 yet, so it has nothing to publish until readsb (or"
     say "dump1090-fa) serves BEAST there; it keeps trying"
   fi
-  set_readsb_location
 
   printf '\ntally-feed %s is installed and publishing (systemctl status tally-feed; journalctl -u tally-feed).\n' \
     "$VERSION"
   printf "\nThis receiver's public key, its name on the network:\n\n  %s\n" "$public"
   printf "\nIts station page, once the network holds its first receptions:\n\n  %s/%s\n\n" "$STATION_PAGE" "$(base64url "$public")"
   printf "What it publishes, in open data anyone can read: every reception this receiver's decoders\n"
-  printf 'report, signed with that key.\n%s\n' "$(privacy_line)"
+  printf 'report, signed with that key.\n'
   printf 'To change the location, run this again with --locate (it asks for the address), or with\n'
   printf 'TALLY_LAT, TALLY_LON and TALLY_ALT.\n\n'
   auto_update_lines
